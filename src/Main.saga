@@ -1,0 +1,109 @@
+module Main
+
+import Std.IO (console)
+import Kraken.Query as Db
+import Kraken.Query (QueryBuild, Repo)
+import SagaPgo (Connection, connect, default_config, pg)
+
+record User {
+  id: Int,
+  name: String,
+  age: Int,
+}
+
+record NewUser {
+  name: String,
+  age: Int,
+}
+
+record Post {
+  id: Int,
+  author_id: Int,
+  title: String,
+  published: Bool,
+}
+
+record NewPost {
+  author_id: Int,
+  title: String,
+  published: Bool,
+}
+
+type UsersScope = UsersScope
+type PostsScope = PostsScope
+type UsersTable = UsersTable
+type PostsTable = PostsTable
+
+record Users source {
+  id: Db.Column source 'id Int,
+  name: Db.Column source 'name String,
+  age: Db.Column source 'age Int,
+}
+
+record Posts source {
+  id: Db.Column source 'id Int,
+  author_id: Db.Column source 'author_id Int,
+  title: Db.Column source 'title String,
+  published: Db.Column source 'published Bool,
+}
+
+fun user_cols : String -> Users UsersScope
+user_cols source = Users {
+  id: Db.col_as "id" source,
+  name: Db.col_as "name" source,
+  age: Db.col_as "age" source,
+}
+
+fun post_cols : String -> Posts PostsScope
+post_cols source = Posts {
+  id: Db.col_as "id" source,
+  author_id: Db.col_as "author_id" source,
+  title: Db.col_as "title" source,
+  published: Db.col_as "published" source,
+}
+
+fun users : Db.Table UsersTable User NewUser (Users UsersScope)
+users = Db.table "users" user_cols
+
+fun posts : Db.Table PostsTable Post NewPost (Posts PostsScope)
+posts = Db.table "posts" post_cols
+
+fun user_posts_query : Unit -> Db.Prepared (String, String)
+user_posts_query () = Db.query (fun () -> {
+  let u = from! users
+  let p = inner_join! posts (fun post -> Db.eq_col post.author_id u.id)
+  where_! (Db.and_ [
+    Db.eq u.name "Alice",
+    Db.gt u.age 18,
+    Db.eq p.published True,
+  ])
+  order_by! [Db.desc p.id]
+  limit! 20
+  Db.select (u.name, p.title)
+})
+
+fun load_user_posts : Connection -> Result (List (String, String)) Db.DbError
+  needs {Repo}
+load_user_posts conn = Db.all conn (user_posts_query ())
+
+main () = {
+  let config =
+    { default_config "kraken_testing" |
+      user: "postgres",
+      password: "postgres",
+      port: 5432,
+    }
+  let conn = connect config
+  let prepared = user_posts_query ()
+  println prepared.sql
+
+  let result = load_user_posts conn with Db.pg_repo
+
+  case result {
+    Ok rows -> {
+      println ("rows: " <> show (List.length rows))
+      List.iter (fun row -> println (debug row)) rows
+    }
+    Err err -> println ("query failed: " <> debug err)
+  }
+} with {pg, console}

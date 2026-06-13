@@ -1,0 +1,649 @@
+module Kraken.Query
+
+import Std.Base (Proxy, KnownSymbol)
+import Std.Dynamic (
+  Dynamic,
+  DecodeError,
+  Decoder,
+  decode_element,
+  string,
+  int,
+  float,
+  bool,
+  optional
+)
+import SagaPgo (Connection, Postgres, QueryError, Returned)
+import SagaPgo as Pgo
+import SagaPgo.Types (Value)
+import SagaPgo.Types as T
+
+pub trait PgType a {
+  fun encode_pg : a -> Value
+  fun decode_pg : Decoder a
+}
+
+impl PgType for Int {
+  encode_pg value = T.pg_int value
+  decode_pg = int
+}
+
+impl PgType for Float {
+  encode_pg value = T.pg_float value
+  decode_pg = float
+}
+
+impl PgType for String {
+  encode_pg value = T.pg_text value
+  decode_pg = string
+}
+
+impl PgType for Bool {
+  encode_pg value = T.pg_bool value
+  decode_pg = bool
+}
+
+impl PgType for T.Uuid {
+  encode_pg value = T.pg_uuid value
+  decode_pg = T.uuid
+}
+
+impl PgType for Maybe a where {a: PgType} {
+  encode_pg value = case value {
+    Just inner -> encode_pg inner
+    Nothing -> T.pg_null ()
+  }
+  decode_pg = optional decode_pg
+}
+
+record TableDef cols {
+  name: String,
+  alias: Maybe String,
+  make_cols: String -> cols,
+}
+
+pub opaque type Table table row insert cols = Table (TableDef cols)
+
+record ColumnInfo {
+  source: String,
+  name: String,
+}
+
+pub opaque type Column source (name : Symbol) a = Column ColumnInfo
+
+pub fun table : String -> (String -> cols) -> Table table row insert cols
+table name make_cols =
+  Table (TableDef {
+    name: name,
+    alias: Nothing,
+    make_cols: make_cols,
+  })
+
+pub fun table_as : String -> Table table row insert cols -> Table table row insert cols
+table_as alias table_value = {
+  let Table def = table_value
+  Table ({ def | alias: Just alias })
+}
+
+pub fun col : Proxy name -> String -> Column source name a
+  where {name: KnownSymbol}
+col name source =
+  Column (ColumnInfo {
+    source: source,
+    name: symbol_name name,
+  })
+
+pub fun col_as : String -> String -> Column source name a
+col_as name source =
+  Column (ColumnInfo {
+    source: source,
+    name: name,
+  })
+
+type SqlPart =
+  | Text String
+  | Param Value
+
+record SqlFrag {
+  parts: List SqlPart,
+}
+
+pub opaque type Expr = Expr SqlFrag
+
+record SelectItem {
+  expr: SqlFrag,
+  alias: String,
+}
+
+record OrderItem {
+  expr: SqlFrag,
+  direction: String,
+}
+
+pub opaque type Order = Order OrderItem
+
+record FieldDef a {
+  selection: SelectItem,
+  decoder: Decoder a,
+}
+
+pub opaque type Field a = Field (FieldDef a)
+
+record ProjectionDef a {
+  selections: List SelectItem,
+  decode: Dynamic -> Result a DecodeError,
+}
+
+pub opaque type Projection a = Projection (ProjectionDef a)
+
+pub trait Selectable selection row {
+  fun to_projection : selection -> Projection row
+}
+
+pub fun select : selection -> Projection row where {selection: Selectable row}
+select selection = to_projection selection
+
+fun raw : String -> SqlFrag
+raw text = SqlFrag { parts: [Text text] }
+
+fun param : Value -> SqlFrag
+param value = SqlFrag { parts: [Param value] }
+
+fun append_frag : SqlFrag -> SqlFrag -> SqlFrag
+append_frag left right = SqlFrag { parts: List.append left.parts right.parts }
+
+fun spaced : SqlFrag -> String -> SqlFrag -> SqlFrag
+spaced left op right =
+  append_frag left (append_frag (raw (" " <> op <> " ")) right)
+
+fun column_frag : Column source name a -> SqlFrag
+column_frag (Column info) = raw (info.source <> "." <> info.name)
+
+pub fun eq : Column source name a -> a -> Expr where {a: PgType}
+eq column value = Expr (spaced (column_frag column) "=" (param (encode_pg value)))
+
+pub fun not_eq : Column source name a -> a -> Expr where {a: PgType}
+not_eq column value = Expr (spaced (column_frag column) "<>" (param (encode_pg value)))
+
+pub fun gt : Column source name a -> a -> Expr where {a: PgType}
+gt column value = Expr (spaced (column_frag column) ">" (param (encode_pg value)))
+
+pub fun gte : Column source name a -> a -> Expr where {a: PgType}
+gte column value = Expr (spaced (column_frag column) ">=" (param (encode_pg value)))
+
+pub fun lt : Column source name a -> a -> Expr where {a: PgType}
+lt column value = Expr (spaced (column_frag column) "<" (param (encode_pg value)))
+
+pub fun lte : Column source name a -> a -> Expr where {a: PgType}
+lte column value = Expr (spaced (column_frag column) "<=" (param (encode_pg value)))
+
+pub fun eq_col : Column left lname a -> Column right rname a -> Expr
+eq_col left right = Expr (spaced (column_frag left) "=" (column_frag right))
+
+pub fun is_null : Column source name a -> Expr
+is_null column = Expr (append_frag (column_frag column) (raw " IS NULL"))
+
+pub fun is_not_null : Column source name a -> Expr
+is_not_null column = Expr (append_frag (column_frag column) (raw " IS NOT NULL"))
+
+pub fun and_ : List Expr -> Expr
+and_ exprs = Expr (join_exprs " AND " exprs)
+
+pub fun or_ : List Expr -> Expr
+or_ exprs = Expr (join_exprs " OR " exprs)
+
+fun join_exprs : String -> List Expr -> SqlFrag
+join_exprs sep exprs = case exprs {
+  [] -> raw "TRUE"
+  [Expr frag] -> frag
+  Expr frag :: rest -> {
+    let left = append_frag (raw "(") frag
+    let right = append_frag (raw (")" <> sep)) (join_exprs sep rest)
+    append_frag left right
+  }
+}
+
+pub fun field : Proxy alias -> Column source name a -> Field a
+  where {alias: KnownSymbol, a: PgType}
+field alias column =
+  Field (FieldDef {
+    selection: SelectItem {
+      expr: column_frag column,
+      alias: symbol_name alias,
+    },
+    decoder: decode_pg,
+  })
+
+pub fun field_as : String -> Column source name a -> Field a
+  where {a: PgType}
+field_as alias column =
+  Field (FieldDef {
+    selection: SelectItem {
+      expr: column_frag column,
+      alias: alias,
+    },
+    decoder: decode_pg,
+  })
+
+fun field_auto : Column source name a -> Field a where {a: PgType}
+field_auto column = {
+  let Column info = column
+  field_as info.name column
+}
+
+fun project1 : (a -> out) -> Field a -> Projection out
+project1 make fa = {
+  let Field adef = fa
+  Projection (ProjectionDef {
+    selections: [adef.selection],
+    decode: fun row -> case decode_element 0 adef.decoder row {
+      Ok a -> Ok (make a)
+      Err err -> Err err
+    },
+  })
+}
+
+impl Selectable (a, b) for (Column source_a name_a a, Column source_b name_b b)
+  where {a: PgType, b: PgType}
+{
+  to_projection selection = {
+    let (a_col, b_col) = selection
+    project2 (fun a b -> (a, b)) (field_auto a_col) (field_auto b_col)
+  }
+}
+
+fun project2 : (a -> b -> out) -> Field a -> Field b -> Projection out
+project2 make fa fb = {
+  let Field adef = fa
+  let Field bdef = fb
+  Projection (ProjectionDef {
+    selections: [adef.selection, bdef.selection],
+    decode: fun row -> case decode_element 0 adef.decoder row {
+      Err err -> Err err
+      Ok a -> case decode_element 1 bdef.decoder row {
+        Err err -> Err err
+        Ok b -> Ok (make a b)
+      }
+    },
+  })
+}
+
+fun project3 : (a -> b -> c -> out) -> Field a -> Field b -> Field c -> Projection out
+project3 make fa fb fc = {
+  let Field adef = fa
+  let Field bdef = fb
+  let Field cdef = fc
+  Projection (ProjectionDef {
+    selections: [adef.selection, bdef.selection, cdef.selection],
+    decode: fun row -> case decode_element 0 adef.decoder row {
+      Err err -> Err err
+      Ok a -> case decode_element 1 bdef.decoder row {
+        Err err -> Err err
+        Ok b -> case decode_element 2 cdef.decoder row {
+          Err err -> Err err
+          Ok c -> Ok (make a b c)
+        }
+      }
+    },
+  })
+}
+
+pub fun asc : Column source name a -> Order
+asc column =
+  Order (OrderItem {
+    expr: column_frag column,
+    direction: "ASC",
+  })
+
+pub fun desc : Column source name a -> Order
+desc column =
+  Order (OrderItem {
+    expr: column_frag column,
+    direction: "DESC",
+  })
+
+record Source {
+  name: String,
+  alias: String,
+}
+
+type QueryStep a = QueryStep (QueryState -> (a, QueryState))
+
+type JoinKind =
+  | InnerJoin
+  | LeftJoin
+
+record Join {
+  kind: JoinKind,
+  source: Source,
+  on: Expr,
+}
+
+record QueryState {
+  from_source: Maybe Source,
+  joins: List Join,
+  wheres: List Expr,
+  order_bys: List Order,
+  limit_count: Maybe Int,
+  offset_count: Maybe Int,
+  next_alias: Int,
+}
+
+pub record Prepared a {
+  sql: String,
+  params: List Value,
+  decode: Dynamic -> Result a DecodeError,
+}
+
+pub type DbError =
+  | QueryFailed QueryError
+  | DecodeFailed DecodeError
+  deriving (Debug)
+
+pub effect Repo {
+  fun execute : Connection -> Prepared a -> Result (Returned Dynamic) QueryError
+}
+
+pub handler pg_repo for Repo needs {Postgres} {
+  execute conn prepared = {
+    let result = run conn prepared
+    resume result
+  }
+}
+
+pub effect QueryBuild {
+  fun from : Table name row insert cols -> cols
+  fun inner_join : Table name row insert cols -> (cols -> Expr) -> cols
+  fun left_join : Table name row insert cols -> (cols -> Expr) -> cols
+  fun where_ : Expr -> Unit
+  fun order_by : List Order -> Unit
+  fun limit : Int -> Unit
+  fun offset : Int -> Unit
+}
+
+fun empty_state : QueryState
+empty_state =
+  QueryState {
+    from_source: Nothing,
+    joins: [],
+    wheres: [],
+    order_bys: [],
+    limit_count: Nothing,
+    offset_count: Nothing,
+    next_alias: 0,
+  }
+
+fun bind_table : Table table row insert cols -> QueryState -> (Source, cols, QueryState)
+bind_table table_value state = {
+  let Table def = table_value
+  let alias = case def.alias {
+    Just name -> name
+    Nothing -> "t" <> show state.next_alias
+  }
+  let source =
+    Source {
+      name: def.name,
+      alias: alias,
+    }
+  let cols = def.make_cols alias
+  (source, cols, { state | next_alias: state.next_alias + 1 })
+}
+
+handler collect_query for QueryBuild {
+  from table_value = {
+    QueryStep (fun state -> {
+      let (source, cols, state2) = bind_table table_value state
+      let QueryStep run_rest = resume cols
+      run_rest ({ state2 | from_source: Just source })
+    })
+  }
+
+  inner_join table_value on_fn = {
+    QueryStep (fun state -> {
+      let (source, cols, state2) = bind_table table_value state
+      let join = Join {
+        kind: InnerJoin,
+        source: source,
+        on: on_fn cols,
+      }
+      let QueryStep run_rest = resume cols
+      run_rest ({ state2 | joins: List.append state2.joins [join] })
+    })
+  }
+
+  left_join table_value on_fn = {
+    QueryStep (fun state -> {
+      let (source, cols, state2) = bind_table table_value state
+      let join = Join {
+        kind: LeftJoin,
+        source: source,
+        on: on_fn cols,
+      }
+      let QueryStep run_rest = resume cols
+      run_rest ({ state2 | joins: List.append state2.joins [join] })
+    })
+  }
+
+  where_ expr = {
+    QueryStep (fun state -> {
+      let QueryStep run_rest = resume ()
+      run_rest ({ state | wheres: List.append state.wheres [expr] })
+    })
+  }
+
+  order_by orders = {
+    QueryStep (fun state -> {
+      let QueryStep run_rest = resume ()
+      run_rest ({ state | order_bys: List.append state.order_bys orders })
+    })
+  }
+
+  limit count = {
+    QueryStep (fun state -> {
+      let QueryStep run_rest = resume ()
+      run_rest ({ state | limit_count: Just count })
+    })
+  }
+
+  offset count = {
+    QueryStep (fun state -> {
+      let QueryStep run_rest = resume ()
+      run_rest ({ state | offset_count: Just count })
+    })
+  }
+
+  return value = QueryStep (fun state -> (value, state))
+}
+
+pub fun query : (Unit -> Projection a needs {QueryBuild}) -> Prepared a
+query make = {
+  let QueryStep run_query = make () with collect_query
+  let (projection, state) = run_query empty_state
+  prepare projection state
+}
+
+record RenderState {
+  sql: String,
+  params: List Value,
+  next_index: Int,
+}
+
+fun render_text : String -> RenderState -> RenderState
+render_text text state = { state | sql: state.sql <> text }
+
+fun render_param : Value -> RenderState -> RenderState
+render_param value state =
+  { state |
+    sql: state.sql <> "$" <> show state.next_index,
+    params: List.append state.params [value],
+    next_index: state.next_index + 1,
+  }
+
+fun render_frag : SqlFrag -> RenderState -> RenderState
+render_frag frag state = render_parts frag.parts state
+
+fun render_parts : List SqlPart -> RenderState -> RenderState
+render_parts parts state = case parts {
+  [] -> state
+  Text text :: rest -> render_parts rest (render_text text state)
+  Param value :: rest -> render_parts rest (render_param value state)
+}
+
+fun render_source : Source -> String
+render_source source =
+  if source.name == source.alias then source.name
+  else source.name <> " AS " <> source.alias
+
+fun render_join_kind : JoinKind -> String
+render_join_kind kind = case kind {
+  InnerJoin -> "INNER JOIN"
+  LeftJoin -> "LEFT JOIN"
+}
+
+fun render_expr : Expr -> RenderState -> RenderState
+render_expr (Expr frag) state = render_frag frag state
+
+fun render_join : Join -> RenderState -> RenderState
+render_join join state =
+  state
+  |> render_text (" " <> render_join_kind join.kind <> " " <> render_source join.source <> " ON ")
+  |> render_expr join.on
+
+fun render_joins : List Join -> RenderState -> RenderState
+render_joins joins state = case joins {
+  [] -> state
+  join :: rest -> render_joins rest (render_join join state)
+}
+
+fun render_selection : SelectItem -> RenderState -> RenderState
+render_selection item state =
+  state
+  |> render_frag item.expr
+  |> render_text (" AS " <> item.alias)
+
+fun render_selects : List SelectItem -> RenderState -> RenderState
+render_selects selections state = case selections {
+  [] -> render_text "*" state
+  [selection] -> render_selection selection state
+  selection :: rest ->
+    state
+    |> render_selection selection
+    |> render_text ", "
+    |> render_selects rest
+}
+
+fun render_order : Order -> RenderState -> RenderState
+render_order (Order item) state =
+  state
+  |> render_frag item.expr
+  |> render_text (" " <> item.direction)
+
+fun render_orders : List Order -> RenderState -> RenderState
+render_orders orders state = case orders {
+  [] -> state
+  [order] ->
+    state
+    |> render_text " ORDER BY "
+    |> render_order order
+  order :: rest ->
+    state
+    |> render_text " ORDER BY "
+    |> render_order order
+    |> render_text ", "
+    |> render_more_orders rest
+}
+
+fun render_more_orders : List Order -> RenderState -> RenderState
+render_more_orders orders state = case orders {
+  [] -> state
+  [order] -> render_order order state
+  order :: rest ->
+    state
+    |> render_order order
+    |> render_text ", "
+    |> render_more_orders rest
+}
+
+fun render_wheres : List Expr -> RenderState -> RenderState
+render_wheres wheres state = case wheres {
+  [] -> state
+  _ ->
+    state
+    |> render_text " WHERE "
+    |> render_expr (and_ wheres)
+}
+
+fun render_limit : Maybe Int -> RenderState -> RenderState
+render_limit count state = case count {
+  Nothing -> state
+  Just n -> render_text (" LIMIT " <> show n) state
+}
+
+fun render_offset : Maybe Int -> RenderState -> RenderState
+render_offset count state = case count {
+  Nothing -> state
+  Just n -> render_text (" OFFSET " <> show n) state
+}
+
+fun prepare : Projection a -> QueryState -> Prepared a
+prepare projection state = case state.from_source {
+  Nothing -> panic "Kraken.Query.query: missing from!"
+  Just source -> {
+    let Projection projection_def = projection
+    let initial =
+      RenderState {
+        sql: "SELECT ",
+        params: [],
+        next_index: 1,
+      }
+
+    let rendered =
+      initial
+      |> render_selects projection_def.selections
+      |> render_text (" FROM " <> render_source source)
+      |> render_joins state.joins
+      |> render_wheres state.wheres
+      |> render_orders state.order_bys
+      |> render_limit state.limit_count
+      |> render_offset state.offset_count
+
+    Prepared {
+      sql: rendered.sql,
+      params: rendered.params,
+      decode: projection_def.decode,
+    }
+  }
+}
+
+pub fun run : Connection -> Prepared a -> Result (Returned Dynamic) QueryError
+  needs {Postgres}
+run conn prepared =
+  Pgo.sql prepared.sql
+  |> Pgo.bind_values prepared.params
+  |> Pgo.execute conn
+
+pub fun all : Connection -> Prepared a -> Result (List a) DbError needs {Repo}
+all conn prepared = case execute! conn prepared {
+  Ok returned -> decode_rows prepared.decode returned.rows
+  Err err -> Err (QueryFailed err)
+}
+
+pub fun one : Connection -> Prepared a -> Result (Maybe a) DbError needs {Repo}
+one conn prepared = case all conn prepared {
+  Ok rows -> case rows {
+    [] -> Ok Nothing
+    row :: _ -> Ok (Just row)
+  }
+  Err err -> Err err
+}
+
+fun decode_rows : (Dynamic -> Result a DecodeError) -> List Dynamic -> Result (List a) DbError
+decode_rows decoder rows = case rows {
+  [] -> Ok []
+  row :: rest -> case decoder row {
+    Err err -> Err (DecodeFailed err)
+    Ok value -> case decode_rows decoder rest {
+      Err err -> Err err
+      Ok values -> Ok (value :: values)
+    }
+  }
+}

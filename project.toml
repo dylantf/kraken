@@ -1,0 +1,12 @@
+[project]
+name = "kraken"
+
+[bin]
+main = "src/Main.saga"
+
+[library]
+module = "Kraken"
+expose = ["Kraken.Query"]
+
+[deps]
+saga_pgo = { path = "../saga_pgo" }
