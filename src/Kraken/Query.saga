@@ -12,6 +12,7 @@ import Std.Dynamic (
   bool,
   optional
 )
+import Std.Generic (Generic, Leaf, Labeled, And, Record)
 import SagaPgo (Connection, Postgres, QueryError, Returned)
 import SagaPgo as Pgo
 import SagaPgo.Types (Value)
@@ -126,21 +127,45 @@ record FieldDef a {
   decoder: Decoder a,
 }
 
-pub opaque type Field a = Field (FieldDef a)
+opaque type Field a = Field (FieldDef a)
 
 record ProjectionDef a {
   selections: List SelectItem,
-  decode: Dynamic -> Result a DecodeError,
+  width: Int,
+  decode_at: Int -> Dynamic -> Result a DecodeError,
 }
 
 pub opaque type Projection a = Projection (ProjectionDef a)
 
-pub trait Selectable selection row {
+pub trait Selectable selection row | selection -> row {
   fun to_projection : selection -> Projection row
 }
 
-pub fun select : selection -> Projection row where {selection: Selectable row}
-select selection = to_projection selection
+pub fun select : selection -> Projection row
+  where {
+    selection: Generic selection_rep,
+    selection_rep: Selectable row_rep,
+    row: Generic row_rep,
+  }
+select selection =
+  to_projection (to selection)
+  |> map from
+
+pub fun select_all : selection -> Projection row where {selection: Selectable row}
+select_all selection = to_projection selection
+
+pub fun map : (a -> b) -> Projection a -> Projection b
+map transform projection = {
+  let Projection def = projection
+  Projection (ProjectionDef {
+    selections: def.selections,
+    width: def.width,
+    decode_at: fun offset row -> case def.decode_at offset row {
+      Err err -> Err err
+      Ok value -> Ok (transform value)
+    },
+  })
+}
 
 fun raw : String -> SqlFrag
 raw text = SqlFrag { parts: [Text text] }
@@ -202,18 +227,7 @@ join_exprs sep exprs = case exprs {
   }
 }
 
-pub fun field : Proxy alias -> Column source name a -> Field a
-  where {alias: KnownSymbol, a: PgType}
-field alias column =
-  Field (FieldDef {
-    selection: SelectItem {
-      expr: column_frag column,
-      alias: symbol_name alias,
-    },
-    decoder: decode_pg,
-  })
-
-pub fun field_as : String -> Column source name a -> Field a
+fun field_as : String -> Column source name a -> Field a
   where {a: PgType}
 field_as alias column =
   Field (FieldDef {
@@ -230,61 +244,93 @@ field_auto column = {
   field_as info.name column
 }
 
-fun project1 : (a -> out) -> Field a -> Projection out
-project1 make fa = {
-  let Field adef = fa
+fun field_projection : Column source name a -> Projection a where {a: PgType}
+field_projection column = {
+  let Field def = field_auto column
   Projection (ProjectionDef {
-    selections: [adef.selection],
-    decode: fun row -> case decode_element 0 adef.decoder row {
-      Ok a -> Ok (make a)
+    selections: [def.selection],
+    width: 1,
+    decode_at: fun offset row -> decode_element offset def.decoder row,
+  })
+}
+
+fun relabel_item : String -> SelectItem -> SelectItem
+relabel_item alias item = { item | alias: alias }
+
+fun relabel_items : String -> List SelectItem -> List SelectItem
+relabel_items alias items = List.map (relabel_item alias) items
+
+fun relabel_projection : String -> Projection a -> Projection a
+relabel_projection alias projection = {
+  let Projection def = projection
+  if def.width == 1 then
+    Projection ({ def | selections: relabel_items alias def.selections })
+  else
+    projection
+}
+
+fun zip_projection : Projection a -> Projection b -> Projection (a, b)
+zip_projection left right = {
+  let Projection left_def = left
+  let Projection right_def = right
+
+  Projection (ProjectionDef {
+    selections: List.append left_def.selections right_def.selections,
+    width: left_def.width + right_def.width,
+    decode_at: fun offset row -> case left_def.decode_at offset row {
       Err err -> Err err
+      Ok left_value -> case right_def.decode_at (offset + left_def.width) row {
+        Err err -> Err err
+        Ok right_value -> Ok (left_value, right_value)
+      }
     },
   })
 }
 
-impl Selectable (a, b) for (Column source_a name_a a, Column source_b name_b b)
-  where {a: PgType, b: PgType}
-{
-  to_projection selection = {
-    let (a_col, b_col) = selection
-    project2 (fun a b -> (a, b)) (field_auto a_col) (field_auto b_col)
+fun projection_decode : Projection a -> Dynamic -> Result a DecodeError
+projection_decode projection row = {
+  let Projection def = projection
+  def.decode_at 0 row
+}
+
+impl Selectable (Leaf a) for (Leaf (Column source name a)) where {a: PgType} {
+  to_projection selection = case selection {
+    Leaf column ->
+      field_projection column
+      |> map Leaf
   }
 }
 
-fun project2 : (a -> b -> out) -> Field a -> Field b -> Projection out
-project2 make fa fb = {
-  let Field adef = fa
-  let Field bdef = fb
-  Projection (ProjectionDef {
-    selections: [adef.selection, bdef.selection],
-    decode: fun row -> case decode_element 0 adef.decoder row {
-      Err err -> Err err
-      Ok a -> case decode_element 1 bdef.decoder row {
-        Err err -> Err err
-        Ok b -> Ok (make a b)
-      }
-    },
-  })
+impl Selectable (Labeled n out) for (Labeled n field)
+  where {n: KnownSymbol, Selectable field out}
+{
+  to_projection selection = case selection {
+    Labeled field ->
+      to_projection field
+      |> relabel_projection (symbol_name (Proxy : Proxy n))
+      |> map Labeled
+  }
 }
 
-fun project3 : (a -> b -> c -> out) -> Field a -> Field b -> Field c -> Projection out
-project3 make fa fb fc = {
-  let Field adef = fa
-  let Field bdef = fb
-  let Field cdef = fc
-  Projection (ProjectionDef {
-    selections: [adef.selection, bdef.selection, cdef.selection],
-    decode: fun row -> case decode_element 0 adef.decoder row {
-      Err err -> Err err
-      Ok a -> case decode_element 1 bdef.decoder row {
-        Err err -> Err err
-        Ok b -> case decode_element 2 cdef.decoder row {
-          Err err -> Err err
-          Ok c -> Ok (make a b c)
-        }
-      }
-    },
-  })
+impl Selectable (And left_out right_out) for (And left right)
+  where {Selectable left left_out, Selectable right right_out}
+{
+  to_projection selection = case selection {
+    And left right ->
+      zip_projection (to_projection left) (to_projection right)
+      |> map (fun selected -> {
+        let (left_value, right_value) = selected
+        And left_value right_value
+      })
+  }
+}
+
+impl Selectable (Record out) for (Record fields) where {Selectable fields out} {
+  to_projection selection = case selection {
+    Record name fields ->
+      to_projection fields
+      |> map (fun out -> Record name out)
+  }
 }
 
 pub fun asc : Column source name a -> Order
@@ -609,7 +655,7 @@ prepare projection state = case state.from_source {
     Prepared {
       sql: rendered.sql,
       params: rendered.params,
-      decode: projection_def.decode,
+      decode: projection_decode projection,
     }
   }
 }

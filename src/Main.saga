@@ -68,7 +68,29 @@ users = Db.table "users" user_cols
 fun posts : Db.Table PostsTable Post NewPost (Posts PostsScope)
 posts = Db.table "posts" post_cols
 
-fun user_posts_query : Unit -> Db.Prepared (String, String)
+impl Db.Selectable ({ id: Int, name: String, age: Int }) for Users source {
+  to_projection u =
+    Db.select {
+      id: u.id,
+      name: u.name,
+      age: u.age,
+    }
+}
+
+fun users_query : Unit -> Db.Prepared { id: Int, name: String, age: Int }
+users_query () = Db.query (fun () -> {
+  let u = from! users
+  where_! (Db.gt u.age 18)
+  order_by! [Db.asc u.id]
+  limit! 20
+  Db.select_all u
+})
+
+fun user_posts_query : Unit -> Db.Prepared {
+  post_title: String,
+  user_id: Int,
+  user_name: String,
+}
 user_posts_query () = Db.query (fun () -> {
   let u = from! users
   let p = inner_join! posts (fun post -> Db.eq_col post.author_id u.id)
@@ -79,12 +101,23 @@ user_posts_query () = Db.query (fun () -> {
   ])
   order_by! [Db.desc p.id]
   limit! 20
-  Db.select (u.name, p.title)
+  Db.select {
+    user_id: u.id,
+    user_name: u.name,
+    post_title: p.title,
+  }
 })
 
-fun load_user_posts : Connection -> Result (List (String, String)) Db.DbError
+fun load_user_posts : Connection -> Result (List {
+  post_title: String,
+  user_id: Int,
+  user_name: String,
+}) Db.DbError
   needs {Repo}
 load_user_posts conn = Db.all conn (user_posts_query ())
+
+fun load_users : Connection -> Result (List { id: Int, name: String, age: Int }) Db.DbError needs {Repo}
+load_users conn = Db.all conn (users_query ())
 
 main () = {
   let config =
@@ -94,6 +127,15 @@ main () = {
       port: 5432,
     }
   let conn = connect config
+  let users_prepared = users_query ()
+  println users_prepared.sql
+
+  let users_result = load_users conn with Db.pg_repo
+  case users_result {
+    Ok rows -> println ("users: " <> show (List.length rows))
+    Err err -> println ("users query failed: " <> debug err)
+  }
+
   let prepared = user_posts_query ()
   println prepared.sql
 
@@ -102,7 +144,9 @@ main () = {
   case result {
     Ok rows -> {
       println ("rows: " <> show (List.length rows))
-      List.iter (fun row -> println (debug row)) rows
+      List.iter (fun row ->
+        println (show row.user_id <> ": " <> row.user_name <> " / " <> row.post_title)
+      ) rows
     }
     Err err -> println ("query failed: " <> debug err)
   }
