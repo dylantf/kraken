@@ -56,13 +56,18 @@ impl PgType for Maybe a where {a: PgType} {
   decode_pg = optional decode_pg
 }
 
-record TableDef cols {
+pub type Required = Required
+pub type Optional = Optional
+
+record TableDef required_cols optional_cols {
   name: String,
   alias: Maybe String,
-  make_cols: String -> cols,
+  make_required_cols: String -> required_cols,
+  make_optional_cols: String -> optional_cols,
 }
 
-pub opaque type Table table row insert cols = Table (TableDef cols)
+pub opaque type Table table row insert required_cols optional_cols =
+  Table (TableDef required_cols optional_cols)
 
 record ColumnInfo {
   source: String,
@@ -71,15 +76,23 @@ record ColumnInfo {
 
 pub opaque type Column source (name : Symbol) a = Column ColumnInfo
 
-pub fun table : String -> (String -> cols) -> Table table row insert cols
-table name make_cols =
+pub fun table :
+  String ->
+  (String -> required_cols) ->
+  (String -> optional_cols) ->
+  Table table row insert required_cols optional_cols
+table name make_required_cols make_optional_cols =
   Table (TableDef {
     name: name,
     alias: Nothing,
-    make_cols: make_cols,
+    make_required_cols: make_required_cols,
+    make_optional_cols: make_optional_cols,
   })
 
-pub fun table_as : String -> Table table row insert cols -> Table table row insert cols
+pub fun table_as :
+  String ->
+  Table table row insert required_cols optional_cols ->
+  Table table row insert required_cols optional_cols
 table_as alias table_value = {
   let Table def = table_value
   Table ({ def | alias: Just alias })
@@ -108,6 +121,8 @@ record SqlFrag {
   parts: List SqlPart,
 }
 
+pub opaque type Fragment = Fragment SqlFrag
+
 pub opaque type Expr = Expr SqlFrag
 
 record SelectItem {
@@ -128,6 +143,8 @@ record FieldDef a {
 }
 
 opaque type Field a = Field (FieldDef a)
+
+pub opaque type SelectExpr a = SelectExpr (FieldDef a)
 
 record ProjectionDef a {
   selections: List SelectItem,
@@ -181,8 +198,76 @@ raw text = SqlFrag { parts: [Text text] }
 fun param : Value -> SqlFrag
 param value = SqlFrag { parts: [Param value] }
 
+fun params_frag : List Value -> SqlFrag
+params_frag values = SqlFrag { parts: List.map Param values }
+
 fun append_frag : SqlFrag -> SqlFrag -> SqlFrag
 append_frag left right = SqlFrag { parts: List.append left.parts right.parts }
+
+fun append_frags : List SqlFrag -> SqlFrag
+append_frags frags = case frags {
+  [] -> raw ""
+  frag :: rest -> append_frag frag (append_frags rest)
+}
+
+pub fun raw_expr : String -> Expr
+raw_expr text = Expr (raw text)
+
+pub fun raw_expr_with : String -> List Value -> Expr
+raw_expr_with text params = Expr (append_frag (raw text) (params_frag params))
+
+pub fun sql_text : String -> Fragment
+sql_text text = Fragment (raw text)
+
+pub fun sql_param : Value -> Fragment
+sql_param value = Fragment (param value)
+
+pub fun sql_value : a -> Fragment where {a: PgType}
+sql_value value = Fragment (param (encode_pg value))
+
+pub fun sql_column : Column source name a -> Fragment
+sql_column column = Fragment (column_frag column)
+
+fun fragments_frag : List Fragment -> SqlFrag
+fragments_frag fragments = {
+  let frags = List.map (fun fragment -> case fragment { Fragment frag -> frag }) fragments
+  append_frags frags
+}
+
+pub fun raw_expr_from : List Fragment -> Expr
+raw_expr_from fragments = Expr (fragments_frag fragments)
+
+pub fun raw_sql : String -> Expr
+raw_sql text = raw_expr text
+
+pub fun raw_sql_with : String -> List Value -> Expr
+raw_sql_with text params = raw_expr_with text params
+
+fun select_expr_as_frag : String -> SqlFrag -> SelectExpr a
+  where {a: PgType}
+select_expr_as_frag alias frag =
+  SelectExpr (FieldDef {
+    selection: SelectItem {
+      expr: frag,
+      alias: alias,
+    },
+    decoder: decode_pg,
+  })
+
+pub fun select_raw : String -> SelectExpr a where {a: PgType}
+select_raw text = select_expr_as_frag "value" (raw text)
+
+pub fun select_raw_as : String -> String -> SelectExpr a where {a: PgType}
+select_raw_as alias text = select_expr_as_frag alias (raw text)
+
+pub fun select_raw_with : String -> List Value -> SelectExpr a where {a: PgType}
+select_raw_with text params = select_expr_as_frag "value" (append_frag (raw text) (params_frag params))
+
+pub fun select_raw_from : List Fragment -> SelectExpr a where {a: PgType}
+select_raw_from fragments = select_expr_as_frag "value" (fragments_frag fragments)
+
+pub fun select_raw_from_as : String -> List Fragment -> SelectExpr a where {a: PgType}
+select_raw_from_as alias fragments = select_expr_as_frag alias (fragments_frag fragments)
 
 fun spaced : SqlFrag -> String -> SqlFrag -> SqlFrag
 spaced left op right =
@@ -252,14 +337,24 @@ field_auto column = {
   field_as info.name column
 }
 
-fun field_projection : Column source name a -> Projection a where {a: PgType}
-field_projection column = {
-  let Field def = field_auto column
+fun field_def_projection : FieldDef a -> Projection a
+field_def_projection def =
   Projection (ProjectionDef {
     selections: [def.selection],
     width: 1,
     decode_at: fun offset row -> decode_element offset def.decoder row,
   })
+
+fun field_projection : Column source name a -> Projection a where {a: PgType}
+field_projection column = {
+  let Field def = field_auto column
+  field_def_projection def
+}
+
+fun select_expr_projection : SelectExpr a -> Projection a
+select_expr_projection expr = {
+  let SelectExpr def = expr
+  field_def_projection def
 }
 
 fun relabel_item : String -> SelectItem -> SelectItem
@@ -268,13 +363,19 @@ relabel_item alias item = { item | alias: alias }
 fun relabel_items : String -> List SelectItem -> List SelectItem
 relabel_items alias items = List.map (relabel_item alias) items
 
+fun prefix_item : String -> SelectItem -> SelectItem
+prefix_item prefix item = { item | alias: prefix <> "_" <> item.alias }
+
+fun prefix_items : String -> List SelectItem -> List SelectItem
+prefix_items prefix items = List.map (prefix_item prefix) items
+
 fun relabel_projection : String -> Projection a -> Projection a
 relabel_projection alias projection = {
   let Projection def = projection
   if def.width == 1 then
     Projection ({ def | selections: relabel_items alias def.selections })
   else
-    projection
+    Projection ({ def | selections: prefix_items alias def.selections })
 }
 
 fun zip_projection : Projection a -> Projection b -> Projection (a, b)
@@ -303,6 +404,10 @@ projection_decode projection row = {
 
 impl Selectable a for (Column source name a) where {a: PgType} {
   to_projection column = field_projection column
+}
+
+impl Selectable a for SelectExpr a {
+  to_projection expr = select_expr_projection expr
 }
 
 impl Selectable (Leaf row) for (Leaf selection) where {selection: Selectable row} {
@@ -409,9 +514,15 @@ pub handler pg_repo for Repo needs {Postgres} {
 }
 
 pub effect QueryBuild selection {
-  fun from : Table name row insert cols -> cols
-  fun inner_join : Table name row insert cols -> (cols -> Expr) -> cols
-  fun left_join : Table name row insert cols -> (cols -> Expr) -> cols
+  fun from : Table name row insert required_cols optional_cols -> required_cols
+  fun inner_join :
+    Table name row insert required_cols optional_cols ->
+    (required_cols -> Expr) ->
+    required_cols
+  fun left_join :
+    Table name row insert required_cols optional_cols ->
+    (required_cols -> Expr) ->
+    optional_cols
   fun where_ : Expr -> Unit
   fun order_by : List Order -> Unit
   fun limit : Int -> Unit
@@ -431,8 +542,11 @@ empty_state =
     next_alias: 0,
   }
 
-fun bind_table : Table table row insert cols -> QueryState -> (Source, cols, QueryState)
-bind_table table_value state = {
+fun bind_required_table :
+  Table table row insert required_cols optional_cols ->
+  QueryState ->
+  (Source, required_cols, QueryState)
+bind_required_table table_value state = {
   let Table def = table_value
   let alias = case def.alias {
     Just name -> name
@@ -443,14 +557,14 @@ bind_table table_value state = {
       name: def.name,
       alias: alias,
     }
-  let cols = def.make_cols alias
+  let cols = def.make_required_cols alias
   (source, cols, { state | next_alias: state.next_alias + 1 })
 }
 
 handler collect_query for QueryBuild selection {
   from table_value = {
     QueryStep (fun state -> {
-      let (source, cols, state2) = bind_table table_value state
+      let (source, cols, state2) = bind_required_table table_value state
       let QueryStep run_rest = resume cols
       run_rest ({ state2 | from_source: Just source })
     })
@@ -458,7 +572,7 @@ handler collect_query for QueryBuild selection {
 
   inner_join table_value on_fn = {
     QueryStep (fun state -> {
-      let (source, cols, state2) = bind_table table_value state
+      let (source, cols, state2) = bind_required_table table_value state
       let join = Join {
         kind: InnerJoin,
         source: source,
@@ -471,13 +585,14 @@ handler collect_query for QueryBuild selection {
 
   left_join table_value on_fn = {
     QueryStep (fun state -> {
-      let (source, cols, state2) = bind_table table_value state
+      let (source, required_cols, state2) = bind_required_table table_value state
+      let optional_cols = (case table_value { Table def -> def.make_optional_cols source.alias })
       let join = Join {
         kind: LeftJoin,
         source: source,
-        on: on_fn cols,
+        on: on_fn required_cols,
       }
-      let QueryStep run_rest = resume cols
+      let QueryStep run_rest = resume optional_cols
       run_rest ({ state2 | joins: List.append state2.joins [join] })
     })
   }

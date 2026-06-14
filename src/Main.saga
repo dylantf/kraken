@@ -40,6 +40,12 @@ record Users source {
   age: Db.Column source 'age Int,
 }
 
+record OptionalUsers source {
+  id: Db.Column source 'id (Maybe Int),
+  name: Db.Column source 'name (Maybe String),
+  age: Db.Column source 'age (Maybe Int),
+}
+
 record Posts source {
   id: Db.Column source 'id Int,
   author_id: Db.Column source 'author_id Int,
@@ -47,8 +53,22 @@ record Posts source {
   published: Db.Column source 'published Bool,
 }
 
+record OptionalPosts source {
+  id: Db.Column source 'id (Maybe Int),
+  author_id: Db.Column source 'author_id (Maybe Int),
+  title: Db.Column source 'title (Maybe String),
+  published: Db.Column source 'published (Maybe Bool),
+}
+
 fun user_cols : String -> Users UsersScope
 user_cols source = Users {
+  id: Db.col_as "id" source,
+  name: Db.col_as "name" source,
+  age: Db.col_as "age" source,
+}
+
+fun optional_user_cols : String -> OptionalUsers UsersScope
+optional_user_cols source = OptionalUsers {
   id: Db.col_as "id" source,
   name: Db.col_as "name" source,
   age: Db.col_as "age" source,
@@ -62,11 +82,19 @@ post_cols source = Posts {
   published: Db.col_as "published" source,
 }
 
-fun users : Db.Table UsersTable User NewUser (Users UsersScope)
-users = Db.table "users" user_cols
+fun optional_post_cols : String -> OptionalPosts PostsScope
+optional_post_cols source = OptionalPosts {
+  id: Db.col_as "id" source,
+  author_id: Db.col_as "author_id" source,
+  title: Db.col_as "title" source,
+  published: Db.col_as "published" source,
+}
 
-fun posts : Db.Table PostsTable Post NewPost (Posts PostsScope)
-posts = Db.table "posts" post_cols
+fun users : Db.Table UsersTable User NewUser (Users UsersScope) (OptionalUsers UsersScope)
+users = Db.table "users" user_cols optional_user_cols
+
+fun posts : Db.Table PostsTable Post NewPost (Posts PostsScope) (OptionalPosts PostsScope)
+posts = Db.table "posts" post_cols optional_post_cols
 
 impl Db.Selectable User for Users source {
   to_projection u = {
@@ -86,6 +114,14 @@ users_query () = Db.query (fun () -> {
   select! ({ id: u.id, name: u.name, age: u.age })
 })
 
+fun post_count_query : Unit -> Db.Prepared { total: Int }
+post_count_query () = Db.query (fun () -> {
+  let p = from! posts
+  where_! (Db.eq p.published True)
+  let total: Db.SelectExpr Int = Db.select_raw "COUNT(*)"
+  select! ({ total: total })
+})
+
 fun user_posts_query : Unit -> Db.Prepared {
   post_title: String,
   user: User,
@@ -97,10 +133,27 @@ user_posts_query () = Db.query (fun () -> {
     Db.eq u.name "Alice",
     Db.gt u.age 18,
     Db.eq p.published True,
+    Db.raw_expr_from [
+      Db.sql_column p.title,
+      Db.sql_text " LIKE ",
+      Db.sql_value "Hello%",
+    ],
   ])
   order_by! [Db.desc p.id]
   limit! 20
   select! ({ user: u, post_title: p.title })
+})
+
+# fun users_with_optional_posts_query : Unit -> Db.Prepared {
+#   user: User,
+#   post_id: Maybe Int,
+#   post_title: Maybe String,
+# }
+users_with_optional_posts_query () = Db.query (fun () -> {
+  let u = from! users
+  let p = left_join! posts (fun post -> Db.eq_col post.author_id u.id)
+  order_by! [Db.asc u.id]
+  select! ({ user: u, post_id: p.id, post_title: p.title })
 })
 
 fun load_user_posts : Connection -> Result (List {
@@ -137,6 +190,9 @@ main () = {
 
   let prepared = user_posts_query ()
   println prepared.sql
+
+  let left_prepared = users_with_optional_posts_query ()
+  println left_prepared.sql
 
   let result = load_user_posts conn with Db.pg_repo
 
