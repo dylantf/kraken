@@ -68,13 +68,13 @@ users = Db.table "users" user_cols
 fun posts : Db.Table PostsTable Post NewPost (Posts PostsScope)
 posts = Db.table "posts" post_cols
 
-impl Db.Selectable ({ id: Int, name: String, age: Int }) for Users source {
-  to_projection u =
-    Db.select {
-      id: u.id,
-      name: u.name,
-      age: u.age,
-    }
+impl Db.Selectable User for Users source {
+  to_projection u = {
+    let projection: Db.Projection { id: Int, name: String, age: Int } =
+      Db.project ({ id: u.id, name: u.name, age: u.age })
+    projection
+    |> Db.map (fun row -> User { id: row.id, name: row.name, age: row.age })
+  }
 }
 
 fun users_query : Unit -> Db.Prepared { id: Int, name: String, age: Int }
@@ -83,13 +83,12 @@ users_query () = Db.query (fun () -> {
   where_! (Db.gt u.age 18)
   order_by! [Db.asc u.id]
   limit! 20
-  Db.select_all u
+  select! ({ id: u.id, name: u.name, age: u.age })
 })
 
 fun user_posts_query : Unit -> Db.Prepared {
   post_title: String,
-  user_id: Int,
-  user_name: String,
+  user: User,
 }
 user_posts_query () = Db.query (fun () -> {
   let u = from! users
@@ -101,22 +100,22 @@ user_posts_query () = Db.query (fun () -> {
   ])
   order_by! [Db.desc p.id]
   limit! 20
-  Db.select {
-    user_id: u.id,
-    user_name: u.name,
-    post_title: p.title,
-  }
+  select! ({ user: u, post_title: p.title })
 })
 
 fun load_user_posts : Connection -> Result (List {
   post_title: String,
-  user_id: Int,
-  user_name: String,
+  user: User,
 }) Db.DbError
   needs {Repo}
 load_user_posts conn = Db.all conn (user_posts_query ())
 
-fun load_users : Connection -> Result (List { id: Int, name: String, age: Int }) Db.DbError needs {Repo}
+fun load_users : Connection -> Result (List {
+  id: Int,
+  name: String,
+  age: Int,
+}) Db.DbError
+  needs {Repo}
 load_users conn = Db.all conn (users_query ())
 
 main () = {
@@ -145,8 +144,7 @@ main () = {
     Ok rows -> {
       println ("rows: " <> show (List.length rows))
       List.iter (fun row ->
-        println (show row.user_id <> ": " <> row.user_name <> " / " <> row.post_title)
-      ) rows
+        println $"{show row.user.id}: {row.user.name}/{row.post_title}") rows
     }
     Err err -> println ("query failed: " <> debug err)
   }

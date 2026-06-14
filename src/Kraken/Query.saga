@@ -141,15 +141,23 @@ pub trait Selectable selection row | selection -> row {
   fun to_projection : selection -> Projection row
 }
 
+pub fun project : selection -> Projection row
+  where {
+    selection: Generic selection_rep,
+    selection_rep: Selectable row_rep,
+    row: Generic row_rep,
+  }
+project selection =
+  to_projection (to selection)
+  |> map from
+
 pub fun select : selection -> Projection row
   where {
     selection: Generic selection_rep,
     selection_rep: Selectable row_rep,
     row: Generic row_rep,
   }
-select selection =
-  to_projection (to selection)
-  |> map from
+select selection = project selection
 
 pub fun select_all : selection -> Projection row where {selection: Selectable row}
 select_all selection = to_projection selection
@@ -293,10 +301,14 @@ projection_decode projection row = {
   def.decode_at 0 row
 }
 
-impl Selectable (Leaf a) for (Leaf (Column source name a)) where {a: PgType} {
+impl Selectable a for (Column source name a) where {a: PgType} {
+  to_projection column = field_projection column
+}
+
+impl Selectable (Leaf row) for (Leaf selection) where {selection: Selectable row} {
   to_projection selection = case selection {
-    Leaf column ->
-      field_projection column
+    Leaf value ->
+      to_projection value
       |> map Leaf
   }
 }
@@ -396,7 +408,7 @@ pub handler pg_repo for Repo needs {Postgres} {
   }
 }
 
-pub effect QueryBuild {
+pub effect QueryBuild selection {
   fun from : Table name row insert cols -> cols
   fun inner_join : Table name row insert cols -> (cols -> Expr) -> cols
   fun left_join : Table name row insert cols -> (cols -> Expr) -> cols
@@ -404,6 +416,7 @@ pub effect QueryBuild {
   fun order_by : List Order -> Unit
   fun limit : Int -> Unit
   fun offset : Int -> Unit
+  fun select : selection -> selection
 }
 
 fun empty_state : QueryState
@@ -434,7 +447,7 @@ bind_table table_value state = {
   (source, cols, { state | next_alias: state.next_alias + 1 })
 }
 
-handler collect_query for QueryBuild {
+handler collect_query for QueryBuild selection {
   from table_value = {
     QueryStep (fun state -> {
       let (source, cols, state2) = bind_table table_value state
@@ -497,13 +510,26 @@ handler collect_query for QueryBuild {
     })
   }
 
+  select selection = {
+    QueryStep (fun state -> {
+      let QueryStep run_rest = resume selection
+      run_rest state
+    })
+  }
+
   return value = QueryStep (fun state -> (value, state))
 }
 
-pub fun query : (Unit -> Projection a needs {QueryBuild}) -> Prepared a
+pub fun query : (Unit -> selection needs {QueryBuild selection}) -> Prepared row
+  where {
+    selection: Generic selection_rep,
+    selection_rep: Selectable row_rep,
+    row: Generic row_rep,
+  }
 query make = {
   let QueryStep run_query = make () with collect_query
-  let (projection, state) = run_query empty_state
+  let (selection, state) = run_query empty_state
+  let projection : Projection row = project selection
   prepare projection state
 }
 
