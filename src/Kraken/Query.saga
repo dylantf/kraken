@@ -124,6 +124,9 @@ opaque type SqlArg = SqlArg SqlFrag
 
 opaque type Expr = Expr SqlFrag
 
+fun make_expr : SqlFrag -> Expr
+make_expr frag = Expr frag
+
 record SelectItem {
   expr: SqlFrag,
   alias: String,
@@ -208,10 +211,11 @@ append_frags frags = case frags {
 }
 
 fun raw_expr : String -> Expr
-raw_expr text = Expr (raw_frag text)
+raw_expr text = make_expr (raw_frag text)
 
 fun raw_expr_with : String -> List Value -> Expr
-raw_expr_with text params = Expr (append_frag (raw_frag text) (params_frag params))
+raw_expr_with text params =
+  make_expr (append_frag (raw_frag text) (params_frag params))
 
 pub fun sql_text : String -> Fragment
 sql_text text = Fragment (raw_frag text)
@@ -281,13 +285,13 @@ fun sql_raw_from : List Fragment -> Sql a where {a: PgType}
 sql_raw_from fragments = make_sql (fragments_frag fragments)
 
 fun raw_expr_from : List Fragment -> Expr
-raw_expr_from fragments = Expr (fragments_frag fragments)
+raw_expr_from fragments = make_expr (fragments_frag fragments)
 
 pub fun expr_raw : String -> List SqlArg -> Expr
-expr_raw template args = Expr (raw_template_frag template args)
+expr_raw template args = make_expr (raw_template_frag template args)
 
 pub fun expr : Sql Bool -> Expr
-expr sql_value = Expr (sql_frag sql_value)
+expr sql_value = make_expr (sql_frag sql_value)
 
 fun spaced : SqlFrag -> String -> SqlFrag -> SqlFrag
 spaced left op right =
@@ -300,45 +304,147 @@ fun value_frag : input -> SqlFrag where {input: ToSql a}
 value_frag input = sql_frag (to_sql input)
 
 pub fun eq : input -> a -> Expr where {input: ToSql a, a: PgType}
-eq input value = Expr (spaced (value_frag input) "=" (param (encode_pg value)))
+eq input value =
+  make_expr (spaced (value_frag input) "=" (param (encode_pg value)))
 
 pub fun not_eq : input -> a -> Expr where {input: ToSql a, a: PgType}
 not_eq input value =
-  Expr (spaced (value_frag input) "<>" (param (encode_pg value)))
+  make_expr (spaced (value_frag input) "<>" (param (encode_pg value)))
 
 pub fun gt : input -> a -> Expr where {input: ToSql a, a: PgType}
-gt input value = Expr (spaced (value_frag input) ">" (param (encode_pg value)))
+gt input value =
+  make_expr (spaced (value_frag input) ">" (param (encode_pg value)))
 
 pub fun gte : input -> a -> Expr where {input: ToSql a, a: PgType}
 gte input value =
-  Expr (spaced (value_frag input) ">=" (param (encode_pg value)))
+  make_expr (spaced (value_frag input) ">=" (param (encode_pg value)))
 
 pub fun lt : input -> a -> Expr where {input: ToSql a, a: PgType}
-lt input value = Expr (spaced (value_frag input) "<" (param (encode_pg value)))
+lt input value =
+  make_expr (spaced (value_frag input) "<" (param (encode_pg value)))
 
 pub fun lte : input -> a -> Expr where {input: ToSql a, a: PgType}
 lte input value =
-  Expr (spaced (value_frag input) "<=" (param (encode_pg value)))
+  make_expr (spaced (value_frag input) "<=" (param (encode_pg value)))
 
 pub fun eq_sql : left -> right -> Expr
   where {left: ToSql a, right: ToSql a, a: PgType}
-eq_sql left right = Expr (spaced (value_frag left) "=" (value_frag right))
+eq_sql left right = make_expr (spaced (value_frag left) "=" (value_frag right))
 
 pub fun eq_col : left -> right -> Expr
   where {left: ToSql a, right: ToSql a, a: PgType}
 eq_col left right = eq_sql left right
 
+fun true_expr : Unit -> Expr
+true_expr () = make_expr (raw_frag "TRUE")
+
+fun false_expr : Unit -> Expr
+false_expr () = make_expr (raw_frag "FALSE")
+
+fun value_params_frag : List a -> SqlFrag where {a: PgType}
+value_params_frag values = case values {
+  [] -> raw_frag ""
+  [value] -> param (encode_pg value)
+  value :: rest ->
+    append_frags [param (encode_pg value), raw_frag ", ", value_params_frag rest]
+}
+
+fun array_values_frag : List a -> SqlFrag where {a: PgType}
+array_values_frag values =
+  append_frags [raw_frag "ARRAY[", value_params_frag values, raw_frag "]"]
+
+pub fun like : input -> String -> Expr where {input: ToSql String}
+like input pattern =
+  make_expr (spaced (value_frag input) "LIKE" (param (encode_pg pattern)))
+
+pub fun ilike : input -> String -> Expr where {input: ToSql String}
+ilike input pattern =
+  make_expr (spaced (value_frag input) "ILIKE" (param (encode_pg pattern)))
+
+pub fun between : input -> a -> a -> Expr where {input: ToSql a, a: PgType}
+between input lower upper =
+  make_expr (append_frags [
+    value_frag input,
+    raw_frag " BETWEEN ",
+    param (encode_pg lower),
+    raw_frag " AND ",
+    param (encode_pg upper),
+  ])
+
+pub fun in_ : input -> List a -> Expr where {input: ToSql a, a: PgType}
+in_ input values = case values {
+  [] -> false_expr ()
+  _ ->
+    make_expr (append_frags [
+      value_frag input,
+      raw_frag " IN (",
+      value_params_frag values,
+      raw_frag ")",
+    ])
+}
+
+pub fun not_in : input -> List a -> Expr where {input: ToSql a, a: PgType}
+not_in input values = case values {
+  [] -> true_expr ()
+  _ ->
+    make_expr (append_frags [
+      value_frag input,
+      raw_frag " NOT IN (",
+      value_params_frag values,
+      raw_frag ")",
+    ])
+}
+
+fun any_expr : String -> input -> List a -> Expr
+  where {input: ToSql a, a: PgType}
+any_expr op input values = case values {
+  [] -> false_expr ()
+  _ ->
+    make_expr (append_frags [
+      value_frag input,
+      raw_frag (" " <> op <> " ANY("),
+      array_values_frag values,
+      raw_frag ")",
+    ])
+}
+
+fun all_expr : String -> input -> List a -> Expr
+  where {input: ToSql a, a: PgType}
+all_expr op input values = case values {
+  [] -> true_expr ()
+  _ ->
+    make_expr (append_frags [
+      value_frag input,
+      raw_frag (" " <> op <> " ALL("),
+      array_values_frag values,
+      raw_frag ")",
+    ])
+}
+
+pub fun eq_any : input -> List a -> Expr where {input: ToSql a, a: PgType}
+eq_any input values = any_expr "=" input values
+
+pub fun not_eq_all : input -> List a -> Expr
+  where {input: ToSql a, a: PgType}
+not_eq_all input values = all_expr "<>" input values
+
+pub fun like_any : input -> List String -> Expr where {input: ToSql String}
+like_any input patterns = any_expr "LIKE" input patterns
+
+pub fun ilike_any : input -> List String -> Expr where {input: ToSql String}
+ilike_any input patterns = any_expr "ILIKE" input patterns
+
 pub fun is_null : input -> Expr where {input: ToSql a, a: PgType}
-is_null input = Expr (append_frag (value_frag input) (raw_frag " IS NULL"))
+is_null input = make_expr (append_frag (value_frag input) (raw_frag " IS NULL"))
 
 pub fun is_not_null : input -> Expr where {input: ToSql a, a: PgType}
-is_not_null input = Expr (append_frag (value_frag input) (raw_frag " IS NOT NULL"))
+is_not_null input = make_expr (append_frag (value_frag input) (raw_frag " IS NOT NULL"))
 
 pub fun and_ : List Expr -> Expr
-and_ exprs = Expr (join_exprs " AND " exprs)
+and_ exprs = make_expr (join_exprs " AND " exprs)
 
 pub fun or_ : List Expr -> Expr
-or_ exprs = Expr (join_exprs " OR " exprs)
+or_ exprs = make_expr (join_exprs " OR " exprs)
 
 fun join_exprs : String -> List Expr -> SqlFrag
 join_exprs sep exprs = case exprs {

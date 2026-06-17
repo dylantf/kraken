@@ -269,13 +269,20 @@ clear nullability/cardinality model.
 
 ## Tier 4: Predicate Vocabulary
 
-Useful helpers to add once `Sql a` exists:
+Implemented helpers:
 
 - `in_`
 - `not_in`
 - `like`
 - `ilike`
 - `between`
+- `eq_any`
+- `not_eq_all`
+- `like_any`
+- `ilike_any`
+
+Still useful later:
+
 - `exists`
 - `not_exists`
 - `is_null`
@@ -289,7 +296,28 @@ Db.is_null p.title
 Db.is_not_null p.title
 Db.like p.title "Hello%"
 Db.in_ u.id [1, 2, 3]
+Db.eq_any u.id [1, 2, 3]
+Db.like_any p.title ["Hello%", "Draft%"]
 ```
+
+Empty list policy:
+
+- `in_ x []` renders `FALSE`
+- `not_in x []` renders `TRUE`
+- `eq_any x []`, `like_any x []`, and `ilike_any x []` render `FALSE`
+- `not_eq_all x []` renders `TRUE`
+
+The `ANY`/`ALL` helpers currently render `ANY(ARRAY[...])` and `ALL(ARRAY[...])`
+using individual bind parameters. That keeps the common predicates useful before
+Kraken has a real array column/value model.
+
+Next design topic: arrays and JSON/JSONB.
+
+- Postgres arrays need a `PgArray a` or `PgType (List a)` story, including
+  encoder/decoder behavior and empty array casts.
+- JSON/JSONB likely wants integration with a Saga JSON library, probably via
+  deriving-based `ToJson`/`FromJson` constraints wrapped in `PgJson a` /
+  `PgJsonb a` newtypes or column annotations.
 
 ## Tier 5: Casts And SQL Functions
 

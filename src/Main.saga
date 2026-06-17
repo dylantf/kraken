@@ -155,14 +155,28 @@ user_posts_query () = Db.query (fun () -> {
   let u = from! users
   let p = inner_join! posts (fun post -> Db.eq_col post.author_id u.id)
   where_! (Db.and_ [
-    Db.eq u.name "Alice",
-    Db.gt u.age 18,
+    Db.in_ u.name ["Alice", "Bob"],
+    Db.between u.age 18 65,
     Db.eq p.published True,
-    Db.expr_raw "? LIKE ?" [Db.sql p.title, Db.value "Hello%"],
+    Db.like p.title "Hello%",
   ])
   order_by! [Db.desc p.id]
   limit! 20
   select! ({ user: u, post_title: p.title })
+})
+
+fun predicate_showcase_query : Unit -> Db.Prepared { id: Int }
+predicate_showcase_query () = Db.query (fun () -> {
+  let u = from! users
+  where_! (Db.and_ [
+    Db.ilike u.name "%alice%",
+    Db.not_in u.name ["Mallory"],
+    Db.eq_any u.id [1, 2, 3],
+    Db.not_eq_all u.id [99, 100],
+    Db.like_any u.name ["A%", "B%"],
+    Db.ilike_any u.name ["%a%", "%b%"],
+  ])
+  select! ({ id: u.id })
 })
 
 # fun users_with_optional_posts_query : Unit -> Db.Prepared {
@@ -237,6 +251,9 @@ main () = {
 
   let grouped_prepared = post_counts_by_author_query ()
   println grouped_prepared.sql
+
+  let predicate_prepared = predicate_showcase_query ()
+  println predicate_prepared.sql
 
   let stats_prepared = user_age_stats_query ()
   println stats_prepared.sql
