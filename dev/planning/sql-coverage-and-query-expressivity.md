@@ -329,17 +329,17 @@ Kraken has a real array column/value model.
 
 ## Schema Ergonomics
 
-Current demos define both required and optional column records:
+Earlier demos defined both required and optional column records:
 
 ```saga
 record Users source { ... Column source name a ... }
 record OptionalUsers source { ... Column source name (Maybe a) ... }
 ```
 
-This is only acceptable as scaffolding. The library needs the optional shape for
-outer joins, because a `LEFT JOIN` can make every column on the joined side
-`NULL` even when the table column is declared `NOT NULL`. But users should define
-a table's columns once.
+That was only acceptable as scaffolding. The library needs an optional column
+shape for outer joins, because a `LEFT JOIN` can make every column on the joined
+side `NULL` even when the table column is declared `NOT NULL`. But users should
+not need to define a second `OptionalFoo` record.
 
 Target direction: derive or generic-transform the nullable mirror:
 
@@ -348,8 +348,98 @@ Column source name a -> Column source name (Maybe a)
 ```
 
 recursively over the table column record. `from!` and `inner_join!` keep the
-required shape; `left_join!` returns the generated optional shape. Circle back
-before treating the schema API as user-ready.
+required shape; `left_join!` returns an optional shape.
+
+Current schema-trait checkpoint:
+
+```saga
+pub type TableRef a = TableRef Int
+
+pub trait TableSchema cols row insert optional_cols {
+  fun schema_table_name : TableRef cols -> String
+  fun schema_required_cols : String -> cols
+  fun schema_optional_cols : String -> optional_cols
+}
+
+pub fun table_for : TableRef required_cols
+  -> Table required_cols row insert required_cols optional_cols
+  where {required_cols: TableSchema row insert optional_cols}
+```
+
+This lets a table value be derived from one impl. The optional scope can now be
+an anonymous record type instead of a named `OptionalUsers` record:
+
+```saga
+impl Db.TableSchema User NewUser ({
+  id: Db.Column source 'id (Maybe Int),
+  name: Db.Column source 'name (Maybe String),
+  age: Db.Column source 'age (Maybe Int),
+}) for Users source {
+  ...
+}
+
+fun users : Db.Table (Users UsersScope) User NewUser (Users UsersScope) {
+  id: Db.Column UsersScope 'id (Maybe Int),
+  name: Db.Column UsersScope 'name (Maybe String),
+  age: Db.Column UsersScope 'age (Maybe Int),
+}
+users = Db.table_for Db.table_ref
+```
+
+That removes the separate `user_cols` / `optional_user_cols` helper functions
+and separate table marker types. It also removes the named `OptionalFoo` record
+from user code. Direct optional column selection works:
+
+```saga
+let p = left_join! posts (fun post -> Db.eq_col post.author_id u.id)
+select! ({ post_title: p.title })
+# post_title : Maybe String
+```
+
+Whole-row projection checkpoint:
+
+Applied derives now cover the whole-row projection bridge. The user-facing shape
+is:
+
+```saga
+record User {
+  id: Int,
+  name: String,
+  age: Int,
+} deriving (Generic)
+
+record Users source {
+  id: Db.Column source 'id Int,
+  name: Db.Column source 'name String,
+  age: Db.Column source 'age Int,
+} deriving (Generic, Db.Selectable User)
+```
+
+This replaces both the public `impl Db.Selectable User for Users source` and the
+internal generated-representation bridge. It works even though `Db.Projection`
+is opaque because the derive can route through `Db.map` instead of destructuring
+the wrapper.
+
+Remaining schema ergonomics work:
+
+- The anonymous optional shape is still verbose and repeats the table fields.
+  The next target is deriving or schema-generating:
+
+```saga
+Db.Column source name a -> Db.Column source name (Maybe a)
+```
+
+- Whole-row selection from a left join is not yet implicit. Ideally:
+
+```saga
+let p = left_join! posts (fun post -> Db.eq_col post.author_id u.id)
+select! ({ post: p })
+# post : Maybe Post
+```
+
+Currently the optional scope is anonymous, and Saga cannot attach a
+`Selectable (Maybe Post)` impl to that anonymous record directly. This likely
+needs another generated bridge, or an explicit helper/design decision.
 
 Array status:
 

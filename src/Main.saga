@@ -41,51 +41,36 @@ type PostsScope = PostsScope
 type UsersTable = UsersTable
 type PostsTable = PostsTable
 
-record Users source {
-  id: Db.Column source 'id Int,
-  name: Db.Column source 'name String,
-  age: Db.Column source 'age Int,
+record Users source meta {
+  id: Db.Column source meta 'id Int,
+  name: Db.Column source meta 'name String,
+  age: Db.Column source meta 'age Int,
 }
 
-record OptionalUsers source {
-  id: Db.Column source 'id (Maybe Int),
-  name: Db.Column source 'name (Maybe String),
-  age: Db.Column source 'age (Maybe Int),
+record Posts source meta {
+  id: Db.Column source meta 'id Int,
+  author_id: Db.Column source meta 'author_id Int,
+  title: Db.Column source meta 'title String,
+  published: Db.Column source meta 'published Bool,
+  tags: Db.Column source meta 'tags (Db.Array String),
+  metadata: Db.Column source meta 'metadata (Db.Jsonb Metadata),
 }
 
-record Posts source {
-  id: Db.Column source 'id Int,
-  author_id: Db.Column source 'author_id Int,
-  title: Db.Column source 'title String,
-  published: Db.Column source 'published Bool,
-  tags: Db.Column source 'tags (Db.Array String),
-  metadata: Db.Column source 'metadata (Db.Jsonb Metadata),
-}
-
-record OptionalPosts source {
-  id: Db.Column source 'id (Maybe Int),
-  author_id: Db.Column source 'author_id (Maybe Int),
-  title: Db.Column source 'title (Maybe String),
-  published: Db.Column source 'published (Maybe Bool),
-  tags: Db.Column source 'tags (Maybe (Db.Array String)),
-  metadata: Db.Column source 'metadata (Maybe (Db.Jsonb Metadata)),
-}
-
-fun user_cols : String -> Users UsersScope
+fun user_cols : String -> Users UsersScope Db.Required
 user_cols source = Users {
   id: Db.col_as "id" source,
   name: Db.col_as "name" source,
   age: Db.col_as "age" source,
 }
 
-fun optional_user_cols : String -> OptionalUsers UsersScope
-optional_user_cols source = OptionalUsers {
+fun optional_user_cols : String -> Users UsersScope Db.Optional
+optional_user_cols source = Users {
   id: Db.col_as "id" source,
   name: Db.col_as "name" source,
   age: Db.col_as "age" source,
 }
 
-fun post_cols : String -> Posts PostsScope
+fun post_cols : String -> Posts PostsScope Db.Required
 post_cols source = Posts {
   id: Db.col_as "id" source,
   author_id: Db.col_as "author_id" source,
@@ -95,8 +80,8 @@ post_cols source = Posts {
   metadata: Db.col_as "metadata" source,
 }
 
-fun optional_post_cols : String -> OptionalPosts PostsScope
-optional_post_cols source = OptionalPosts {
+fun optional_post_cols : String -> Posts PostsScope Db.Optional
+optional_post_cols source = Posts {
   id: Db.col_as "id" source,
   author_id: Db.col_as "author_id" source,
   title: Db.col_as "title" source,
@@ -105,13 +90,13 @@ optional_post_cols source = OptionalPosts {
   metadata: Db.col_as "metadata" source,
 }
 
-fun users : Db.Table UsersTable User NewUser (Users UsersScope) (OptionalUsers UsersScope)
+fun users : Db.Table UsersTable User NewUser (Users UsersScope Db.Required) (Users UsersScope Db.Optional)
 users = Db.table "users" user_cols optional_user_cols
 
-fun posts : Db.Table PostsTable Post NewPost (Posts PostsScope) (OptionalPosts PostsScope)
+fun posts : Db.Table PostsTable Post NewPost (Posts PostsScope Db.Required) (Posts PostsScope Db.Optional)
 posts = Db.table "posts" post_cols optional_post_cols
 
-impl Db.Selectable User for Users source {
+impl Db.Selectable User for (Users source Db.Required) {
   to_projection u = {
     let projection: Db.Projection { id: Int, name: String, age: Int } =
       Db.project ({ id: u.id, name: u.name, age: u.age })
@@ -238,11 +223,12 @@ metadata_probe_query () = Query.query (fun () -> {
   })
 })
 
-# fun users_with_optional_posts_query : Unit -> Query.Prepared {
-#   user: User,
-#   post_id: Maybe Int,
-#   post_title: Maybe String,
-# }
+fun users_with_optional_posts_query : Unit
+  -> Query.Prepared {
+    user: User,
+    post_id: Maybe Int,
+    post_title: Maybe String,
+  }
 users_with_optional_posts_query () = Query.query (fun () -> {
   let u = from! users
   let p = left_join! posts (fun post -> Db.eq_col post.author_id u.id)

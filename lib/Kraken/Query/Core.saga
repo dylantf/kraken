@@ -134,7 +134,7 @@ record ColumnInfo {
   name: String,
 }
 
-opaque type Column source (name : Symbol) a = Column ColumnInfo
+opaque type Column source meta (name : Symbol) a = Column ColumnInfo
 
 pub fun table : String
   -> (String -> required_cols)
@@ -186,11 +186,11 @@ table_optional_cols alias table_value = {
   def.make_optional_cols alias
 }
 
-pub fun col : Proxy name -> String -> Column source name a
+pub fun col : Proxy name -> String -> Column source meta name a
   where {name: KnownSymbol}
 col name source = Column (ColumnInfo { source: source, name: symbol_name name })
 
-pub fun col_as : String -> String -> Column source name a
+pub fun col_as : String -> String -> Column source meta name a
 col_as name source = Column (ColumnInfo { source: source, name: name })
 
 pub type SqlPart =
@@ -324,7 +324,7 @@ sql_param value = Fragment (param value)
 pub fun sql_value : a -> Fragment where {a: PgType}
 sql_value value = Fragment (param (encode_pg value))
 
-pub fun sql_column : Column source name a -> Fragment
+pub fun sql_column : Column source meta name a -> Fragment
 sql_column column = Fragment (column_frag column)
 
 fun sql_frag : Sql a -> SqlFrag
@@ -377,7 +377,7 @@ raw template args = make_sql (raw_template_frag template args)
 pub fun raw_array : String -> List SqlArg -> Sql (Array a) where {a: PgType}
 raw_array template args = make_sql (raw_template_frag template args)
 
-pub fun raw_array_like : Column source name (Array a)
+pub fun raw_array_like : Column source meta name (Array a)
   -> String
   -> List SqlArg
   -> Sql (Array a)
@@ -414,7 +414,7 @@ fun spaced : SqlFrag -> String -> SqlFrag -> SqlFrag
 spaced left op right =
   append_frag left (append_frag (raw_frag (" " <> op <> " ")) right)
 
-fun column_frag : Column source name a -> SqlFrag
+fun column_frag : Column source meta name a -> SqlFrag
 column_frag (Column info) = raw_frag (info.source <> "." <> info.name)
 
 fun value_frag : input -> SqlFrag where {input: ToSql a}
@@ -612,14 +612,14 @@ join_exprs sep exprs = case exprs {
   }
 }
 
-fun field_as : String -> Column source name a -> Field a where {a: PgType}
+fun field_as : String -> Column source meta name a -> Field a where {a: PgType}
 field_as alias column =
   Field (FieldDef {
     selection: SelectItem { expr: column_frag column, alias: alias },
     decoder: decode_pg,
   })
 
-fun field_auto : Column source name a -> Field a where {a: PgType}
+fun field_auto : Column source meta name a -> Field a where {a: PgType}
 field_auto column = {
   let Column info = column
   field_as info.name column
@@ -633,10 +633,20 @@ field_def_projection def =
     decode_at: fun offset row -> decode_element offset def.decoder row,
   })
 
-fun field_projection : Column source name a -> Projection a where {a: PgType}
+fun field_projection : Column source meta name a -> Projection a where {a: PgType}
 field_projection column = {
   let Field def = field_auto column
   field_def_projection def
+}
+
+fun optional_field_projection : Column source meta name a -> Projection (Maybe a)
+  where {a: PgType}
+optional_field_projection column = {
+  let Column info = column
+  field_def_projection (FieldDef {
+    selection: SelectItem { expr: column_frag column, alias: info.name },
+    decoder: optional decode_pg,
+  })
 }
 
 fun sql_projection : Sql a -> Projection a
@@ -705,15 +715,19 @@ projection_selections projection = {
 pub fun decode_projection : Projection a -> Dynamic -> Result a DecodeError
 decode_projection projection row = projection_decode projection row
 
-impl Selectable a for Column source name a where {a: PgType} {
+impl Selectable a for (Column source Required name a) where {a: PgType} {
   to_projection column = field_projection column
+}
+
+impl Selectable (Maybe a) for (Column source Optional name a) where {a: PgType} {
+  to_projection column = optional_field_projection column
 }
 
 impl Selectable a for Sql a {
   to_projection sql_value = sql_projection sql_value
 }
 
-impl ToSql a for Column source name a where {a: PgType} {
+impl ToSql a for Column source meta name a where {a: PgType} {
   to_sql column = make_sql (column_frag column)
 }
 
@@ -721,7 +735,7 @@ impl ToSql a for Sql a {
   to_sql sql_value = sql_value
 }
 
-impl ToArraySql a for (Column source name (Array a)) where {a: PgType} {
+impl ToArraySql a for (Column source meta name (Array a)) where {a: PgType} {
   to_array_sql column = make_sql (column_frag column)
 }
 
@@ -729,7 +743,7 @@ impl ToArraySql a for (Sql (Array a)) where {a: PgType} {
   to_array_sql sql_value = sql_value
 }
 
-impl ToJsonbSql a for (Column source name (Jsonb a))
+impl ToJsonbSql a for (Column source meta name (Jsonb a))
   where {a: ToJson + FromJson}
 {
   to_jsonb_sql column = make_sql (column_frag column)
