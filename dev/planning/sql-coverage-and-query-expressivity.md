@@ -32,6 +32,22 @@ Kraken currently supports:
   `avg`, `min`, `max`
 - query execution through `all` and `one`
 
+Current module layout:
+
+- `Kraken.Query.Core`
+  - schema/table/column types
+  - `PgType`
+  - typed SQL expressions
+  - projections and `Selectable`
+  - predicates, ordering, grouping, and aggregates
+- `Kraken.Query`
+  - `QueryBuild`
+  - query collection/rendering
+  - prepared queries
+  - execution helpers and `pg_repo`
+
+The demo keeps the app in `src/Main.saga` and the library modules under `lib/`.
+
 Example:
 
 ```saga

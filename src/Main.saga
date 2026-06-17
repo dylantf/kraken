@@ -1,8 +1,9 @@
 module Main
 
 import Std.IO (console)
-import Kraken.Query as Db
+import Kraken.Query as Query
 import Kraken.Query (QueryBuild, Repo)
+import Kraken.Query.Core as Db
 import SagaPgo (Connection, connect, default_config, pg)
 
 record User {
@@ -105,8 +106,8 @@ impl Db.Selectable User for Users source {
   }
 }
 
-fun users_query : Unit -> Db.Prepared { id: Int, name: String, age: Int }
-users_query () = Db.query (fun () -> {
+fun users_query : Unit -> Query.Prepared { id: Int, name: String, age: Int }
+users_query () = Query.query (fun () -> {
   let u = from! users
   where_! (Db.gt u.age 18)
   order_by! [Db.asc u.id]
@@ -114,18 +115,18 @@ users_query () = Db.query (fun () -> {
   select! ({ id: u.id, name: u.name, age: u.age })
 })
 
-fun post_count_query : Unit -> Db.Prepared { total: Int }
-post_count_query () = Db.query (fun () -> {
+fun post_count_query : Unit -> Query.Prepared { total: Int }
+post_count_query () = Query.query (fun () -> {
   let p = from! posts
   where_! (Db.eq p.published True)
   select! ({ total: Db.count_star })
 })
 
-fun post_counts_by_author_query : Unit -> Db.Prepared {
+fun post_counts_by_author_query : Unit -> Query.Prepared {
   author_id: Int,
   total: Int,
 }
-post_counts_by_author_query () = Db.query (fun () -> {
+post_counts_by_author_query () = Query.query (fun () -> {
   let p = from! posts
   group_by! [Db.group p.author_id]
   having! (Db.gt (Db.count p.id) 0)
@@ -133,12 +134,12 @@ post_counts_by_author_query () = Db.query (fun () -> {
   select! ({ author_id: p.author_id, total: Db.count p.id })
 })
 
-fun user_age_stats_query : Unit -> Db.Prepared {
+fun user_age_stats_query : Unit -> Query.Prepared {
   average_age: Maybe Float,
   oldest_age: Maybe Int,
   total_age: Maybe Int,
 }
-user_age_stats_query () = Db.query (fun () -> {
+user_age_stats_query () = Query.query (fun () -> {
   let u = from! users
   select! ({
     average_age: Db.avg u.age,
@@ -147,11 +148,11 @@ user_age_stats_query () = Db.query (fun () -> {
   })
 })
 
-fun user_posts_query : Unit -> Db.Prepared {
+fun user_posts_query : Unit -> Query.Prepared {
   post_title: String,
   user: User,
 }
-user_posts_query () = Db.query (fun () -> {
+user_posts_query () = Query.query (fun () -> {
   let u = from! users
   let p = inner_join! posts (fun post -> Db.eq_col post.author_id u.id)
   where_! (Db.and_ [
@@ -165,8 +166,8 @@ user_posts_query () = Db.query (fun () -> {
   select! ({ user: u, post_title: p.title })
 })
 
-fun predicate_showcase_query : Unit -> Db.Prepared { id: Int }
-predicate_showcase_query () = Db.query (fun () -> {
+fun predicate_showcase_query : Unit -> Query.Prepared { id: Int }
+predicate_showcase_query () = Query.query (fun () -> {
   let u = from! users
   where_! (Db.and_ [
     Db.ilike u.name "%alice%",
@@ -179,12 +180,12 @@ predicate_showcase_query () = Db.query (fun () -> {
   select! ({ id: u.id })
 })
 
-# fun users_with_optional_posts_query : Unit -> Db.Prepared {
+# fun users_with_optional_posts_query : Unit -> Query.Prepared {
 #   user: User,
 #   post_id: Maybe Int,
 #   post_title: Maybe String,
 # }
-users_with_optional_posts_query () = Db.query (fun () -> {
+users_with_optional_posts_query () = Query.query (fun () -> {
   let u = from! users
   let p = left_join! posts (fun post -> Db.eq_col post.author_id u.id)
   order_by! [Db.asc u.id]
@@ -194,25 +195,25 @@ users_with_optional_posts_query () = Db.query (fun () -> {
 fun load_user_posts : Connection -> Result (List {
   post_title: String,
   user: User,
-}) Db.DbError
+}) Query.DbError
   needs {Repo}
-load_user_posts conn = Db.all conn (user_posts_query ())
+load_user_posts conn = Query.all conn (user_posts_query ())
 
 fun load_users : Connection -> Result (List {
   id: Int,
   name: String,
   age: Int,
-}) Db.DbError
+}) Query.DbError
   needs {Repo}
-load_users conn = Db.all conn (users_query ())
+load_users conn = Query.all conn (users_query ())
 
 fun load_user_age_stats : Connection -> Result (Maybe {
   average_age: Maybe Float,
   oldest_age: Maybe Int,
   total_age: Maybe Int,
-}) Db.DbError
+}) Query.DbError
   needs {Repo}
-load_user_age_stats conn = Db.one conn (user_age_stats_query ())
+load_user_age_stats conn = Query.one conn (user_age_stats_query ())
 
 fun show_maybe_int : Maybe Int -> String
 show_maybe_int value = case value {
@@ -237,7 +238,7 @@ main () = {
   let users_prepared = users_query ()
   println users_prepared.sql
 
-  let users_result = load_users conn with Db.pg_repo
+  let users_result = load_users conn with Query.pg_repo
   case users_result {
     Ok rows -> println ("users: " <> show (List.length rows))
     Err err -> println ("users query failed: " <> debug err)
@@ -258,7 +259,7 @@ main () = {
   let stats_prepared = user_age_stats_query ()
   println stats_prepared.sql
 
-  let stats_result = load_user_age_stats conn with Db.pg_repo
+  let stats_result = load_user_age_stats conn with Query.pg_repo
   case stats_result {
     Ok (Just stats) ->
       println $"age stats: avg={show_maybe_float stats.average_age} oldest={show_maybe_int stats.oldest_age} total={show_maybe_int stats.total_age}"
@@ -266,7 +267,7 @@ main () = {
     Err err -> println ("stats query failed: " <> debug err)
   }
 
-  let result = load_user_posts conn with Db.pg_repo
+  let result = load_user_posts conn with Query.pg_repo
 
   case result {
     Ok rows -> {
