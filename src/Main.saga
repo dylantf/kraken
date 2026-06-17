@@ -118,8 +118,19 @@ fun post_count_query : Unit -> Db.Prepared { total: Int }
 post_count_query () = Db.query (fun () -> {
   let p = from! posts
   where_! (Db.eq p.published True)
-  let total: Db.SelectExpr Int = Db.select_raw "COUNT(*)"
-  select! ({ total: total })
+  select! ({ total: Db.count_star })
+})
+
+fun post_counts_by_author_query : Unit -> Db.Prepared {
+  author_id: Int,
+  total: Int,
+}
+post_counts_by_author_query () = Db.query (fun () -> {
+  let p = from! posts
+  group_by! [Db.group p.author_id]
+  having! (Db.gt (Db.count p.id) 0)
+  order_by! [Db.desc (Db.count p.id)]
+  select! ({ author_id: p.author_id, total: Db.count p.id })
 })
 
 fun user_posts_query : Unit -> Db.Prepared {
@@ -193,6 +204,9 @@ main () = {
 
   let left_prepared = users_with_optional_posts_query ()
   println left_prepared.sql
+
+  let grouped_prepared = post_counts_by_author_query ()
+  println grouped_prepared.sql
 
   let result = load_user_posts conn with Db.pg_repo
 

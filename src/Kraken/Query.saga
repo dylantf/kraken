@@ -66,21 +66,20 @@ record TableDef required_cols optional_cols {
   make_optional_cols: String -> optional_cols,
 }
 
-pub opaque type Table table row insert required_cols optional_cols =
-  Table (TableDef required_cols optional_cols)
+opaque type Table table row insert required_cols optional_cols =
+  | Table (TableDef required_cols optional_cols)
 
 record ColumnInfo {
   source: String,
   name: String,
 }
 
-pub opaque type Column source (name : Symbol) a = Column ColumnInfo
+opaque type Column source (name : Symbol) a = Column ColumnInfo
 
-pub fun table :
-  String ->
-  (String -> required_cols) ->
-  (String -> optional_cols) ->
-  Table table row insert required_cols optional_cols
+pub fun table : String
+  -> (String -> required_cols)
+  -> (String -> optional_cols)
+  -> Table table row insert required_cols optional_cols
 table name make_required_cols make_optional_cols =
   Table (TableDef {
     name: name,
@@ -89,10 +88,9 @@ table name make_required_cols make_optional_cols =
     make_optional_cols: make_optional_cols,
   })
 
-pub fun table_as :
-  String ->
-  Table table row insert required_cols optional_cols ->
-  Table table row insert required_cols optional_cols
+pub fun table_as : String
+  -> Table table row insert required_cols optional_cols
+  -> Table table row insert required_cols optional_cols
 table_as alias table_value = {
   let Table def = table_value
   Table ({ def | alias: Just alias })
@@ -100,18 +98,10 @@ table_as alias table_value = {
 
 pub fun col : Proxy name -> String -> Column source name a
   where {name: KnownSymbol}
-col name source =
-  Column (ColumnInfo {
-    source: source,
-    name: symbol_name name,
-  })
+col name source = Column (ColumnInfo { source: source, name: symbol_name name })
 
 pub fun col_as : String -> String -> Column source name a
-col_as name source =
-  Column (ColumnInfo {
-    source: source,
-    name: name,
-  })
+col_as name source = Column (ColumnInfo { source: source, name: name })
 
 type SqlPart =
   | Text String
@@ -121,9 +111,16 @@ record SqlFrag {
   parts: List SqlPart,
 }
 
-pub opaque type Fragment = Fragment SqlFrag
+opaque type Fragment = Fragment SqlFrag
 
-pub opaque type Expr = Expr SqlFrag
+record SqlDef a {
+  frag: SqlFrag,
+  decoder: Decoder a,
+}
+
+opaque type Sql a = Sql (SqlDef a)
+
+opaque type Expr = Expr SqlFrag
 
 record SelectItem {
   expr: SqlFrag,
@@ -135,7 +132,9 @@ record OrderItem {
   direction: String,
 }
 
-pub opaque type Order = Order OrderItem
+opaque type Order = Order OrderItem
+
+opaque type Group = Group SqlFrag
 
 record FieldDef a {
   selection: SelectItem,
@@ -144,7 +143,7 @@ record FieldDef a {
 
 opaque type Field a = Field (FieldDef a)
 
-pub opaque type SelectExpr a = SelectExpr (FieldDef a)
+opaque type SelectExpr a = SelectExpr (FieldDef a)
 
 record ProjectionDef a {
   selections: List SelectItem,
@@ -152,31 +151,28 @@ record ProjectionDef a {
   decode_at: Int -> Dynamic -> Result a DecodeError,
 }
 
-pub opaque type Projection a = Projection (ProjectionDef a)
+opaque type Projection a = Projection (ProjectionDef a)
 
 pub trait Selectable selection row | selection -> row {
   fun to_projection : selection -> Projection row
 }
 
+pub trait ToSql input a | input -> a {
+  fun to_sql : input -> Sql a
+}
+
 pub fun project : selection -> Projection row
-  where {
-    selection: Generic selection_rep,
-    selection_rep: Selectable row_rep,
-    row: Generic row_rep,
-  }
+  where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 project selection =
   to_projection (to selection)
   |> map from
 
 pub fun select : selection -> Projection row
-  where {
-    selection: Generic selection_rep,
-    selection_rep: Selectable row_rep,
-    row: Generic row_rep,
-  }
+  where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 select selection = project selection
 
-pub fun select_all : selection -> Projection row where {selection: Selectable row}
+pub fun select_all : selection -> Projection row
+  where {selection: Selectable row}
 select_all selection = to_projection selection
 
 pub fun map : (a -> b) -> Projection a -> Projection b
@@ -185,10 +181,11 @@ map transform projection = {
   Projection (ProjectionDef {
     selections: def.selections,
     width: def.width,
-    decode_at: fun offset row -> case def.decode_at offset row {
-      Err err -> Err err
-      Ok value -> Ok (transform value)
-    },
+    decode_at: fun offset row ->
+      case def.decode_at offset row {
+        Err err -> Err err
+        Ok value -> Ok (transform value)
+      },
   })
 }
 
@@ -228,11 +225,32 @@ sql_value value = Fragment (param (encode_pg value))
 pub fun sql_column : Column source name a -> Fragment
 sql_column column = Fragment (column_frag column)
 
+fun sql_frag : Sql a -> SqlFrag
+sql_frag sql_value = case sql_value {
+  Sql def -> def.frag
+}
+
+fun make_sql : SqlFrag -> Sql a where {a: PgType}
+make_sql frag = Sql (SqlDef { frag: frag, decoder: decode_pg })
+
+pub fun sql_raw : String -> Sql a where {a: PgType}
+sql_raw text = make_sql (raw text)
+
+pub fun sql_raw_with : String -> List Value -> Sql a where {a: PgType}
+sql_raw_with text params =
+  make_sql (append_frag (raw text) (params_frag params))
+
 fun fragments_frag : List Fragment -> SqlFrag
 fragments_frag fragments = {
-  let frags = List.map (fun fragment -> case fragment { Fragment frag -> frag }) fragments
+  let frags =
+    List.map (fun fragment -> case fragment {
+      Fragment frag -> frag
+    }) fragments
   append_frags frags
 }
+
+pub fun sql_raw_from : List Fragment -> Sql a where {a: PgType}
+sql_raw_from fragments = make_sql (fragments_frag fragments)
 
 pub fun raw_expr_from : List Fragment -> Expr
 raw_expr_from fragments = Expr (fragments_frag fragments)
@@ -243,31 +261,29 @@ raw_sql text = raw_expr text
 pub fun raw_sql_with : String -> List Value -> Expr
 raw_sql_with text params = raw_expr_with text params
 
-fun select_expr_as_frag : String -> SqlFrag -> SelectExpr a
-  where {a: PgType}
+fun select_expr_as_frag : String -> SqlFrag -> SelectExpr a where {a: PgType}
 select_expr_as_frag alias frag =
   SelectExpr (FieldDef {
-    selection: SelectItem {
-      expr: frag,
-      alias: alias,
-    },
+    selection: SelectItem { expr: frag, alias: alias },
     decoder: decode_pg,
   })
 
-pub fun select_raw : String -> SelectExpr a where {a: PgType}
-select_raw text = select_expr_as_frag "value" (raw text)
+pub fun select_raw : String -> Sql a where {a: PgType}
+select_raw text = sql_raw text
 
 pub fun select_raw_as : String -> String -> SelectExpr a where {a: PgType}
 select_raw_as alias text = select_expr_as_frag alias (raw text)
 
-pub fun select_raw_with : String -> List Value -> SelectExpr a where {a: PgType}
-select_raw_with text params = select_expr_as_frag "value" (append_frag (raw text) (params_frag params))
+pub fun select_raw_with : String -> List Value -> Sql a where {a: PgType}
+select_raw_with text params = sql_raw_with text params
 
-pub fun select_raw_from : List Fragment -> SelectExpr a where {a: PgType}
-select_raw_from fragments = select_expr_as_frag "value" (fragments_frag fragments)
+pub fun select_raw_from : List Fragment -> Sql a where {a: PgType}
+select_raw_from fragments = sql_raw_from fragments
 
-pub fun select_raw_from_as : String -> List Fragment -> SelectExpr a where {a: PgType}
-select_raw_from_as alias fragments = select_expr_as_frag alias (fragments_frag fragments)
+pub fun select_raw_from_as : String -> List Fragment -> SelectExpr a
+  where {a: PgType}
+select_raw_from_as alias fragments =
+  select_expr_as_frag alias (fragments_frag fragments)
 
 fun spaced : SqlFrag -> String -> SqlFrag -> SqlFrag
 spaced left op right =
@@ -276,32 +292,43 @@ spaced left op right =
 fun column_frag : Column source name a -> SqlFrag
 column_frag (Column info) = raw (info.source <> "." <> info.name)
 
-pub fun eq : Column source name a -> a -> Expr where {a: PgType}
-eq column value = Expr (spaced (column_frag column) "=" (param (encode_pg value)))
+fun value_frag : input -> SqlFrag where {input: ToSql a}
+value_frag input = sql_frag (to_sql input)
 
-pub fun not_eq : Column source name a -> a -> Expr where {a: PgType}
-not_eq column value = Expr (spaced (column_frag column) "<>" (param (encode_pg value)))
+pub fun eq : input -> a -> Expr where {input: ToSql a, a: PgType}
+eq input value = Expr (spaced (value_frag input) "=" (param (encode_pg value)))
 
-pub fun gt : Column source name a -> a -> Expr where {a: PgType}
-gt column value = Expr (spaced (column_frag column) ">" (param (encode_pg value)))
+pub fun not_eq : input -> a -> Expr where {input: ToSql a, a: PgType}
+not_eq input value =
+  Expr (spaced (value_frag input) "<>" (param (encode_pg value)))
 
-pub fun gte : Column source name a -> a -> Expr where {a: PgType}
-gte column value = Expr (spaced (column_frag column) ">=" (param (encode_pg value)))
+pub fun gt : input -> a -> Expr where {input: ToSql a, a: PgType}
+gt input value = Expr (spaced (value_frag input) ">" (param (encode_pg value)))
 
-pub fun lt : Column source name a -> a -> Expr where {a: PgType}
-lt column value = Expr (spaced (column_frag column) "<" (param (encode_pg value)))
+pub fun gte : input -> a -> Expr where {input: ToSql a, a: PgType}
+gte input value =
+  Expr (spaced (value_frag input) ">=" (param (encode_pg value)))
 
-pub fun lte : Column source name a -> a -> Expr where {a: PgType}
-lte column value = Expr (spaced (column_frag column) "<=" (param (encode_pg value)))
+pub fun lt : input -> a -> Expr where {input: ToSql a, a: PgType}
+lt input value = Expr (spaced (value_frag input) "<" (param (encode_pg value)))
 
-pub fun eq_col : Column left lname a -> Column right rname a -> Expr
-eq_col left right = Expr (spaced (column_frag left) "=" (column_frag right))
+pub fun lte : input -> a -> Expr where {input: ToSql a, a: PgType}
+lte input value =
+  Expr (spaced (value_frag input) "<=" (param (encode_pg value)))
 
-pub fun is_null : Column source name a -> Expr
-is_null column = Expr (append_frag (column_frag column) (raw " IS NULL"))
+pub fun eq_sql : left -> right -> Expr
+  where {left: ToSql a, right: ToSql a, a: PgType}
+eq_sql left right = Expr (spaced (value_frag left) "=" (value_frag right))
 
-pub fun is_not_null : Column source name a -> Expr
-is_not_null column = Expr (append_frag (column_frag column) (raw " IS NOT NULL"))
+pub fun eq_col : left -> right -> Expr
+  where {left: ToSql a, right: ToSql a, a: PgType}
+eq_col left right = eq_sql left right
+
+pub fun is_null : input -> Expr where {input: ToSql a, a: PgType}
+is_null input = Expr (append_frag (value_frag input) (raw " IS NULL"))
+
+pub fun is_not_null : input -> Expr where {input: ToSql a, a: PgType}
+is_not_null input = Expr (append_frag (value_frag input) (raw " IS NOT NULL"))
 
 pub fun and_ : List Expr -> Expr
 and_ exprs = Expr (join_exprs " AND " exprs)
@@ -320,14 +347,10 @@ join_exprs sep exprs = case exprs {
   }
 }
 
-fun field_as : String -> Column source name a -> Field a
-  where {a: PgType}
+fun field_as : String -> Column source name a -> Field a where {a: PgType}
 field_as alias column =
   Field (FieldDef {
-    selection: SelectItem {
-      expr: column_frag column,
-      alias: alias,
-    },
+    selection: SelectItem { expr: column_frag column, alias: alias },
     decoder: decode_pg,
   })
 
@@ -351,6 +374,15 @@ field_projection column = {
   field_def_projection def
 }
 
+fun sql_projection : Sql a -> Projection a
+sql_projection sql_value = case sql_value {
+  Sql def ->
+    field_def_projection (FieldDef {
+      selection: SelectItem { expr: def.frag, alias: "value" },
+      decoder: def.decoder,
+    })
+}
+
 fun select_expr_projection : SelectExpr a -> Projection a
 select_expr_projection expr = {
   let SelectExpr def = expr
@@ -372,10 +404,11 @@ prefix_items prefix items = List.map (prefix_item prefix) items
 fun relabel_projection : String -> Projection a -> Projection a
 relabel_projection alias projection = {
   let Projection def = projection
-  if def.width == 1 then
-    Projection ({ def | selections: relabel_items alias def.selections })
-  else
-    Projection ({ def | selections: prefix_items alias def.selections })
+  if def.width
+    == 1 then Projection ({ def |
+    selections: relabel_items alias def.selections,
+  })
+  else Projection ({ def | selections: prefix_items alias def.selections })
 }
 
 fun zip_projection : Projection a -> Projection b -> Projection (a, b)
@@ -386,13 +419,15 @@ zip_projection left right = {
   Projection (ProjectionDef {
     selections: List.append left_def.selections right_def.selections,
     width: left_def.width + right_def.width,
-    decode_at: fun offset row -> case left_def.decode_at offset row {
-      Err err -> Err err
-      Ok left_value -> case right_def.decode_at (offset + left_def.width) row {
+    decode_at: fun offset row ->
+      case left_def.decode_at offset row {
         Err err -> Err err
-        Ok right_value -> Ok (left_value, right_value)
-      }
-    },
+        Ok left_value -> case right_def.decode_at (offset
+          + left_def.width) row {
+          Err err -> Err err
+          Ok right_value -> Ok (left_value, right_value)
+        }
+      },
   })
 }
 
@@ -402,15 +437,34 @@ projection_decode projection row = {
   def.decode_at 0 row
 }
 
-impl Selectable a for (Column source name a) where {a: PgType} {
+impl Selectable a for Column source name a where {a: PgType} {
   to_projection column = field_projection column
+}
+
+impl Selectable a for Sql a {
+  to_projection sql_value = sql_projection sql_value
 }
 
 impl Selectable a for SelectExpr a {
   to_projection expr = select_expr_projection expr
 }
 
-impl Selectable (Leaf row) for (Leaf selection) where {selection: Selectable row} {
+impl ToSql a for Column source name a where {a: PgType} {
+  to_sql column = make_sql (column_frag column)
+}
+
+impl ToSql a for Sql a {
+  to_sql sql_value = sql_value
+}
+
+impl ToSql a for SelectExpr a {
+  to_sql expr = case expr {
+    SelectExpr def ->
+      Sql (SqlDef { frag: def.selection.expr, decoder: def.decoder })
+  }
+}
+
+impl Selectable (Leaf row) for Leaf selection where {selection: Selectable row} {
   to_projection selection = case selection {
     Leaf value ->
       to_projection value
@@ -418,7 +472,7 @@ impl Selectable (Leaf row) for (Leaf selection) where {selection: Selectable row
   }
 }
 
-impl Selectable (Labeled n out) for (Labeled n field)
+impl Selectable (Labeled n out) for Labeled n field
   where {n: KnownSymbol, Selectable field out}
 {
   to_projection selection = case selection {
@@ -429,7 +483,7 @@ impl Selectable (Labeled n out) for (Labeled n field)
   }
 }
 
-impl Selectable (And left_out right_out) for (And left right)
+impl Selectable (And left_out right_out) for And left right
   where {Selectable left left_out, Selectable right right_out}
 {
   to_projection selection = case selection {
@@ -442,7 +496,9 @@ impl Selectable (And left_out right_out) for (And left right)
   }
 }
 
-impl Selectable (Record out) for (Record fields) where {Selectable fields out} {
+impl Selectable (Record out) for Record fields
+  where {Selectable fields out}
+{
   to_projection selection = case selection {
     Record name fields ->
       to_projection fields
@@ -450,19 +506,36 @@ impl Selectable (Record out) for (Record fields) where {Selectable fields out} {
   }
 }
 
-pub fun asc : Column source name a -> Order
-asc column =
-  Order (OrderItem {
-    expr: column_frag column,
-    direction: "ASC",
-  })
+pub fun asc : input -> Order where {input: ToSql a, a: PgType}
+asc input = Order (OrderItem { expr: value_frag input, direction: "ASC" })
 
-pub fun desc : Column source name a -> Order
-desc column =
-  Order (OrderItem {
-    expr: column_frag column,
-    direction: "DESC",
-  })
+pub fun desc : input -> Order where {input: ToSql a, a: PgType}
+desc input = Order (OrderItem { expr: value_frag input, direction: "DESC" })
+
+pub fun group : input -> Group where {input: ToSql a, a: PgType}
+group input = Group (value_frag input)
+
+pub fun count_star : Sql Int
+count_star = make_sql (raw "COUNT(*)")
+
+pub fun count : input -> Sql Int where {input: ToSql a, a: PgType}
+count input = make_sql (append_frags [raw "COUNT(", value_frag input, raw ")"])
+
+pub fun count_distinct : input -> Sql Int where {input: ToSql a, a: PgType}
+count_distinct input =
+  make_sql (append_frags [raw "COUNT(DISTINCT ", value_frag input, raw ")"])
+
+pub fun sum : input -> Sql a where {input: ToSql a, a: PgType}
+sum input = make_sql (append_frags [raw "SUM(", value_frag input, raw ")"])
+
+pub fun avg : input -> Sql Float where {input: ToSql a, a: PgType}
+avg input = make_sql (append_frags [raw "AVG(", value_frag input, raw ")"])
+
+pub fun min : input -> Sql a where {input: ToSql a, a: PgType}
+min input = make_sql (append_frags [raw "MIN(", value_frag input, raw ")"])
+
+pub fun max : input -> Sql a where {input: ToSql a, a: PgType}
+max input = make_sql (append_frags [raw "MAX(", value_frag input, raw ")"])
 
 record Source {
   name: String,
@@ -485,6 +558,8 @@ record QueryState {
   from_source: Maybe Source,
   joins: List Join,
   wheres: List Expr,
+  group_bys: List Group,
+  havings: List Expr,
   order_bys: List Order,
   limit_count: Maybe Int,
   offset_count: Maybe Int,
@@ -515,15 +590,15 @@ pub handler pg_repo for Repo needs {Postgres} {
 
 pub effect QueryBuild selection {
   fun from : Table name row insert required_cols optional_cols -> required_cols
-  fun inner_join :
-    Table name row insert required_cols optional_cols ->
-    (required_cols -> Expr) ->
-    required_cols
-  fun left_join :
-    Table name row insert required_cols optional_cols ->
-    (required_cols -> Expr) ->
-    optional_cols
+  fun inner_join : Table name row insert required_cols optional_cols
+    -> (required_cols -> Expr)
+    -> required_cols
+  fun left_join : Table name row insert required_cols optional_cols
+    -> (required_cols -> Expr)
+    -> optional_cols
   fun where_ : Expr -> Unit
+  fun group_by : List Group -> Unit
+  fun having : Expr -> Unit
   fun order_by : List Order -> Unit
   fun limit : Int -> Unit
   fun offset : Int -> Unit
@@ -531,32 +606,28 @@ pub effect QueryBuild selection {
 }
 
 fun empty_state : QueryState
-empty_state =
-  QueryState {
-    from_source: Nothing,
-    joins: [],
-    wheres: [],
-    order_bys: [],
-    limit_count: Nothing,
-    offset_count: Nothing,
-    next_alias: 0,
-  }
+empty_state = QueryState {
+  from_source: Nothing,
+  joins: [],
+  wheres: [],
+  group_bys: [],
+  havings: [],
+  order_bys: [],
+  limit_count: Nothing,
+  offset_count: Nothing,
+  next_alias: 0,
+}
 
-fun bind_required_table :
-  Table table row insert required_cols optional_cols ->
-  QueryState ->
-  (Source, required_cols, QueryState)
+fun bind_required_table : Table table row insert required_cols optional_cols
+  -> QueryState
+  -> (Source, required_cols, QueryState)
 bind_required_table table_value state = {
   let Table def = table_value
   let alias = case def.alias {
     Just name -> name
     Nothing -> "t" <> show state.next_alias
   }
-  let source =
-    Source {
-      name: def.name,
-      alias: alias,
-    }
+  let source = Source { name: def.name, alias: alias }
   let cols = def.make_required_cols alias
   (source, cols, { state | next_alias: state.next_alias + 1 })
 }
@@ -573,11 +644,7 @@ handler collect_query for QueryBuild selection {
   inner_join table_value on_fn = {
     QueryStep (fun state -> {
       let (source, cols, state2) = bind_required_table table_value state
-      let join = Join {
-        kind: InnerJoin,
-        source: source,
-        on: on_fn cols,
-      }
+      let join = Join { kind: InnerJoin, source: source, on: on_fn cols }
       let QueryStep run_rest = resume cols
       run_rest ({ state2 | joins: List.append state2.joins [join] })
     })
@@ -585,8 +652,11 @@ handler collect_query for QueryBuild selection {
 
   left_join table_value on_fn = {
     QueryStep (fun state -> {
-      let (source, required_cols, state2) = bind_required_table table_value state
-      let optional_cols = (case table_value { Table def -> def.make_optional_cols source.alias })
+      let (source, required_cols, state2) =
+        bind_required_table table_value state
+      let optional_cols = case table_value {
+        Table def -> def.make_optional_cols source.alias
+      }
       let join = Join {
         kind: LeftJoin,
         source: source,
@@ -601,6 +671,20 @@ handler collect_query for QueryBuild selection {
     QueryStep (fun state -> {
       let QueryStep run_rest = resume ()
       run_rest ({ state | wheres: List.append state.wheres [expr] })
+    })
+  }
+
+  group_by groups = {
+    QueryStep (fun state -> {
+      let QueryStep run_rest = resume ()
+      run_rest ({ state | group_bys: List.append state.group_bys groups })
+    })
+  }
+
+  having expr = {
+    QueryStep (fun state -> {
+      let QueryStep run_rest = resume ()
+      run_rest ({ state | havings: List.append state.havings [expr] })
     })
   }
 
@@ -631,20 +715,15 @@ handler collect_query for QueryBuild selection {
       run_rest state
     })
   }
-
   return value = QueryStep (fun state -> (value, state))
 }
 
 pub fun query : (Unit -> selection needs {QueryBuild selection}) -> Prepared row
-  where {
-    selection: Generic selection_rep,
-    selection_rep: Selectable row_rep,
-    row: Generic row_rep,
-  }
+  where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 query make = {
   let QueryStep run_query = make () with collect_query
   let (selection, state) = run_query empty_state
-  let projection : Projection row = project selection
+  let projection: Projection row = project selection
   prepare projection state
 }
 
@@ -692,7 +771,11 @@ render_expr (Expr frag) state = render_frag frag state
 fun render_join : Join -> RenderState -> RenderState
 render_join join state =
   state
-  |> render_text (" " <> render_join_kind join.kind <> " " <> render_source join.source <> " ON ")
+  |> render_text (" "
+    <> render_join_kind join.kind
+    <> " "
+    <> render_source join.source
+    <> " ON ")
   |> render_expr join.on
 
 fun render_joins : List Join -> RenderState -> RenderState
@@ -759,6 +842,46 @@ render_wheres wheres state = case wheres {
     |> render_expr (and_ wheres)
 }
 
+fun render_group : Group -> RenderState -> RenderState
+render_group group state = case group {
+  Group frag -> render_frag frag state
+}
+
+fun render_more_groups : List Group -> RenderState -> RenderState
+render_more_groups groups state = case groups {
+  [] -> state
+  [group] -> render_group group state
+  group :: rest ->
+    state
+    |> render_group group
+    |> render_text ", "
+    |> render_more_groups rest
+}
+
+fun render_groups : List Group -> RenderState -> RenderState
+render_groups groups state = case groups {
+  [] -> state
+  [group] ->
+    state
+    |> render_text " GROUP BY "
+    |> render_group group
+  group :: rest ->
+    state
+    |> render_text " GROUP BY "
+    |> render_group group
+    |> render_text ", "
+    |> render_more_groups rest
+}
+
+fun render_havings : List Expr -> RenderState -> RenderState
+render_havings havings state = case havings {
+  [] -> state
+  _ ->
+    state
+    |> render_text " HAVING "
+    |> render_expr (and_ havings)
+}
+
 fun render_limit : Maybe Int -> RenderState -> RenderState
 render_limit count state = case count {
   Nothing -> state
@@ -776,12 +899,7 @@ prepare projection state = case state.from_source {
   Nothing -> panic "Kraken.Query.query: missing from!"
   Just source -> {
     let Projection projection_def = projection
-    let initial =
-      RenderState {
-        sql: "SELECT ",
-        params: [],
-        next_index: 1,
-      }
+    let initial = RenderState { sql: "SELECT ", params: [], next_index: 1 }
 
     let rendered =
       initial
@@ -789,6 +907,8 @@ prepare projection state = case state.from_source {
       |> render_text (" FROM " <> render_source source)
       |> render_joins state.joins
       |> render_wheres state.wheres
+      |> render_groups state.group_bys
+      |> render_havings state.havings
       |> render_orders state.order_bys
       |> render_limit state.limit_count
       |> render_offset state.offset_count
@@ -823,7 +943,9 @@ one conn prepared = case all conn prepared {
   Err err -> Err err
 }
 
-fun decode_rows : (Dynamic -> Result a DecodeError) -> List Dynamic -> Result (List a) DbError
+fun decode_rows : (Dynamic -> Result a DecodeError)
+  -> List Dynamic
+  -> Result (List a) DbError
 decode_rows decoder rows = case rows {
   [] -> Ok []
   row :: rest -> case decoder row {
