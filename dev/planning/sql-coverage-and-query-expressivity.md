@@ -22,7 +22,7 @@ Kraken currently supports:
 - selecting table scopes into domain records, such as `user: u`
 - alias prefixing for nested projections, such as `user_id`
 - raw predicate fragments
-- raw selectable expressions with `SelectExpr`
+- raw selectable expressions through `Sql a`
 - typed SQL value expressions with `Sql a`
 - `group_by!`
 - `having!`
@@ -143,7 +143,6 @@ The current model now has:
 - `Column source name a`
 - `Sql a`
 - `Expr`
-- `SelectExpr a`
 
 Aggregates, casts, SQL functions, arithmetic, and `HAVING` all want to flow
 through the shared typed SQL value expression:
@@ -340,25 +339,18 @@ the insert/update APIs need their own planning.
 
 ### Should `Sql a` Replace `SelectExpr a`?
 
-Maybe.
+Decision: yes.
 
-`SelectExpr a` currently means "a selectable raw expression with a decoder."
-If `Sql a` also carries enough information to select/decode, then `SelectExpr`
-could disappear or become an alias-like wrapper.
-
-If `Sql a` is only a typed fragment, then selectable raw expressions still need
-decoder metadata. In that case:
+`Sql a` now carries the fragment and decoder needed for selection, so
+`SelectExpr a` is redundant. Aliasing should come from anonymous record labels:
 
 ```saga
-Sql a
-SelectExpr a
+select! ({ total: Db.count_star })
+select! ({ lower_name: Db.sql_raw "LOWER(t0.name)" })
 ```
 
-can coexist, with:
-
-```saga
-Db.select_expr : Sql a -> SelectExpr a where {a: PgType}
-```
+The default alias for selecting a bare `Sql a` is still `value`, but the preferred
+surface API is to put raw or computed expressions behind record labels.
 
 ### How Should Whole-Row Optional Left Joins Work?
 

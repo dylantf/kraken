@@ -143,8 +143,6 @@ record FieldDef a {
 
 opaque type Field a = Field (FieldDef a)
 
-opaque type SelectExpr a = SelectExpr (FieldDef a)
-
 record ProjectionDef a {
   selections: List SelectItem,
   width: Int,
@@ -261,29 +259,14 @@ raw_sql text = raw_expr text
 pub fun raw_sql_with : String -> List Value -> Expr
 raw_sql_with text params = raw_expr_with text params
 
-fun select_expr_as_frag : String -> SqlFrag -> SelectExpr a where {a: PgType}
-select_expr_as_frag alias frag =
-  SelectExpr (FieldDef {
-    selection: SelectItem { expr: frag, alias: alias },
-    decoder: decode_pg,
-  })
-
 pub fun select_raw : String -> Sql a where {a: PgType}
 select_raw text = sql_raw text
-
-pub fun select_raw_as : String -> String -> SelectExpr a where {a: PgType}
-select_raw_as alias text = select_expr_as_frag alias (raw text)
 
 pub fun select_raw_with : String -> List Value -> Sql a where {a: PgType}
 select_raw_with text params = sql_raw_with text params
 
 pub fun select_raw_from : List Fragment -> Sql a where {a: PgType}
 select_raw_from fragments = sql_raw_from fragments
-
-pub fun select_raw_from_as : String -> List Fragment -> SelectExpr a
-  where {a: PgType}
-select_raw_from_as alias fragments =
-  select_expr_as_frag alias (fragments_frag fragments)
 
 fun spaced : SqlFrag -> String -> SqlFrag -> SqlFrag
 spaced left op right =
@@ -383,12 +366,6 @@ sql_projection sql_value = case sql_value {
     })
 }
 
-fun select_expr_projection : SelectExpr a -> Projection a
-select_expr_projection expr = {
-  let SelectExpr def = expr
-  field_def_projection def
-}
-
 fun relabel_item : String -> SelectItem -> SelectItem
 relabel_item alias item = { item | alias: alias }
 
@@ -445,23 +422,12 @@ impl Selectable a for Sql a {
   to_projection sql_value = sql_projection sql_value
 }
 
-impl Selectable a for SelectExpr a {
-  to_projection expr = select_expr_projection expr
-}
-
 impl ToSql a for Column source name a where {a: PgType} {
   to_sql column = make_sql (column_frag column)
 }
 
 impl ToSql a for Sql a {
   to_sql sql_value = sql_value
-}
-
-impl ToSql a for SelectExpr a {
-  to_sql expr = case expr {
-    SelectExpr def ->
-      Sql (SqlDef { frag: def.selection.expr, decoder: def.decoder })
-  }
 }
 
 impl Selectable (Leaf row) for Leaf selection where {selection: Selectable row} {
