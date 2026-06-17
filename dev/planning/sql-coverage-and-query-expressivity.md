@@ -23,6 +23,8 @@ Kraken currently supports:
 - alias prefixing for nested projections, such as `user_id`
 - raw predicate fragments
 - raw selectable expressions through `Sql a`
+- placeholder-based raw SQL with `Db.sql`, `Db.value`, `Db.raw`, and
+  `Db.expr_raw`
 - typed SQL value expressions with `Sql a`
 - `group_by!`
 - `having!`
@@ -94,13 +96,9 @@ having! (Db.gt (Db.count p.id) 1)
 Raw SQL should stay available for missing features:
 
 ```saga
-where_! (Db.raw_expr_from [
-  Db.sql_column p.title,
-  Db.sql_text " LIKE ",
-  Db.sql_value "Hello%",
-])
+where_! (Db.expr_raw "? LIKE ?" [Db.sql p.title, Db.value "Hello%"])
 
-select! ({ total: Db.select_raw "COUNT(*)" })
+select! ({ total: Db.raw "COUNT(*)" [] })
 ```
 
 ## Tier 1: Core Select
@@ -156,8 +154,8 @@ Current direction:
 ```saga
 pub opaque type Sql a
 
-pub fun sql_raw : String -> Sql a where {a: PgType}
-pub fun sql_raw_from : List Fragment -> Sql a where {a: PgType}
+pub fun raw : String -> List SqlArg -> Sql a where {a: PgType}
+pub fun expr_raw : String -> List SqlArg -> Expr
 ```
 
 Comparisons have moved from column-specific helpers to expression helpers via
@@ -321,13 +319,33 @@ Db.sql_fn "lower" [Db.sql_column u.name]
 
 But this can wait until real use cases show up.
 
+## Raw SQL Escape Hatches
+
+Kraken should prefer placeholder-based raw SQL helpers for escape hatches instead
+of forcing users to assemble fragment lists by hand:
+
+```saga
+where_! (Db.expr_raw "? LIKE ?" [Db.sql p.title, Db.value "Hello%"])
+select! ({ lower_name: Db.raw "LOWER(?)" [Db.sql u.name] })
+```
+
+Placeholder argument rules:
+
+- `Db.sql value` inlines trusted typed SQL fragments, such as columns or
+  computed `Sql a` expressions
+- `Db.value value` creates a Postgres bind parameter
+- `Db.raw` returns `Sql a`, so selection still uses the normal
+  decoder path
+- `Db.expr_raw` returns `Expr` for boolean predicates
+- placeholder count is validated at query construction time
+
 ## Tier 6: Subqueries
 
 Raw SQL can cover early needs:
 
 ```saga
 select! ({
-  latest_title: Db.select_raw "(SELECT title FROM posts ORDER BY id DESC LIMIT 1)"
+  latest_title: Db.raw "(SELECT title FROM posts ORDER BY id DESC LIMIT 1)" []
 })
 ```
 
@@ -344,7 +362,7 @@ Possible future syntax:
 where_! (Db.exists (fun () -> {
   let p = from! posts
   where_! (Db.eq_col p.author_id u.id)
-  select! ({ one: Db.select_raw "1" })
+  select! ({ one: Db.raw "1" [] })
 }))
 ```
 
@@ -393,7 +411,7 @@ Decision: yes.
 
 ```saga
 select! ({ total: Db.count_star })
-select! ({ lower_name: Db.sql_raw "LOWER(t0.name)" })
+select! ({ lower_name: Db.raw "LOWER(?)" [Db.sql u.name] })
 ```
 
 The default alias for selecting a bare `Sql a` is still `value`, but the preferred
@@ -447,8 +465,6 @@ are:
 
 - remove `SelectExpr`; keep `Sql a` as the single typed SQL value expression
 - aggregate nullability for `sum`, `avg`, `min`, and `max`
-- clean up raw SQL escape hatches around `sql_raw`, `sql_raw_from`, and
-  `raw_expr_from`
 - predicate helpers like `like`, `ilike`, `between`, `in_`
 - casts through `PgTypeName a`
 - `distinct!`

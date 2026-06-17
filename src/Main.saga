@@ -158,11 +158,7 @@ user_posts_query () = Db.query (fun () -> {
     Db.eq u.name "Alice",
     Db.gt u.age 18,
     Db.eq p.published True,
-    Db.raw_expr_from [
-      Db.sql_column p.title,
-      Db.sql_text " LIKE ",
-      Db.sql_value "Hello%",
-    ],
+    Db.expr_raw "? LIKE ?" [Db.sql p.title, Db.value "Hello%"],
   ])
   order_by! [Db.desc p.id]
   limit! 20

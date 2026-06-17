@@ -120,6 +120,8 @@ record SqlDef a {
 
 opaque type Sql a = Sql (SqlDef a)
 
+opaque type SqlArg = SqlArg SqlFrag
+
 opaque type Expr = Expr SqlFrag
 
 record SelectItem {
@@ -187,8 +189,8 @@ map transform projection = {
   })
 }
 
-fun raw : String -> SqlFrag
-raw text = SqlFrag { parts: [Text text] }
+fun raw_frag : String -> SqlFrag
+raw_frag text = SqlFrag { parts: [Text text] }
 
 fun param : Value -> SqlFrag
 param value = SqlFrag { parts: [Param value] }
@@ -201,18 +203,18 @@ append_frag left right = SqlFrag { parts: List.append left.parts right.parts }
 
 fun append_frags : List SqlFrag -> SqlFrag
 append_frags frags = case frags {
-  [] -> raw ""
+  [] -> raw_frag ""
   frag :: rest -> append_frag frag (append_frags rest)
 }
 
-pub fun raw_expr : String -> Expr
-raw_expr text = Expr (raw text)
+fun raw_expr : String -> Expr
+raw_expr text = Expr (raw_frag text)
 
-pub fun raw_expr_with : String -> List Value -> Expr
-raw_expr_with text params = Expr (append_frag (raw text) (params_frag params))
+fun raw_expr_with : String -> List Value -> Expr
+raw_expr_with text params = Expr (append_frag (raw_frag text) (params_frag params))
 
 pub fun sql_text : String -> Fragment
-sql_text text = Fragment (raw text)
+sql_text text = Fragment (raw_frag text)
 
 pub fun sql_param : Value -> Fragment
 sql_param value = Fragment (param value)
@@ -231,12 +233,40 @@ sql_frag sql_value = case sql_value {
 fun make_sql : SqlFrag -> Sql a where {a: PgType}
 make_sql frag = Sql (SqlDef { frag: frag, decoder: decode_pg })
 
-pub fun sql_raw : String -> Sql a where {a: PgType}
-sql_raw text = make_sql (raw text)
+pub fun sql : input -> SqlArg where {input: ToSql a}
+sql input = SqlArg (value_frag input)
 
-pub fun sql_raw_with : String -> List Value -> Sql a where {a: PgType}
-sql_raw_with text params =
-  make_sql (append_frag (raw text) (params_frag params))
+pub fun value : a -> SqlArg where {a: PgType}
+value input = SqlArg (param (encode_pg input))
+
+fun sql_arg_frag : SqlArg -> SqlFrag
+sql_arg_frag arg = case arg {
+  SqlArg frag -> frag
+}
+
+fun placeholder_frag : List String -> List SqlArg -> SqlFrag
+placeholder_frag parts args = case parts {
+  [] -> case args {
+    [] -> raw_frag ""
+    _ -> panic "raw: too many arguments for placeholders"
+  }
+  [part] -> case args {
+    [] -> raw_frag part
+    _ -> panic "raw: too many arguments for placeholders"
+  }
+  part :: rest -> case args {
+    [] -> panic "raw: too few arguments for placeholders"
+    arg :: arg_rest ->
+      append_frags [raw_frag part, sql_arg_frag arg, placeholder_frag rest arg_rest]
+  }
+}
+
+fun raw_template_frag : String -> List SqlArg -> SqlFrag
+raw_template_frag template args =
+  placeholder_frag (String.split "?" template) args
+
+pub fun raw : String -> List SqlArg -> Sql a where {a: PgType}
+raw template args = make_sql (raw_template_frag template args)
 
 fun fragments_frag : List Fragment -> SqlFrag
 fragments_frag fragments = {
@@ -247,33 +277,24 @@ fragments_frag fragments = {
   append_frags frags
 }
 
-pub fun sql_raw_from : List Fragment -> Sql a where {a: PgType}
+fun sql_raw_from : List Fragment -> Sql a where {a: PgType}
 sql_raw_from fragments = make_sql (fragments_frag fragments)
 
-pub fun raw_expr_from : List Fragment -> Expr
+fun raw_expr_from : List Fragment -> Expr
 raw_expr_from fragments = Expr (fragments_frag fragments)
 
-pub fun raw_sql : String -> Expr
-raw_sql text = raw_expr text
+pub fun expr_raw : String -> List SqlArg -> Expr
+expr_raw template args = Expr (raw_template_frag template args)
 
-pub fun raw_sql_with : String -> List Value -> Expr
-raw_sql_with text params = raw_expr_with text params
-
-pub fun select_raw : String -> Sql a where {a: PgType}
-select_raw text = sql_raw text
-
-pub fun select_raw_with : String -> List Value -> Sql a where {a: PgType}
-select_raw_with text params = sql_raw_with text params
-
-pub fun select_raw_from : List Fragment -> Sql a where {a: PgType}
-select_raw_from fragments = sql_raw_from fragments
+pub fun expr : Sql Bool -> Expr
+expr sql_value = Expr (sql_frag sql_value)
 
 fun spaced : SqlFrag -> String -> SqlFrag -> SqlFrag
 spaced left op right =
-  append_frag left (append_frag (raw (" " <> op <> " ")) right)
+  append_frag left (append_frag (raw_frag (" " <> op <> " ")) right)
 
 fun column_frag : Column source name a -> SqlFrag
-column_frag (Column info) = raw (info.source <> "." <> info.name)
+column_frag (Column info) = raw_frag (info.source <> "." <> info.name)
 
 fun value_frag : input -> SqlFrag where {input: ToSql a}
 value_frag input = sql_frag (to_sql input)
@@ -308,10 +329,10 @@ pub fun eq_col : left -> right -> Expr
 eq_col left right = eq_sql left right
 
 pub fun is_null : input -> Expr where {input: ToSql a, a: PgType}
-is_null input = Expr (append_frag (value_frag input) (raw " IS NULL"))
+is_null input = Expr (append_frag (value_frag input) (raw_frag " IS NULL"))
 
 pub fun is_not_null : input -> Expr where {input: ToSql a, a: PgType}
-is_not_null input = Expr (append_frag (value_frag input) (raw " IS NOT NULL"))
+is_not_null input = Expr (append_frag (value_frag input) (raw_frag " IS NOT NULL"))
 
 pub fun and_ : List Expr -> Expr
 and_ exprs = Expr (join_exprs " AND " exprs)
@@ -321,11 +342,11 @@ or_ exprs = Expr (join_exprs " OR " exprs)
 
 fun join_exprs : String -> List Expr -> SqlFrag
 join_exprs sep exprs = case exprs {
-  [] -> raw "TRUE"
+  [] -> raw_frag "TRUE"
   [Expr frag] -> frag
   Expr frag :: rest -> {
-    let left = append_frag (raw "(") frag
-    let right = append_frag (raw (")" <> sep)) (join_exprs sep rest)
+    let left = append_frag (raw_frag "(") frag
+    let right = append_frag (raw_frag (")" <> sep)) (join_exprs sep rest)
     append_frag left right
   }
 }
@@ -482,26 +503,26 @@ pub fun group : input -> Group where {input: ToSql a, a: PgType}
 group input = Group (value_frag input)
 
 pub fun count_star : Sql Int
-count_star = make_sql (raw "COUNT(*)")
+count_star = make_sql (raw_frag "COUNT(*)")
 
 pub fun count : input -> Sql Int where {input: ToSql a, a: PgType}
-count input = make_sql (append_frags [raw "COUNT(", value_frag input, raw ")"])
+count input = make_sql (append_frags [raw_frag "COUNT(", value_frag input, raw_frag ")"])
 
 pub fun count_distinct : input -> Sql Int where {input: ToSql a, a: PgType}
 count_distinct input =
-  make_sql (append_frags [raw "COUNT(DISTINCT ", value_frag input, raw ")"])
+  make_sql (append_frags [raw_frag "COUNT(DISTINCT ", value_frag input, raw_frag ")"])
 
 pub fun sum : input -> Sql (Maybe a) where {input: ToSql a, a: PgType}
-sum input = make_sql (append_frags [raw "SUM(", value_frag input, raw ")"])
+sum input = make_sql (append_frags [raw_frag "SUM(", value_frag input, raw_frag ")"])
 
 pub fun avg : input -> Sql (Maybe Float) where {input: ToSql a, a: PgType}
-avg input = make_sql (append_frags [raw "AVG(", value_frag input, raw ")"])
+avg input = make_sql (append_frags [raw_frag "AVG(", value_frag input, raw_frag ")"])
 
 pub fun min : input -> Sql (Maybe a) where {input: ToSql a, a: PgType}
-min input = make_sql (append_frags [raw "MIN(", value_frag input, raw ")"])
+min input = make_sql (append_frags [raw_frag "MIN(", value_frag input, raw_frag ")"])
 
 pub fun max : input -> Sql (Maybe a) where {input: ToSql a, a: PgType}
-max input = make_sql (append_frags [raw "MAX(", value_frag input, raw ")"])
+max input = make_sql (append_frags [raw_frag "MAX(", value_frag input, raw_frag ")"])
 
 record Source {
   name: String,
