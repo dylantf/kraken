@@ -52,6 +52,7 @@ record Posts source {
   author_id: Db.Column source 'author_id Int,
   title: Db.Column source 'title String,
   published: Db.Column source 'published Bool,
+  tags: Db.Column source 'tags (Db.Array String),
 }
 
 record OptionalPosts source {
@@ -59,6 +60,7 @@ record OptionalPosts source {
   author_id: Db.Column source 'author_id (Maybe Int),
   title: Db.Column source 'title (Maybe String),
   published: Db.Column source 'published (Maybe Bool),
+  tags: Db.Column source 'tags (Maybe (Db.Array String)),
 }
 
 fun user_cols : String -> Users UsersScope
@@ -81,6 +83,7 @@ post_cols source = Posts {
   author_id: Db.col_as "author_id" source,
   title: Db.col_as "title" source,
   published: Db.col_as "published" source,
+  tags: Db.col_as "tags" source,
 }
 
 fun optional_post_cols : String -> OptionalPosts PostsScope
@@ -89,6 +92,7 @@ optional_post_cols source = OptionalPosts {
   author_id: Db.col_as "author_id" source,
   title: Db.col_as "title" source,
   published: Db.col_as "published" source,
+  tags: Db.col_as "tags" source,
 }
 
 fun users : Db.Table UsersTable User NewUser (Users UsersScope) (OptionalUsers UsersScope)
@@ -122,10 +126,11 @@ post_count_query () = Query.query (fun () -> {
   select! ({ total: Db.count_star })
 })
 
-fun post_counts_by_author_query : Unit -> Query.Prepared {
-  author_id: Int,
-  total: Int,
-}
+fun post_counts_by_author_query : Unit
+  -> Query.Prepared {
+    author_id: Int,
+    total: Int,
+  }
 post_counts_by_author_query () = Query.query (fun () -> {
   let p = from! posts
   group_by! [Db.group p.author_id]
@@ -134,11 +139,12 @@ post_counts_by_author_query () = Query.query (fun () -> {
   select! ({ author_id: p.author_id, total: Db.count p.id })
 })
 
-fun user_age_stats_query : Unit -> Query.Prepared {
-  average_age: Maybe Float,
-  oldest_age: Maybe Int,
-  total_age: Maybe Int,
-}
+fun user_age_stats_query : Unit
+  -> Query.Prepared {
+    average_age: Maybe Float,
+    oldest_age: Maybe Int,
+    total_age: Maybe Int,
+  }
 user_age_stats_query () = Query.query (fun () -> {
   let u = from! users
   select! ({
@@ -148,10 +154,11 @@ user_age_stats_query () = Query.query (fun () -> {
   })
 })
 
-fun user_posts_query : Unit -> Query.Prepared {
-  post_title: String,
-  user: User,
-}
+fun user_posts_query : Unit
+  -> Query.Prepared {
+    post_title: String,
+    user: User,
+  }
 user_posts_query () = Query.query (fun () -> {
   let u = from! users
   let p = inner_join! posts (fun post -> Db.eq_col post.author_id u.id)
@@ -180,6 +187,23 @@ predicate_showcase_query () = Query.query (fun () -> {
   select! ({ id: u.id })
 })
 
+fun tagged_posts_query : Unit
+  -> Query.Prepared {
+    id: Int,
+    tags: Db.Array String,
+  }
+tagged_posts_query () = Query.query (fun () -> {
+  let p = from! posts
+  let tags =
+    Db.raw_array_like p.tags "COALESCE(?, ARRAY[]::text[])" [Db.sql p.tags]
+  where_! (Db.and_ [
+    Db.contains p.tags (Db.array ["saga"]),
+    Db.overlaps tags (Db.array ["db", "query"]),
+    Db.contained_by p.tags (Db.array ["saga", "db", "query", "typed"]),
+  ])
+  select! ({ id: p.id, tags: tags })
+})
+
 # fun users_with_optional_posts_query : Unit -> Query.Prepared {
 #   user: User,
 #   post_id: Maybe Int,
@@ -192,28 +216,39 @@ users_with_optional_posts_query () = Query.query (fun () -> {
   select! ({ user: u, post_id: p.id, post_title: p.title })
 })
 
-fun load_user_posts : Connection -> Result (List {
-  post_title: String,
-  user: User,
-}) Query.DbError
+fun load_user_posts : Connection
+  -> Result (List {
+    post_title: String,
+    user: User,
+  }) Query.DbError
   needs {Repo}
 load_user_posts conn = Query.all conn (user_posts_query ())
 
-fun load_users : Connection -> Result (List {
-  id: Int,
-  name: String,
-  age: Int,
-}) Query.DbError
+fun load_users : Connection
+  -> Result (List {
+    id: Int,
+    name: String,
+    age: Int,
+  }) Query.DbError
   needs {Repo}
 load_users conn = Query.all conn (users_query ())
 
-fun load_user_age_stats : Connection -> Result (Maybe {
-  average_age: Maybe Float,
-  oldest_age: Maybe Int,
-  total_age: Maybe Int,
-}) Query.DbError
+fun load_user_age_stats : Connection
+  -> Result (Maybe {
+    average_age: Maybe Float,
+    oldest_age: Maybe Int,
+    total_age: Maybe Int,
+  }) Query.DbError
   needs {Repo}
 load_user_age_stats conn = Query.one conn (user_age_stats_query ())
+
+fun load_tagged_posts : Connection
+  -> Result (List {
+    id: Int,
+    tags: Db.Array String,
+  }) Query.DbError
+  needs {Repo}
+load_tagged_posts conn = Query.all conn (tagged_posts_query ())
 
 fun show_maybe_int : Maybe Int -> String
 show_maybe_int value = case value {
@@ -225,6 +260,13 @@ fun show_maybe_float : Maybe Float -> String
 show_maybe_float value = case value {
   Just inner -> show inner
   Nothing -> "NULL"
+}
+
+fun show_string_list : List String -> String
+show_string_list values = case values {
+  [] -> ""
+  [value] -> value
+  value :: rest -> value <> ", " <> show_string_list rest
 }
 
 main () = {
@@ -255,6 +297,19 @@ main () = {
 
   let predicate_prepared = predicate_showcase_query ()
   println predicate_prepared.sql
+
+  let tagged_prepared = tagged_posts_query ()
+  println tagged_prepared.sql
+
+  let tagged_result = load_tagged_posts conn with Query.pg_repo
+  case tagged_result {
+    Ok rows -> {
+      println ("tagged posts: " <> show (List.length rows))
+      List.iter (fun row ->
+        println $"{show row.id}: [{show_string_list (Db.array_to_list row.tags)}]") rows
+    }
+    Err err -> println ("tagged query failed: " <> debug err)
+  }
 
   let stats_prepared = user_age_stats_query ()
   println stats_prepared.sql

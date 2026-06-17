@@ -10,6 +10,8 @@ import Std.Dynamic (
   int,
   float,
   bool,
+  list_of,
+  decode,
   optional
 )
 import Std.Generic (Generic, Leaf, Labeled, And, Record)
@@ -18,9 +20,22 @@ import SagaPgo as Pgo
 import SagaPgo.Types (Value)
 import SagaPgo.Types as T
 
+@external("erlang", "saga_pgo_bridge", "coerce")
+fun coerce_value : a -> Value
+
 pub trait PgType a {
   fun encode_pg : a -> Value
   fun decode_pg : Decoder a
+}
+
+opaque type Array a = Array (List a)
+
+pub fun array : List a -> Array a
+array values = Array values
+
+pub fun array_to_list : Array a -> List a
+array_to_list array_value = case array_value {
+  Array values -> values
 }
 
 impl PgType for Int {
@@ -46,6 +61,17 @@ impl PgType for Bool {
 impl PgType for T.Uuid {
   encode_pg value = T.pg_uuid value
   decode_pg = T.uuid
+}
+
+impl PgType for Array a where {a: PgType} {
+  encode_pg array_value = case array_value {
+    Array values -> coerce_value values
+  }
+  decode_pg =
+    Decoder (fun data -> case decode (list_of decode_pg) data {
+      Ok values -> Ok (Array values)
+      Err err -> Err err
+    })
 }
 
 impl PgType for Maybe a where {a: PgType} {
@@ -194,6 +220,10 @@ pub trait ToSql input a | input -> a {
   fun to_sql : input -> Sql a
 }
 
+pub trait ToArraySql input a | input -> a {
+  fun to_array_sql : input -> Sql (Array a)
+}
+
 pub fun project : selection -> Projection row
   where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 project selection =
@@ -306,6 +336,16 @@ raw_template_frag template args =
 pub fun raw : String -> List SqlArg -> Sql a where {a: PgType}
 raw template args = make_sql (raw_template_frag template args)
 
+pub fun raw_array : String -> List SqlArg -> Sql (Array a) where {a: PgType}
+raw_array template args = make_sql (raw_template_frag template args)
+
+pub fun raw_array_like : Column source name (Array a)
+  -> String
+  -> List SqlArg
+  -> Sql (Array a)
+  where {a: PgType}
+raw_array_like _ template args = make_sql (raw_template_frag template args)
+
 fun fragments_frag : List Fragment -> SqlFrag
 fragments_frag fragments = {
   let frags =
@@ -341,6 +381,9 @@ column_frag (Column info) = raw_frag (info.source <> "." <> info.name)
 
 fun value_frag : input -> SqlFrag where {input: ToSql a}
 value_frag input = sql_frag (to_sql input)
+
+fun array_frag : input -> SqlFrag where {input: ToArraySql a}
+array_frag input = sql_frag (to_array_sql input)
 
 pub fun eq : input -> a -> Expr where {input: ToSql a, a: PgType}
 eq input value =
@@ -413,6 +456,21 @@ between input lower upper =
     raw_frag " AND ",
     param (encode_pg upper),
   ])
+
+pub fun contains : input -> Array a -> Expr
+  where {input: ToArraySql a, a: PgType}
+contains input values =
+  make_expr (spaced (array_frag input) "@>" (param (encode_pg values)))
+
+pub fun contained_by : input -> Array a -> Expr
+  where {input: ToArraySql a, a: PgType}
+contained_by input values =
+  make_expr (spaced (array_frag input) "<@" (param (encode_pg values)))
+
+pub fun overlaps : input -> Array a -> Expr
+  where {input: ToArraySql a, a: PgType}
+overlaps input values =
+  make_expr (spaced (array_frag input) "&&" (param (encode_pg values)))
 
 pub fun in_ : input -> List a -> Expr where {input: ToSql a, a: PgType}
 in_ input values = case values {
@@ -607,6 +665,14 @@ impl ToSql a for Column source name a where {a: PgType} {
 
 impl ToSql a for Sql a {
   to_sql sql_value = sql_value
+}
+
+impl ToArraySql a for (Column source name (Array a)) where {a: PgType} {
+  to_array_sql column = make_sql (column_frag column)
+}
+
+impl ToArraySql a for (Sql (Array a)) where {a: PgType} {
+  to_array_sql sql_value = sql_value
 }
 
 impl Selectable (Leaf row) for Leaf selection where {selection: Selectable row} {

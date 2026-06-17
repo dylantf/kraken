@@ -327,10 +327,56 @@ The `ANY`/`ALL` helpers currently render `ANY(ARRAY[...])` and `ALL(ARRAY[...])`
 using individual bind parameters. That keeps the common predicates useful before
 Kraken has a real array column/value model.
 
-Next design topic: arrays and JSON/JSONB.
+Array status:
 
-- Postgres arrays need a `PgArray a` or `PgType (List a)` story, including
-  encoder/decoder behavior and empty array casts.
+Kraken now has an explicit `Db.Array a` wrapper:
+
+```saga
+tags: Db.Column source 'tags (Db.Array String)
+
+Db.array ["saga", "db"]
+Db.array_to_list tags
+```
+
+`Db.Array a` has `PgType` support when `a` has `PgType`, so array columns can be
+selected and decoded through the normal projection path. Array values are bound
+as a single parameter, rather than expanded into several placeholders.
+
+Implemented Postgres array column predicates:
+
+```saga
+Db.contains post.tags (Db.array ["saga"])              # @>
+Db.overlaps post.tags (Db.array ["db", "query"])       # &&
+Db.contained_by post.tags (Db.array ["saga", "db"])    # <@
+```
+
+These helpers now work over any input with `ToArraySql`, including both array
+columns and concrete `Sql (Db.Array a)` expressions:
+
+```saga
+let tags =
+  Db.raw_array_like post.tags "COALESCE(?, ARRAY[]::text[])" [Db.sql post.tags]
+
+Db.overlaps tags (Db.array ["db", "query"])
+```
+
+`Db.raw_array` exists for raw array expressions when a surrounding annotation or
+use site pins the element type. `Db.raw_array_like` uses an existing array column
+as the type witness, which avoids needing a local `Sql (Db.Array a)` annotation
+for common raw-expression escapes.
+
+Still open for arrays:
+
+- Decide whether `PgType (List a)` should exist as convenience sugar or whether
+  `Db.Array a` should remain the only first-class Postgres array value.
+- Check runtime behavior for empty array parameters against PostgreSQL. Column
+  context should usually infer the array type, but raw array expressions may need
+  explicit casts.
+- Add scalar membership helpers if the API wants them, for example
+  `Db.any_eq post.tags "saga"` / `"saga" = ANY(tags)`.
+
+Next design topic after arrays: JSON/JSONB.
+
 - JSON/JSONB likely wants integration with a Saga JSON library, probably via
   deriving-based `ToJson`/`FromJson` constraints wrapped in `PgJson a` /
   `PgJsonb a` newtypes or column annotations.
