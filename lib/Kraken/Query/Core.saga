@@ -19,6 +19,8 @@ import SagaPgo (Connection, Postgres, QueryError, Returned)
 import SagaPgo as Pgo
 import SagaPgo.Types (Value)
 import SagaPgo.Types as T
+import SagaJson as Json
+import SagaJson.Codec as JsonCodec (ToJson, FromJson)
 
 @external("erlang", "saga_pgo_bridge", "coerce")
 fun coerce_value : a -> Value
@@ -30,12 +32,30 @@ pub trait PgType a {
 
 opaque type Array a = Array (List a)
 
+opaque type Jsonb a = Jsonb a
+
 pub fun array : List a -> Array a
 array values = Array values
 
 pub fun array_to_list : Array a -> List a
 array_to_list array_value = case array_value {
   Array values -> values
+}
+
+pub fun jsonb : a -> Jsonb a
+jsonb value = Jsonb value
+
+pub fun jsonb_to_value : Jsonb a -> a
+jsonb_to_value json_value = case json_value {
+  Jsonb value -> value
+}
+
+fun json_error_to_decode_error : Json.Error -> DecodeError
+json_error_to_decode_error err = case err {
+  Json.InvalidJson message ->
+    DecodeError "Json" message []
+  Json.InvalidShape expected found path ->
+    DecodeError expected found path
 }
 
 impl PgType for Int {
@@ -71,6 +91,20 @@ impl PgType for Array a where {a: PgType} {
     Decoder (fun data -> case decode (list_of decode_pg) data {
       Ok values -> Ok (Array values)
       Err err -> Err err
+    })
+}
+
+impl PgType for Jsonb a where {a: ToJson + FromJson} {
+  encode_pg json_value = case json_value {
+    Jsonb value -> T.pg_text (JsonCodec.serialize value)
+  }
+  decode_pg =
+    Decoder (fun data -> case decode string data {
+      Err err -> Err err
+      Ok text -> case JsonCodec.deserialize text {
+        Ok value -> Ok (Jsonb value)
+        Err err -> Err (json_error_to_decode_error err)
+      }
     })
 }
 

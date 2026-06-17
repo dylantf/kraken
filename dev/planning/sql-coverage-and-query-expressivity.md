@@ -375,11 +375,42 @@ Still open for arrays:
 - Add scalar membership helpers if the API wants them, for example
   `Db.any_eq post.tags "saga"` / `"saga" = ANY(tags)`.
 
-Next design topic after arrays: JSON/JSONB.
+JSONB status:
 
-- JSON/JSONB likely wants integration with a Saga JSON library, probably via
-  deriving-based `ToJson`/`FromJson` constraints wrapped in `PgJson a` /
-  `PgJsonb a` newtypes or column annotations.
+Kraken depends on `saga_json` and has a typed `Db.Jsonb a` wrapper:
+
+```saga
+record Metadata {
+  source: String,
+  featured: Bool,
+} deriving (ToJson, FromJson)
+
+metadata: Db.Column source 'metadata (Db.Jsonb Metadata)
+```
+
+`Db.Jsonb a` has `PgType` support when `a` has `ToJson + FromJson`.
+
+- Encode path: `a -> SagaJson.Codec.serialize -> String -> Postgres jsonb param`
+- Decode path: pgo/pg_types returns raw JSON text for `json`/`jsonb` with the
+  default config, then Kraken runs `SagaJson.Codec.deserialize`
+- No SQL `::text` cast is needed; direct `SELECT metadata` decodes as text under
+  the current pgo config
+
+User-facing helpers:
+
+```saga
+Db.jsonb metadata
+Db.jsonb_to_value row.metadata
+```
+
+Still open for JSONB:
+
+- Add raw/dynamic JSON wrappers if users want to pass blobs without typed
+  schema validation.
+- Add JSONB operators: containment `@>`, key existence `?`, path/text extraction
+  `->`, `->>`, `#>`, `#>>`.
+- Decide whether `Json a` should mirror `Jsonb a`, or whether Kraken should only
+  bless `jsonb` initially.
 
 ## Tier 5: Casts And SQL Functions
 

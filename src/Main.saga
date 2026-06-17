@@ -5,6 +5,7 @@ import Kraken.Query as Query
 import Kraken.Query (QueryBuild, Repo)
 import Kraken.Query.Core as Db
 import SagaPgo (Connection, connect, default_config, pg)
+import SagaJson.Codec (ToJson, FromJson)
 
 record User {
   id: Int,
@@ -30,6 +31,11 @@ record NewPost {
   published: Bool,
 }
 
+record Metadata {
+  source: String,
+  featured: Bool,
+} deriving (ToJson, FromJson)
+
 type UsersScope = UsersScope
 type PostsScope = PostsScope
 type UsersTable = UsersTable
@@ -53,6 +59,7 @@ record Posts source {
   title: Db.Column source 'title String,
   published: Db.Column source 'published Bool,
   tags: Db.Column source 'tags (Db.Array String),
+  metadata: Db.Column source 'metadata (Db.Jsonb Metadata),
 }
 
 record OptionalPosts source {
@@ -61,6 +68,7 @@ record OptionalPosts source {
   title: Db.Column source 'title (Maybe String),
   published: Db.Column source 'published (Maybe Bool),
   tags: Db.Column source 'tags (Maybe (Db.Array String)),
+  metadata: Db.Column source 'metadata (Maybe (Db.Jsonb Metadata)),
 }
 
 fun user_cols : String -> Users UsersScope
@@ -84,6 +92,7 @@ post_cols source = Posts {
   title: Db.col_as "title" source,
   published: Db.col_as "published" source,
   tags: Db.col_as "tags" source,
+  metadata: Db.col_as "metadata" source,
 }
 
 fun optional_post_cols : String -> OptionalPosts PostsScope
@@ -93,6 +102,7 @@ optional_post_cols source = OptionalPosts {
   title: Db.col_as "title" source,
   published: Db.col_as "published" source,
   tags: Db.col_as "tags" source,
+  metadata: Db.col_as "metadata" source,
 }
 
 fun users : Db.Table UsersTable User NewUser (Users UsersScope) (OptionalUsers UsersScope)
@@ -204,6 +214,18 @@ tagged_posts_query () = Query.query (fun () -> {
   select! ({ id: p.id, tags: tags })
 })
 
+fun metadata_probe_query : Unit
+  -> Query.Prepared {
+    id: Int,
+    metadata: Db.Jsonb Metadata,
+  }
+metadata_probe_query () = Query.query (fun () -> {
+  let p = from! posts
+  order_by! [Db.asc p.id]
+  limit! 2
+  select! ({ id: p.id, metadata: p.metadata })
+})
+
 # fun users_with_optional_posts_query : Unit -> Query.Prepared {
 #   user: User,
 #   post_id: Maybe Int,
@@ -249,6 +271,14 @@ fun load_tagged_posts : Connection
   }) Query.DbError
   needs {Repo}
 load_tagged_posts conn = Query.all conn (tagged_posts_query ())
+
+fun load_metadata_probe : Connection
+  -> Result (List {
+    id: Int,
+    metadata: Db.Jsonb Metadata,
+  }) Query.DbError
+  needs {Repo}
+load_metadata_probe conn = Query.all conn (metadata_probe_query ())
 
 fun show_maybe_int : Maybe Int -> String
 show_maybe_int value = case value {
@@ -309,6 +339,21 @@ main () = {
         println $"{show row.id}: [{show_string_list (Db.array_to_list row.tags)}]") rows
     }
     Err err -> println ("tagged query failed: " <> debug err)
+  }
+
+  let metadata_prepared = metadata_probe_query ()
+  println metadata_prepared.sql
+
+  let metadata_result = load_metadata_probe conn with Query.pg_repo
+  case metadata_result {
+    Ok rows -> {
+      println ("metadata rows: " <> show (List.length rows))
+      List.iter (fun row -> {
+        let metadata = Db.jsonb_to_value row.metadata
+        println $"{show row.id}: {metadata.source} / {show metadata.featured}"
+      }) rows
+    }
+    Err err -> println ("metadata probe failed: " <> debug err)
   }
 
   let stats_prepared = user_age_stats_query ()
