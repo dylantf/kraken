@@ -218,12 +218,24 @@ fun metadata_probe_query : Unit
   -> Query.Prepared {
     id: Int,
     metadata: Db.Jsonb Metadata,
+    source: String,
   }
 metadata_probe_query () = Query.query (fun () -> {
   let p = from! posts
+  where_! (Db.and_ [
+    Db.json_contains p.metadata (Db.jsonb (Metadata {
+      source: "seed",
+      featured: True,
+    })),
+    Db.json_has_key p.metadata "featured",
+  ])
   order_by! [Db.asc p.id]
   limit! 2
-  select! ({ id: p.id, metadata: p.metadata })
+  select! ({
+    id: p.id,
+    metadata: p.metadata,
+    source: Db.json_text p.metadata "source",
+  })
 })
 
 # fun users_with_optional_posts_query : Unit -> Query.Prepared {
@@ -276,6 +288,7 @@ fun load_metadata_probe : Connection
   -> Result (List {
     id: Int,
     metadata: Db.Jsonb Metadata,
+    source: String,
   }) Query.DbError
   needs {Repo}
 load_metadata_probe conn = Query.all conn (metadata_probe_query ())
@@ -350,7 +363,7 @@ main () = {
       println ("metadata rows: " <> show (List.length rows))
       List.iter (fun row -> {
         let metadata = Db.jsonb_to_value row.metadata
-        println $"{show row.id}: {metadata.source} / {show metadata.featured}"
+        println $"{show row.id}: {row.source} / {metadata.source} / {show metadata.featured}"
       }) rows
     }
     Err err -> println ("metadata probe failed: " <> debug err)

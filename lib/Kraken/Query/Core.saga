@@ -258,6 +258,10 @@ pub trait ToArraySql input a | input -> a {
   fun to_array_sql : input -> Sql (Array a)
 }
 
+pub trait ToJsonbSql input a | input -> a {
+  fun to_jsonb_sql : input -> Sql (Jsonb a)
+}
+
 pub fun project : selection -> Projection row
   where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 project selection =
@@ -419,6 +423,9 @@ value_frag input = sql_frag (to_sql input)
 fun array_frag : input -> SqlFrag where {input: ToArraySql a}
 array_frag input = sql_frag (to_array_sql input)
 
+fun jsonb_frag : input -> SqlFrag where {input: ToJsonbSql a}
+jsonb_frag input = sql_frag (to_jsonb_sql input)
+
 pub fun eq : input -> a -> Expr where {input: ToSql a, a: PgType}
 eq input value =
   make_expr (spaced (value_frag input) "=" (param (encode_pg value)))
@@ -505,6 +512,19 @@ pub fun overlaps : input -> Array a -> Expr
   where {input: ToArraySql a, a: PgType}
 overlaps input values =
   make_expr (spaced (array_frag input) "&&" (param (encode_pg values)))
+
+pub fun json_contains : input -> Jsonb a -> Expr
+  where {input: ToJsonbSql a, a: ToJson + FromJson}
+json_contains input value =
+  make_expr (spaced (jsonb_frag input) "@>" (param (encode_pg value)))
+
+pub fun json_has_key : input -> String -> Expr where {input: ToJsonbSql a}
+json_has_key input key =
+  make_expr (spaced (jsonb_frag input) "?" (param (encode_pg key)))
+
+pub fun json_text : input -> String -> Sql String where {input: ToJsonbSql a}
+json_text input key =
+  make_sql (spaced (jsonb_frag input) "->>" (param (encode_pg key)))
 
 pub fun in_ : input -> List a -> Expr where {input: ToSql a, a: PgType}
 in_ input values = case values {
@@ -707,6 +727,16 @@ impl ToArraySql a for (Column source name (Array a)) where {a: PgType} {
 
 impl ToArraySql a for (Sql (Array a)) where {a: PgType} {
   to_array_sql sql_value = sql_value
+}
+
+impl ToJsonbSql a for (Column source name (Jsonb a))
+  where {a: ToJson + FromJson}
+{
+  to_jsonb_sql column = make_sql (column_frag column)
+}
+
+impl ToJsonbSql a for (Sql (Jsonb a)) where {a: ToJson + FromJson} {
+  to_jsonb_sql sql_value = sql_value
 }
 
 impl Selectable (Leaf row) for Leaf selection where {selection: Selectable row} {

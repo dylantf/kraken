@@ -327,6 +327,30 @@ The `ANY`/`ALL` helpers currently render `ANY(ARRAY[...])` and `ALL(ARRAY[...])`
 using individual bind parameters. That keeps the common predicates useful before
 Kraken has a real array column/value model.
 
+## Schema Ergonomics
+
+Current demos define both required and optional column records:
+
+```saga
+record Users source { ... Column source name a ... }
+record OptionalUsers source { ... Column source name (Maybe a) ... }
+```
+
+This is only acceptable as scaffolding. The library needs the optional shape for
+outer joins, because a `LEFT JOIN` can make every column on the joined side
+`NULL` even when the table column is declared `NOT NULL`. But users should define
+a table's columns once.
+
+Target direction: derive or generic-transform the nullable mirror:
+
+```saga
+Column source name a -> Column source name (Maybe a)
+```
+
+recursively over the table column record. `from!` and `inner_join!` keep the
+required shape; `left_join!` returns the generated optional shape. Circle back
+before treating the schema API as user-ready.
+
 Array status:
 
 Kraken now has an explicit `Db.Array a` wrapper:
@@ -403,12 +427,20 @@ Db.jsonb metadata
 Db.jsonb_to_value row.metadata
 ```
 
+Implemented JSONB operators:
+
+```saga
+Db.json_contains post.metadata (Db.jsonb metadata)  # @>
+Db.json_has_key post.metadata "featured"           # ?
+Db.json_text post.metadata "source"                # ->>
+```
+
 Still open for JSONB:
 
 - Add raw/dynamic JSON wrappers if users want to pass blobs without typed
   schema validation.
-- Add JSONB operators: containment `@>`, key existence `?`, path/text extraction
-  `->`, `->>`, `#>`, `#>>`.
+- Add more JSONB operators: JSON extraction `->`, path extraction `#>`, `#>>`,
+  key-any `?|`, key-all `?&`.
 - Decide whether `Json a` should mirror `Jsonb a`, or whether Kraken should only
   bless `jsonb` initially.
 
