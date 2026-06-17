@@ -491,16 +491,16 @@ pub fun count_distinct : input -> Sql Int where {input: ToSql a, a: PgType}
 count_distinct input =
   make_sql (append_frags [raw "COUNT(DISTINCT ", value_frag input, raw ")"])
 
-pub fun sum : input -> Sql a where {input: ToSql a, a: PgType}
+pub fun sum : input -> Sql (Maybe a) where {input: ToSql a, a: PgType}
 sum input = make_sql (append_frags [raw "SUM(", value_frag input, raw ")"])
 
-pub fun avg : input -> Sql Float where {input: ToSql a, a: PgType}
+pub fun avg : input -> Sql (Maybe Float) where {input: ToSql a, a: PgType}
 avg input = make_sql (append_frags [raw "AVG(", value_frag input, raw ")"])
 
-pub fun min : input -> Sql a where {input: ToSql a, a: PgType}
+pub fun min : input -> Sql (Maybe a) where {input: ToSql a, a: PgType}
 min input = make_sql (append_frags [raw "MIN(", value_frag input, raw ")"])
 
-pub fun max : input -> Sql a where {input: ToSql a, a: PgType}
+pub fun max : input -> Sql (Maybe a) where {input: ToSql a, a: PgType}
 max input = make_sql (append_frags [raw "MAX(", value_frag input, raw ")"])
 
 record Source {

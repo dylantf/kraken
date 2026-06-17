@@ -133,6 +133,20 @@ post_counts_by_author_query () = Db.query (fun () -> {
   select! ({ author_id: p.author_id, total: Db.count p.id })
 })
 
+fun user_age_stats_query : Unit -> Db.Prepared {
+  average_age: Maybe Float,
+  oldest_age: Maybe Int,
+  total_age: Maybe Int,
+}
+user_age_stats_query () = Db.query (fun () -> {
+  let u = from! users
+  select! ({
+    average_age: Db.avg u.age,
+    oldest_age: Db.max u.age,
+    total_age: Db.sum u.age,
+  })
+})
+
 fun user_posts_query : Unit -> Db.Prepared {
   post_title: String,
   user: User,
@@ -182,6 +196,26 @@ fun load_users : Connection -> Result (List {
   needs {Repo}
 load_users conn = Db.all conn (users_query ())
 
+fun load_user_age_stats : Connection -> Result (Maybe {
+  average_age: Maybe Float,
+  oldest_age: Maybe Int,
+  total_age: Maybe Int,
+}) Db.DbError
+  needs {Repo}
+load_user_age_stats conn = Db.one conn (user_age_stats_query ())
+
+fun show_maybe_int : Maybe Int -> String
+show_maybe_int value = case value {
+  Just inner -> show inner
+  Nothing -> "NULL"
+}
+
+fun show_maybe_float : Maybe Float -> String
+show_maybe_float value = case value {
+  Just inner -> show inner
+  Nothing -> "NULL"
+}
+
 main () = {
   let config =
     { default_config "kraken_testing" |
@@ -207,6 +241,17 @@ main () = {
 
   let grouped_prepared = post_counts_by_author_query ()
   println grouped_prepared.sql
+
+  let stats_prepared = user_age_stats_query ()
+  println stats_prepared.sql
+
+  let stats_result = load_user_age_stats conn with Db.pg_repo
+  case stats_result {
+    Ok (Just stats) ->
+      println $"age stats: avg={show_maybe_float stats.average_age} oldest={show_maybe_int stats.oldest_age} total={show_maybe_int stats.total_age}"
+    Ok Nothing -> println "age stats: no row"
+    Err err -> println ("stats query failed: " <> debug err)
+  }
 
   let result = load_user_posts conn with Db.pg_repo
 

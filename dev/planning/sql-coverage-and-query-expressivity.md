@@ -192,10 +192,10 @@ Implemented aggregate helpers:
 - `count_star : Sql Int`
 - `count : Column source name a -> Sql Int`
 - `count_distinct : Column source name a -> Sql Int`
-- `sum`
-- `avg`
-- `min`
-- `max`
+- `sum : input -> Sql (Maybe a)`
+- `avg : input -> Sql (Maybe Float)`
+- `min : input -> Sql (Maybe a)`
+- `max : input -> Sql (Maybe a)`
 
 Potential syntax:
 
@@ -221,6 +221,53 @@ Implementation notes:
 - Render repeated `having!` clauses with `AND`, like `where_!`.
 - Aggregates need to be selectable, orderable, and usable in `having!`.
 - `Sql a` now carries the decoder needed for selection.
+
+### Aggregate Nullability
+
+SQL aggregate nullability is not determined only by whether the input column is
+nullable.
+
+`COUNT(*)`, `COUNT(expr)`, and `COUNT(DISTINCT expr)` return a non-null count.
+For an empty input, the result is `0`.
+
+Most other aggregates can return `NULL`:
+
+- ungrouped `SUM(expr)`, `AVG(expr)`, `MIN(expr)`, and `MAX(expr)` return
+  `NULL` when the query input has no rows
+- aggregates over nullable expressions also return `NULL` if every input value
+  for that aggregate is `NULL`
+- left-joined columns are nullable at the query level, even if their underlying
+  table columns are non-nullable
+
+For grouped queries, each emitted group has at least one input row. That means
+an aggregate like `SUM(non_nullable_column)` is non-null for each emitted group,
+assuming no aggregate `FILTER` clause removes all rows for that aggregate. But
+the type system would need to know both query cardinality shape and expression
+nullability to prove that.
+
+Conservative first signature:
+
+```saga
+count : input -> Sql Int
+count_distinct : input -> Sql Int
+sum : input -> Sql (Maybe a)
+avg : input -> Sql (Maybe Float)
+min : input -> Sql (Maybe a)
+max : input -> Sql (Maybe a)
+```
+
+Potential future refinement:
+
+```saga
+sum_non_null : input -> Sql a
+avg_non_null : input -> Sql Float
+min_non_null : input -> Sql a
+max_non_null : input -> Sql a
+```
+
+Those helpers would be an assertion or a proof-bearing API. The library should
+avoid pretending it can infer non-null aggregate results until Kraken has a
+clear nullability/cardinality model.
 
 ## Tier 4: Predicate Vocabulary
 
@@ -398,9 +445,13 @@ Anonymous projections remain ideal for local query construction.
 After `Sql a`, grouping, having, and basic aggregates, the next useful steps
 are:
 
-- `distinct!`
+- remove `SelectExpr`; keep `Sql a` as the single typed SQL value expression
+- aggregate nullability for `sum`, `avg`, `min`, and `max`
+- clean up raw SQL escape hatches around `sql_raw`, `sql_raw_from`, and
+  `raw_expr_from`
 - predicate helpers like `like`, `ilike`, `between`, `in_`
 - casts through `PgTypeName a`
+- `distinct!`
 - whole-row optional left join projection, such as `post: Maybe Post`
 
 This continues growing the SQL surface on top of the typed expression model
