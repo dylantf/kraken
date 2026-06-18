@@ -347,10 +347,10 @@ Target direction: derive or generic-transform the nullable mirror:
 Column source name a -> Column source name (Maybe a)
 ```
 
-recursively over the table column record. `from!` and `inner_join!` keep the
-required shape; `left_join!` returns an optional shape.
+recursively over the table column record. `Query.from` and `Query.inner_join`
+keep the required shape; `Query.left_join` returns an optional shape.
 
-Current schema-trait checkpoint:
+Older schema-trait checkpoint:
 
 ```saga
 pub type TableRef a = TableRef Int
@@ -366,40 +366,30 @@ pub fun table_for : TableRef required_cols
   where {required_cols: TableSchema row insert optional_cols}
 ```
 
-This lets a table value be derived from one impl. The optional scope can now be
-an anonymous record type instead of a named `OptionalUsers` record:
+Current code has moved to a leaner table value and a `table mode -> cols`
+relationship:
 
 ```saga
-impl Db.TableSchema User NewUser ({
-  id: Db.Column source 'id (Maybe Int),
-  name: Db.Column source 'name (Maybe String),
-  age: Db.Column source 'age (Maybe Int),
-}) for Users source {
-  ...
-}
+pub trait TableScope table mode cols | table mode -> cols
 
-fun users : Db.Table (Users UsersScope) User NewUser (Users UsersScope) {
-  id: Db.Column UsersScope 'id (Maybe Int),
-  name: Db.Column UsersScope 'name (Maybe String),
-  age: Db.Column UsersScope 'age (Maybe Int),
-}
+fun users : Db.Table UsersTable
 users = Db.table_for Db.table_ref
 ```
 
-That removes the separate `user_cols` / `optional_user_cols` helper functions
-and separate table marker types. It also removes the named `OptionalFoo` record
-from user code. Direct optional column selection works:
+That removes the separate `user_cols` / `optional_user_cols` helper functions,
+the named `OptionalFoo` record, and `NewFoo` insert shapes from table setup.
+Direct optional column selection works:
 
 ```saga
-let p = left_join! posts (fun post -> Db.eq_col post.author_id u.id)
+let p = Query.left_join posts (fun post -> Db.eq_col post.author_id u.id)
 select! ({ post_title: p.title })
 # post_title : Maybe String
 ```
 
 Whole-row projection checkpoint:
 
-Applied derives now cover the whole-row projection bridge. The user-facing shape
-is:
+Selecting a whole required row currently still needs a user-written bridge. The
+desired user-facing shape is still:
 
 ```saga
 record User {
@@ -415,31 +405,30 @@ record Users source {
 } deriving (Generic, Db.Selectable User)
 ```
 
-This replaces both the public `impl Db.Selectable User for Users source` and the
-internal generated-representation bridge. It works even though `Db.Projection`
-is opaque because the derive can route through `Db.map` instead of destructuring
-the wrapper.
+Generating this bridge would replace the public
+`impl Db.Selectable User for Users source`. It should be possible because the
+derive can route through `Db.map` instead of destructuring the opaque
+`Db.Projection` wrapper.
 
 Remaining schema ergonomics work:
 
-- The anonymous optional shape is still verbose and repeats the table fields.
-  The next target is deriving or schema-generating:
-
-```saga
-Db.Column source name a -> Db.Column source name (Maybe a)
-```
+- Generate the `Selectable User for Users ...` bridge. This is still too much
+  boilerplate for users to write by hand.
+- Reduce table setup further if possible. The remaining repeated shape is
+  `record User`, `record Users source meta`, `type UsersTable`, `TableSchema`,
+  `TableScope`, and the `users` value.
 
 - Whole-row selection from a left join is not yet implicit. Ideally:
 
 ```saga
-let p = left_join! posts (fun post -> Db.eq_col post.author_id u.id)
+let p = Query.left_join posts (fun post -> Db.eq_col post.author_id u.id)
 select! ({ post: p })
 # post : Maybe Post
 ```
 
-Currently the optional scope is anonymous, and Saga cannot attach a
-`Selectable (Maybe Post)` impl to that anonymous record directly. This likely
-needs another generated bridge, or an explicit helper/design decision.
+Scalar optional columns work today, but a row of nullable fields is not the same
+thing as `Maybe Post`. This likely needs primary-key/null sentinel metadata or a
+generated bridge.
 
 Array status:
 

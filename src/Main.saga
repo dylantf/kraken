@@ -47,8 +47,8 @@ impl Db.TableSchema for UsersTable {
   schema_table_name _ = "users"
 }
 
-impl Db.TableScope UsersTable for (Users UsersTable meta) {
-  schema_cols (_, source) = Users {
+impl Db.TableScope meta (Users UsersTable meta) for UsersTable {
+  schema_cols (_, _, source) = Users {
     id: Db.col_as "id" source,
     name: Db.col_as "name" source,
     age: Db.col_as "age" source,
@@ -59,8 +59,8 @@ impl Db.TableSchema for PostsTable {
   schema_table_name _ = "posts"
 }
 
-impl Db.TableScope PostsTable for (Posts PostsTable meta) {
-  schema_cols (_, source) = Posts {
+impl Db.TableScope meta (Posts PostsTable meta) for PostsTable {
+  schema_cols (_, _, source) = Posts {
     id: Db.col_as "id" source,
     author_id: Db.col_as "author_id" source,
     title: Db.col_as "title" source,
@@ -70,10 +70,10 @@ impl Db.TableScope PostsTable for (Posts PostsTable meta) {
   }
 }
 
-fun users : Db.Table UsersTable User (Users UsersTable Db.Required) (Users UsersTable Db.Optional)
+fun users : Db.Table UsersTable
 users = Db.table_for Db.table_ref
 
-fun posts : Db.Table PostsTable Post (Posts PostsTable Db.Required) (Posts PostsTable Db.Optional)
+fun posts : Db.Table PostsTable
 posts = Db.table_for Db.table_ref
 
 impl Db.Selectable User for (Users source Db.Required) {
@@ -87,7 +87,7 @@ impl Db.Selectable User for (Users source Db.Required) {
 
 fun users_query : Unit -> Query.Prepared { id: Int, name: String, age: Int }
 users_query () = Query.query (fun () -> {
-  let u = from! users
+  let u = Query.from users
   where_! (Db.gt u.age 18)
   order_by! [Db.asc u.id]
   limit! 20
@@ -96,7 +96,7 @@ users_query () = Query.query (fun () -> {
 
 fun post_count_query : Unit -> Query.Prepared { total: Int }
 post_count_query () = Query.query (fun () -> {
-  let p = from! posts
+  let p = Query.from posts
   where_! (Db.eq p.published True)
   select! ({ total: Db.count_star })
 })
@@ -107,7 +107,7 @@ fun post_counts_by_author_query : Unit
     total: Int,
   }
 post_counts_by_author_query () = Query.query (fun () -> {
-  let p = from! posts
+  let p = Query.from posts
   group_by! [Db.group p.author_id]
   having! (Db.gt (Db.count p.id) 0)
   order_by! [Db.desc (Db.count p.id)]
@@ -121,7 +121,7 @@ fun user_age_stats_query : Unit
     total_age: Maybe Int,
   }
 user_age_stats_query () = Query.query (fun () -> {
-  let u = from! users
+  let u = Query.from users
   select! ({
     average_age: Db.avg u.age,
     oldest_age: Db.max u.age,
@@ -135,8 +135,8 @@ fun user_posts_query : Unit
     user: User,
   }
 user_posts_query () = Query.query (fun () -> {
-  let u = from! users
-  let p = inner_join! posts (fun post -> Db.eq_col post.author_id u.id)
+  let u = Query.from users
+  let p = Query.inner_join posts (fun post -> Db.eq_col post.author_id u.id)
   where_! (Db.and_ [
     Db.in_ u.name ["Alice", "Bob"],
     Db.between u.age 18 65,
@@ -150,7 +150,7 @@ user_posts_query () = Query.query (fun () -> {
 
 fun predicate_showcase_query : Unit -> Query.Prepared { id: Int }
 predicate_showcase_query () = Query.query (fun () -> {
-  let u = from! users
+  let u = Query.from users
   where_! (Db.and_ [
     Db.ilike u.name "%alice%",
     Db.not_in u.name ["Mallory"],
@@ -168,7 +168,7 @@ fun tagged_posts_query : Unit
     tags: Db.Array String,
   }
 tagged_posts_query () = Query.query (fun () -> {
-  let p = from! posts
+  let p = Query.from posts
   let tags =
     Db.raw_array_like p.tags "COALESCE(?, ARRAY[]::text[])" [Db.sql p.tags]
   where_! (Db.and_ [
@@ -186,7 +186,7 @@ fun metadata_probe_query : Unit
     source: String,
   }
 metadata_probe_query () = Query.query (fun () -> {
-  let p = from! posts
+  let p = Query.from posts
   where_! (Db.and_ [
     Db.json_contains p.metadata (Db.jsonb (Metadata {
       source: "seed",
@@ -210,8 +210,8 @@ fun users_with_optional_posts_query : Unit
     post_title: Maybe String,
   }
 users_with_optional_posts_query () = Query.query (fun () -> {
-  let u = from! users
-  let p = left_join! posts (fun post -> Db.eq_col post.author_id u.id)
+  let u = Query.from users
+  let p = Query.left_join posts (fun post -> Db.eq_col post.author_id u.id)
   order_by! [Db.asc u.id]
   select! ({ user: u, post_id: p.id, post_title: p.title })
 })

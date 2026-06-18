@@ -116,22 +116,20 @@ pub type Required = Required
 pub type Optional = Optional
 pub type TableRef table = TableRef
 
-record TableDef required_cols optional_cols {
+record TableDef {
   name: String,
   alias: Maybe String,
-  make_required_cols: String -> required_cols,
-  make_optional_cols: String -> optional_cols,
 }
 
-opaque type Table table row required_cols optional_cols =
-  | Table (TableDef required_cols optional_cols)
+opaque type Table table =
+  | Table TableDef
 
 pub trait TableSchema table {
   fun schema_table_name : TableRef table -> String
 }
 
-pub trait TableScope cols table | cols -> table {
-  fun schema_cols : (TableRef table, String) -> cols
+pub trait TableScope table mode cols | table mode -> cols {
+  fun schema_cols : (mode, TableRef table, String) -> cols
 }
 
 record ColumnInfo {
@@ -145,42 +143,34 @@ pub fun table_ref : TableRef table
 table_ref = TableRef
 
 pub fun table : String
-  -> (String -> required_cols)
-  -> (String -> optional_cols)
-  -> Table table row required_cols optional_cols
-table name make_required_cols make_optional_cols =
+  -> Table table
+table name =
   Table (TableDef {
     name: name,
     alias: Nothing,
-    make_required_cols: make_required_cols,
-    make_optional_cols: make_optional_cols,
   })
 
 pub fun table_for : TableRef table
-  -> Table table row required_cols optional_cols
-  where {table: TableSchema, required_cols: TableScope table, optional_cols: TableScope table}
-table_for ref = {
-  let required: String -> required_cols = fun source -> schema_cols (ref, source)
-  let optional: String -> optional_cols = fun source -> schema_cols (ref, source)
-  table (schema_table_name ref) required optional
-}
+  -> Table table
+  where {table: TableSchema}
+table_for ref = table (schema_table_name ref)
 
 pub fun table_as : String
-  -> Table table row required_cols optional_cols
-  -> Table table row required_cols optional_cols
+  -> Table table
+  -> Table table
 table_as alias table_value = {
   let Table def = table_value
   Table ({ def | alias: Just alias })
 }
 
-pub fun table_name : Table table row required_cols optional_cols
+pub fun table_name : Table table
   -> String
 table_name table_value = {
   let Table def = table_value
   def.name
 }
 
-pub fun table_alias : Table table row required_cols optional_cols
+pub fun table_alias : Table table
   -> Maybe String
 table_alias table_value = {
   let Table def = table_value
@@ -188,19 +178,19 @@ table_alias table_value = {
 }
 
 pub fun table_required_cols : String
-  -> Table table row required_cols optional_cols
+  -> Table table
   -> required_cols
-table_required_cols alias table_value = {
-  let Table def = table_value
-  def.make_required_cols alias
+  where {table: TableScope Required required_cols}
+table_required_cols alias _ = {
+  schema_cols (Required, table_ref, alias)
 }
 
 pub fun table_optional_cols : String
-  -> Table table row required_cols optional_cols
+  -> Table table
   -> optional_cols
-table_optional_cols alias table_value = {
-  let Table def = table_value
-  def.make_optional_cols alias
+  where {table: TableScope Optional optional_cols}
+table_optional_cols alias _ = {
+  schema_cols (Optional, table_ref, alias)
 }
 
 pub fun col : Proxy name -> String -> Column source meta name a
@@ -288,10 +278,6 @@ project selection =
 pub fun select : selection -> Projection row
   where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 select selection = project selection
-
-pub fun select_all : selection -> Projection row
-  where {selection: Selectable row}
-select_all selection = to_projection selection
 
 pub fun map : (a -> b) -> Projection a -> Projection b
 map transform projection = {
