@@ -4,16 +4,11 @@ import Std.IO (console)
 import Kraken.Query as Query
 import Kraken.Query (QueryBuild, Repo)
 import Kraken.Query.Core as Db
-import SagaPgo (Connection, connect, default_config, pg)
 import SagaJson.Codec (ToJson, FromJson)
+import SagaPgo (Connection, connect, default_config, pg)
 
 record User {
   id: Int,
-  name: String,
-  age: Int,
-}
-
-record NewUser {
   name: String,
   age: Int,
 }
@@ -25,19 +20,11 @@ record Post {
   published: Bool,
 }
 
-record NewPost {
-  author_id: Int,
-  title: String,
-  published: Bool,
-}
-
 record Metadata {
   source: String,
   featured: Bool,
 } deriving (ToJson, FromJson)
 
-type UsersScope = UsersScope
-type PostsScope = PostsScope
 type UsersTable = UsersTable
 type PostsTable = PostsTable
 
@@ -56,45 +43,38 @@ record Posts source meta {
   metadata: Db.Column source meta 'metadata (Db.Jsonb Metadata),
 }
 
-fun user_cols : String -> Users UsersScope Db.Required
-user_cols source = Users {
-  id: Db.col_as "id" source,
-  name: Db.col_as "name" source,
-  age: Db.col_as "age" source,
+impl Db.TableSchema for UsersTable {
+  schema_table_name _ = "users"
 }
 
-fun optional_user_cols : String -> Users UsersScope Db.Optional
-optional_user_cols source = Users {
-  id: Db.col_as "id" source,
-  name: Db.col_as "name" source,
-  age: Db.col_as "age" source,
+impl Db.TableScope UsersTable for (Users UsersTable meta) {
+  schema_cols (_, source) = Users {
+    id: Db.col_as "id" source,
+    name: Db.col_as "name" source,
+    age: Db.col_as "age" source,
+  }
 }
 
-fun post_cols : String -> Posts PostsScope Db.Required
-post_cols source = Posts {
-  id: Db.col_as "id" source,
-  author_id: Db.col_as "author_id" source,
-  title: Db.col_as "title" source,
-  published: Db.col_as "published" source,
-  tags: Db.col_as "tags" source,
-  metadata: Db.col_as "metadata" source,
+impl Db.TableSchema for PostsTable {
+  schema_table_name _ = "posts"
 }
 
-fun optional_post_cols : String -> Posts PostsScope Db.Optional
-optional_post_cols source = Posts {
-  id: Db.col_as "id" source,
-  author_id: Db.col_as "author_id" source,
-  title: Db.col_as "title" source,
-  published: Db.col_as "published" source,
-  tags: Db.col_as "tags" source,
-  metadata: Db.col_as "metadata" source,
+impl Db.TableScope PostsTable for (Posts PostsTable meta) {
+  schema_cols (_, source) = Posts {
+    id: Db.col_as "id" source,
+    author_id: Db.col_as "author_id" source,
+    title: Db.col_as "title" source,
+    published: Db.col_as "published" source,
+    tags: Db.col_as "tags" source,
+    metadata: Db.col_as "metadata" source,
+  }
 }
 
-fun users : Db.Table UsersTable User NewUser (Users UsersScope Db.Required) (Users UsersScope Db.Optional)
-users = Db.table "users" user_cols optional_user_cols
+fun users : Db.Table UsersTable User (Users UsersTable Db.Required) (Users UsersTable Db.Optional)
+users = Db.table_for Db.table_ref
 
-fun posts : Db.Table PostsTable Post NewPost (Posts PostsScope Db.Required) (Posts PostsScope Db.Optional)
-posts = Db.table "posts" post_cols optional_post_cols
+fun posts : Db.Table PostsTable Post (Posts PostsTable Db.Required) (Posts PostsTable Db.Optional)
+posts = Db.table_for Db.table_ref
 
 impl Db.Selectable User for (Users source Db.Required) {
   to_projection u = {

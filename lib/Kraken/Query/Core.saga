@@ -15,12 +15,12 @@ import Std.Dynamic (
   optional
 )
 import Std.Generic (Generic, Leaf, Labeled, And, Record)
+import SagaJson as Json
+import SagaJson.Codec as JsonCodec (ToJson, FromJson)
 import SagaPgo (Connection, Postgres, QueryError, Returned)
 import SagaPgo as Pgo
 import SagaPgo.Types (Value)
 import SagaPgo.Types as T
-import SagaJson as Json
-import SagaJson.Codec as JsonCodec (ToJson, FromJson)
 
 @external("erlang", "saga_pgo_bridge", "coerce")
 fun coerce_value : a -> Value
@@ -52,10 +52,8 @@ jsonb_to_value json_value = case json_value {
 
 fun json_error_to_decode_error : Json.Error -> DecodeError
 json_error_to_decode_error err = case err {
-  Json.InvalidJson message ->
-    DecodeError "Json" message []
-  Json.InvalidShape expected found path ->
-    DecodeError expected found path
+  Json.InvalidJson message -> DecodeError "Json" message []
+  Json.InvalidShape expected found path -> DecodeError expected found path
 }
 
 impl PgType for Int {
@@ -87,25 +85,23 @@ impl PgType for Array a where {a: PgType} {
   encode_pg array_value = case array_value {
     Array values -> coerce_value values
   }
-  decode_pg =
-    Decoder (fun data -> case decode (list_of decode_pg) data {
-      Ok values -> Ok (Array values)
-      Err err -> Err err
-    })
+  decode_pg = Decoder (fun data -> case decode (list_of decode_pg) data {
+    Ok values -> Ok (Array values)
+    Err err -> Err err
+  })
 }
 
 impl PgType for Jsonb a where {a: ToJson + FromJson} {
   encode_pg json_value = case json_value {
     Jsonb value -> T.pg_text (JsonCodec.serialize value)
   }
-  decode_pg =
-    Decoder (fun data -> case decode string data {
-      Err err -> Err err
-      Ok text -> case JsonCodec.deserialize text {
-        Ok value -> Ok (Jsonb value)
-        Err err -> Err (json_error_to_decode_error err)
-      }
-    })
+  decode_pg = Decoder (fun data -> case decode string data {
+    Err err -> Err err
+    Ok text -> case JsonCodec.deserialize text {
+      Ok value -> Ok (Jsonb value)
+      Err err -> Err (json_error_to_decode_error err)
+    }
+  })
 }
 
 impl PgType for Maybe a where {a: PgType} {
@@ -118,6 +114,7 @@ impl PgType for Maybe a where {a: PgType} {
 
 pub type Required = Required
 pub type Optional = Optional
+pub type TableRef table = TableRef
 
 record TableDef required_cols optional_cols {
   name: String,
@@ -126,8 +123,16 @@ record TableDef required_cols optional_cols {
   make_optional_cols: String -> optional_cols,
 }
 
-opaque type Table table row insert required_cols optional_cols =
+opaque type Table table row required_cols optional_cols =
   | Table (TableDef required_cols optional_cols)
+
+pub trait TableSchema table {
+  fun schema_table_name : TableRef table -> String
+}
+
+pub trait TableScope cols table | cols -> table {
+  fun schema_cols : (TableRef table, String) -> cols
+}
 
 record ColumnInfo {
   source: String,
@@ -136,10 +141,13 @@ record ColumnInfo {
 
 opaque type Column source meta (name : Symbol) a = Column ColumnInfo
 
+pub fun table_ref : TableRef table
+table_ref = TableRef
+
 pub fun table : String
   -> (String -> required_cols)
   -> (String -> optional_cols)
-  -> Table table row insert required_cols optional_cols
+  -> Table table row required_cols optional_cols
 table name make_required_cols make_optional_cols =
   Table (TableDef {
     name: name,
@@ -148,22 +156,31 @@ table name make_required_cols make_optional_cols =
     make_optional_cols: make_optional_cols,
   })
 
+pub fun table_for : TableRef table
+  -> Table table row required_cols optional_cols
+  where {table: TableSchema, required_cols: TableScope table, optional_cols: TableScope table}
+table_for ref = {
+  let required: String -> required_cols = fun source -> schema_cols (ref, source)
+  let optional: String -> optional_cols = fun source -> schema_cols (ref, source)
+  table (schema_table_name ref) required optional
+}
+
 pub fun table_as : String
-  -> Table table row insert required_cols optional_cols
-  -> Table table row insert required_cols optional_cols
+  -> Table table row required_cols optional_cols
+  -> Table table row required_cols optional_cols
 table_as alias table_value = {
   let Table def = table_value
   Table ({ def | alias: Just alias })
 }
 
-pub fun table_name : Table table row insert required_cols optional_cols
+pub fun table_name : Table table row required_cols optional_cols
   -> String
 table_name table_value = {
   let Table def = table_value
   def.name
 }
 
-pub fun table_alias : Table table row insert required_cols optional_cols
+pub fun table_alias : Table table row required_cols optional_cols
   -> Maybe String
 table_alias table_value = {
   let Table def = table_value
@@ -171,7 +188,7 @@ table_alias table_value = {
 }
 
 pub fun table_required_cols : String
-  -> Table table row insert required_cols optional_cols
+  -> Table table row required_cols optional_cols
   -> required_cols
 table_required_cols alias table_value = {
   let Table def = table_value
@@ -179,7 +196,7 @@ table_required_cols alias table_value = {
 }
 
 pub fun table_optional_cols : String
-  -> Table table row insert required_cols optional_cols
+  -> Table table row required_cols optional_cols
   -> optional_cols
 table_optional_cols alias table_value = {
   let Table def = table_value
@@ -633,13 +650,15 @@ field_def_projection def =
     decode_at: fun offset row -> decode_element offset def.decoder row,
   })
 
-fun field_projection : Column source meta name a -> Projection a where {a: PgType}
+fun field_projection : Column source meta name a -> Projection a
+  where {a: PgType}
 field_projection column = {
   let Field def = field_auto column
   field_def_projection def
 }
 
-fun optional_field_projection : Column source meta name a -> Projection (Maybe a)
+fun optional_field_projection : Column source meta name a
+  -> Projection (Maybe a)
   where {a: PgType}
 optional_field_projection column = {
   let Column info = column
@@ -727,7 +746,7 @@ impl Selectable a for Sql a {
   to_projection sql_value = sql_projection sql_value
 }
 
-impl ToSql a for Column source meta name a where {a: PgType} {
+impl ToSql a for (Column source meta name a) where {a: PgType} {
   to_sql column = make_sql (column_frag column)
 }
 
@@ -743,9 +762,7 @@ impl ToArraySql a for (Sql (Array a)) where {a: PgType} {
   to_array_sql sql_value = sql_value
 }
 
-impl ToJsonbSql a for (Column source meta name (Jsonb a))
-  where {a: ToJson + FromJson}
-{
+impl ToJsonbSql a for (Column source meta name (Jsonb a)) where {a: ToJson + FromJson} {
   to_jsonb_sql column = make_sql (column_frag column)
 }
 

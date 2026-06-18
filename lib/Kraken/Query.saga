@@ -74,11 +74,11 @@ pub handler pg_repo for Repo needs {Postgres} {
 }
 
 pub effect QueryBuild selection {
-  fun from : Table name row insert required_cols optional_cols -> required_cols
-  fun inner_join : Table name row insert required_cols optional_cols
+  fun from : Table name row required_cols optional_cols -> required_cols
+  fun inner_join : Table name row required_cols optional_cols
     -> (required_cols -> Expr)
     -> required_cols
-  fun left_join : Table name row insert required_cols optional_cols
+  fun left_join : Table name row required_cols optional_cols
     -> (required_cols -> Expr)
     -> optional_cols
   fun where_ : Expr -> Unit
@@ -103,7 +103,7 @@ empty_state = QueryState {
   next_alias: 0,
 }
 
-fun bind_required_table : Table table row insert required_cols optional_cols
+fun bind_required_table : Table table row required_cols optional_cols
   -> QueryState
   -> (Source, required_cols, QueryState)
 bind_required_table table_value state = {
