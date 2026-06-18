@@ -1,172 +1,9 @@
 module Main
 
 import Std.IO (console, Stdio)
-import Kraken.Db as Db
 import Kraken.Db.Query as Query
-import Kraken.Db.Query (QueryBuild, Repo)
-import SagaJson.Codec (ToJson, FromJson)
+import Read
 import SagaPgo (Connection, connect, default_config, pg)
-
-# Domain types
-
-record User {
-  id: Int,
-  name: String,
-  age: Int,
-}
-
-record Metadata {
-  source: String,
-  featured: Bool,
-} deriving (ToJson, FromJson)
-
-record Post {
-  id: Int,
-  author_id: Int,
-  title: String,
-  published: Bool,
-  tags: Db.Array String,
-  metadata: Db.Jsonb Metadata,
-}
-
-# Schema
-
-record Users {
-  id: Db.Col Int,
-  name: Db.Col String,
-  age: Db.Col Int,
-} deriving (Db.Selectable User)
-
-record Posts {
-  id: Db.Col Int,
-  author_id: Db.Col Int,
-  title: Db.Col String,
-  published: Db.Col Bool,
-  tags: Db.Col (Db.Array String),
-  metadata: Db.Col (Db.Jsonb Metadata),
-} deriving (Db.Selectable Post)
-
-impl Db.ColumnSet for Users {
-  columns source = Users {
-    id: Db.col "id" source,
-    name: Db.col "name" source,
-    age: Db.col "age" source,
-  }
-}
-
-impl Db.ColumnSet for Posts {
-  columns source = Posts {
-    id: Db.col "id" source,
-    author_id: Db.col "author_id" source,
-    title: Db.col "title" source,
-    published: Db.col "published" source,
-    tags: Db.col "tags" source,
-    metadata: Db.col "metadata" source,
-  }
-}
-
-fun users : Db.Table Users
-users = Db.table "users"
-
-fun posts : Db.Table Posts
-posts = Db.table "posts"
-
-# Queries
-
-# Plain scalars from a non-null scope: bare dotting, inferred non-null
-fun users_query : Unit -> Query.Prepared { id: Int, name: String, age: Int }
-users_query () = Query.query (fun () -> {
-  let u = from! users
-  where_! (Db.gt u.age 18)
-  order_by! [Db.asc u.id]
-  limit! 20
-  select! ({ id: u.id, name: u.name, age: u.age })
-})
-
-# Whole-row required + a scalar, both from inner joins
-fun user_posts_query : Unit -> Query.Prepared { user: User, title: String }
-user_posts_query () = Query.query (fun () -> {
-  let u = from! users
-  let p = inner_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
-  where_! (Db.eq p.published True)
-  order_by! [Db.desc p.id]
-  select! ({ user: u, title: p.title })
-})
-
-fun users_with_optional_posts_query : Unit
-  -> Query.Prepared { user: User, post: Maybe Post }
-users_with_optional_posts_query () = Query.query (fun () -> {
-  let u = from! users
-  let p =
-    left_join! posts (fun ps ->
-      Db.and_ [Db.eq_col ps.author_id u.id, Db.eq ps.published True])
-  order_by! [Db.asc u.id]
-  select! ({ user: u, post: p })
-})
-
-# Force Nothing path
-fun unmatched_posts_query : Unit
-  -> Query.Prepared { user: User, post: Maybe Post }
-unmatched_posts_query () = Query.query (fun () -> {
-  let u = from! users
-  let p =
-    left_join! posts (fun ps ->
-      Db.and_ [Db.eq_col ps.author_id u.id, Db.eq ps.id (-1)])
-  order_by! [Db.asc u.id]
-  select! ({ user: u, post: p })
-})
-
-# Example anti-join - needs unwrap to get around nullable col
-fun users_without_posts_query : Unit -> Query.Prepared { id: Int, name: String }
-users_without_posts_query () = Query.query (fun () -> {
-  let u = from! users
-  let p = left_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
-  where_! (Db.is_null (Db.unwrap_cols p).id)
-  order_by! [Db.asc u.id]
-  select! ({ id: u.id, name: u.name })
-})
-
-# Loaders
-
-fun load_users : Connection
-  -> Result (List { id: Int, name: String, age: Int }) Query.DbError
-  needs {Repo}
-load_users conn = Query.all conn (users_query ())
-
-fun load_optional_posts : Connection
-  -> Result (List { user: User, post: Maybe Post }) Query.DbError
-  needs {Repo}
-load_optional_posts conn = Query.all conn (users_with_optional_posts_query ())
-
-fun load_unmatched_posts : Connection
-  -> Result (List { user: User, post: Maybe Post }) Query.DbError
-  needs {Repo}
-load_unmatched_posts conn = Query.all conn (unmatched_posts_query ())
-
-fun load_users_without_posts : Connection
-  -> Result (List { id: Int, name: String }) Query.DbError
-  needs {Repo}
-load_users_without_posts conn = Query.all conn (users_without_posts_query ())
-
-fun print_optional_posts : Result (List {
-  user: User,
-  post: Maybe Post,
-}) Query.DbError
-  -> Unit
-  needs {Stdio}
-print_optional_posts result = case result {
-  Ok rows -> {
-    println ("rows: " <> show (List.length rows))
-    List.iter (fun row -> {
-      let post_label = case row.post {
-        Just p -> p.title
-        Nothing -> "<no post>"
-      }
-      println $"{row.user.name}: {post_label}"
-    }) rows
-  }
-  Err err -> println ("query failed: " <> debug err)
-}
 
 main () = {
   let config =
@@ -177,23 +14,17 @@ main () = {
     }
   let conn = connect config
 
-  println (users_query ()).sql
-  println (user_posts_query ()).sql
-  println (users_with_optional_posts_query ()).sql
+  println (Read.users_query ()).sql
+  println (Read.user_posts_query ()).sql
+  println (Read.users_with_optional_posts_query ()).sql
 
   println "-- left join, real matches --"
-  print_optional_posts (load_optional_posts conn with Query.pg_repo)
+  Read.print_optional_posts (Read.load_optional_posts conn with Query.pg_repo)
 
   println "-- left join, unsatisfiable ON (forces Nothing) --"
-  print_optional_posts (load_unmatched_posts conn with Query.pg_repo)
+  Read.print_optional_posts (Read.load_unmatched_posts conn with Query.pg_repo)
 
   println "-- anti-join: users with no post (unwrap_cols + IS NULL) --"
-  println (users_without_posts_query ()).sql
-  case load_users_without_posts conn with Query.pg_repo {
-    Ok rows -> {
-      println ("rows: " <> show (List.length rows))
-      List.iter (fun row -> println $"{show row.id}: {row.name}") rows
-    }
-    Err err -> println ("query failed: " <> debug err)
-  }
+  println (Read.users_without_posts_query ()).sql
+  Read.print_users_without_posts (Read.load_users_without_posts conn with Query.pg_repo)
 } with {pg, console}

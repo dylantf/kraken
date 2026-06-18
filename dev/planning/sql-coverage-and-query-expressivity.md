@@ -186,7 +186,11 @@ Already present:
 
 Near-term additions:
 
-- `distinct!`
+- `distinct!` (`SELECT DISTINCT` / `DISTINCT ON`) — row-level distinct; we only
+  have `count_distinct` today
+- `right_join!` / `full_join!` — lower priority, `left_join!` covers ~90% of
+  cases; would follow the same scope/nullability model (`right_join!` makes the
+  *primary* side nullable, `full_join!` makes both sides nullable)
 
 Possible syntax:
 
@@ -688,7 +692,22 @@ Generic SQL functions can use raw fragments initially:
 Db.sql_fn "lower" [Db.sql_column u.name]
 ```
 
-But this can wait until real use cases show up.
+A small typed `sql_fn` plus a handful of blessed helpers would cover most of the
+expression gaps at once, instead of accreting one-off APIs:
+
+- **`coalesce`** — especially relevant to the Nullable-scope model: it's the
+  principled way to turn a left-joined `Maybe a` back into a non-null scalar
+  (`COALESCE(p.count, 0)`), which the type system otherwise won't let you select
+  off a left join.
+- **`not_`** — general boolean negation. We have `and_` / `or_` / `is_null` /
+  `is_not_null` but no negation combinator.
+- **`CASE WHEN`** — conditional expressions.
+- **String functions** — `lower` / `upper` / `concat` / `trim`.
+- **Arithmetic** — `+` / `-` / `*` / `/` over `Sql a`, for things like
+  `price * quantity`.
+
+These all flow through `Sql a` and stay decoder-aware, so they remain selectable
+and usable in `where_!` / `having!`.
 
 ## Raw SQL Escape Hatches
 
@@ -723,9 +742,10 @@ select! ({
 Typed subqueries split into several features:
 
 - scalar subquery as `Sql a`
-- `EXISTS`
-- `IN (subquery)`
+- `EXISTS` / `NOT EXISTS`
+- `IN (subquery)` (today `in_` only takes a literal list)
 - derived table / subquery join
+- CTEs (`WITH`)
 
 Possible future syntax:
 
@@ -742,34 +762,213 @@ scope with generated columns.
 
 ## Tier 7: DML
 
-Separate builder family:
+**Priority: highest. Kraken is read-only today — this is the structural gap.**
 
-- `insert`
-- `insert_many`
-- `update`
-- `delete`
-- `returning`
+This section is the worked-out DML design (2026-06-18). New module
+`Kraken.Db.Dml` (imported as `Dml`), parallel to `Kraken.Db.Query`, reusing the
+existing `Db` vocabulary: `Table` / `Col` / the `Schema` trait, `PgType.encode_pg`
+for value encoding, `Selectable`/`Projection` for `RETURNING`, and
+`Prepared`/`Repo`/`all`/`one` for execution.
+
+### Guiding principle: two axes of schema config
+
+Configuration about a table splits cleanly by *what it affects*, and that
+decides where it lives:
+
+- **Type-level config = *shape*** (which columns exist, which are insertable).
+  Must live in the record field types, because it changes types the derive sees.
+  This is the `Col a` vs `Generated a` split below.
+- **Value-level config = *behavior*** (primary key, future hooks, table-name
+  overrides, soft-delete scope). Lives in the `Schema` trait impl, because it
+  never reshapes a type — it only changes rendering. Runtime is the right home.
+
+This is the principled version of Drizzle's column config object. Saga has no
+field attributes (`@generated(...)`), and a fully type-level config object would
+explode combinatorially (`Col` / `Generated` / `Pk` / `GeneratedPk` / …), which
+is exactly why Drizzle uses a runtime dict there — so we put only the one thing
+that genuinely must be type-level (insert input shape) in the field type, and
+everything else in the value-level impl.
+
+### Column shape: `Col a` vs `Generated a`
+
+```saga
+record Users {
+  id: Db.Generated Int,     # DB supplies it (SERIAL / identity / default)
+  name: Db.Col String,
+  age: Db.Col Int,
+} deriving (Db.Selectable User, Db.Insertable User)
+```
+
+- `Db.Col a` — an app-provided column.
+- `Db.Generated a` — a DB-managed column. Omitted from insert input (you can't
+  pass it) and excluded from update `SET` (the app never writes it). The type
+  marker is what lets the `Insertable` derive drop the field from the *input
+  shape*; a runtime flag couldn't, because the derive only sees types.
+- `Generated a` must still behave like a column in reads/predicates/joins, so it
+  needs the same mirror instances as `Col a` (`Selectable a for Generated a`,
+  `ToSql a for Generated a`, …) delegating to the `Col` versions. Small,
+  mechanical.
+
+This extends the library's north star — nullability already comes from "schema +
+join kind"; now **insertability comes from the schema too** (`Col` = you provide
+it, `Generated` = the DB does).
+
+### Value-level config: the `Schema` trait
+
+Saga has default trait methods, so `columns` is required and everything else
+defaults — a table overrides only what it uses (no per-table boilerplate for
+features it doesn't need):
+
+```saga
+pub trait Schema cols row {
+  fun columns : String -> cols
+  fun primary_key : cols -> PrimaryKey   # default: NoKey
+  # future: pure transform hooks (before_save, after_load), table-name override
+}
+
+impl Db.Schema Users User {
+  columns src = Users { id: Db.col "id" src, name: Db.col "name" src, age: Db.col "age" src }
+  primary_key u = Db.key u.id            # static: just points at the key column
+}
+```
+
+`primary_key` is pure projection — it *names* the key column(s); it does not
+build a predicate. Assembling `id = $1` is the query layer's job (`update_all` /
+entity-delete take the column name from `primary_key cols`, pull the matching
+value out of the entity, and build the `WHERE`). The config stays declarative.
+
+### Primary keys: `PrimaryKey` / `ColRef`
+
+Composite-key columns differ in type (`org_id: Col Int`, `user_id: Col String`),
+so a composite key can't be `List (Col a)` — the list must hold **erased** column
+refs:
+
+```saga
+pub type PrimaryKey =
+  | NoKey                       # default — table declared none
+  | Key ColRef                  # single (the 95% case)
+  | Composite (List ColRef)     # multi-column
+
+# ColRef is the erased column (drop the phantom). Col a is already
+# `Col ColumnInfo` internally, so ColRef just exposes that ColumnInfo
+# (name + source) — exactly what the WHERE builder needs.
+pub fun key : Col a -> PrimaryKey         # -> Key (erases internally)
+pub fun ref : Col a -> ColRef             # for composite lists
+pub fun composite : List ColRef -> PrimaryKey
+```
+
+```saga
+primary_key u = Db.key u.id                                   # single
+primary_key u = Db.composite [Db.ref u.org_id, Db.ref u.user_id]   # composite
+```
+
+The single/composite split is **purely call-site ergonomics** — `Key` is sugar
+for a one-element `Composite`. Consumers normalize to a list immediately and
+treat both identically: an `AND` of `col = value`, one term per key column.
+**Ship single-key first**; composite is a later generalization.
+
+### Surface
+
+Three distinct write operations, chosen so the read→mutate→save round-trip never
+needs a shape conversion:
+
+```saga
+# INSERT — record literal, no `set!` spam. Generated cols omitted & type-enforced.
+Dml.insert users { name: "Alice", age: 42 }
+
+# INSERT ... RETURNING — closure ends in a selection, exactly like select!
+Dml.insert_returning users { name: "Alice", age: 42 } (fun u -> { id: u.id })
+
+# UPDATE (targeted/partial) — `set!` is the sweet spot here: only write what changes.
+Dml.update users (fun u -> {
+  set! u.age 43
+  where_! (Db.eq u.id 1)
+})
+
+# UPDATE (save whole entity) — eats the domain record as-is, keyed by primary_key.
+let updated = { user | age: 43 }       # native record update; no UserUpdate type
+Dml.update_all users updated           # UPDATE users SET name=$1, age=$2 WHERE id=$3
+
+# DELETE
+Dml.delete users (fun u -> { where_! (Db.eq u.id 1) })
+```
+
+Notably **there is no id-less, Maybe-wrapped `UserUpdate` mirror record** — that
+shape is exactly what would force a `User -> UserUpdate` conversion on every
+fetch→mutate→save. `set!` covers targeted partials and `update_all` covers the
+entity flow, so the patch record earns its place nowhere and is omitted.
+
+### Insert input
+
+`Db.Insertable` is the write-direction mirror of `Db.Selectable`: where
+`Selectable` walks the Generic rep to build a decoder (`Col a` → read `a`),
+`Insertable` walks it to build `[(column_name, Value)]` (`a` → `encode_pg`), and
+**drops `Generated` fields** so the accepted input is the column set minus
+DB-managed columns. This is genuinely more than `Selectable`'s 1:1 walk (it must
+match the input record against a *subset* of the schema columns), so it's the
+main piece of new derive work to validate.
+
+Staging ladder (stop where cost/benefit feels right):
+
+- **Rung 1 (no subset derive):** `Insertable` over the *full* domain record — you
+  supply every column including the key. Mirrors `Selectable` exactly, ships
+  fastest, fine for app-side UUID PKs. Add `Generated` to the schema from the
+  start regardless (cheap, right source of truth).
+- **Rung 2 (target):** subset-aware `Insertable` that drops `Generated` → the
+  `{ name, age }` literal with the key omitted and type-enforced. Validate that
+  the derive machinery can drop fields before committing the surface.
+
+### Execution / implementation notes
+
+- **`RETURNING`** reuses the `Selectable`/`Projection` decode path, so a returning
+  write produces a `Prepared row` and executes through `all`/`one` exactly like a
+  read. Non-returning writes produce a command that yields rows-affected.
+- **Encoding exposes all columns including generated.** The row-encoding step
+  pairs every column with its value; the *operations* filter: `insert` drops
+  `Generated`; `update_all`'s `SET` drops `Generated` + key columns; the `WHERE`
+  uses the key columns. (So `update_all` can still read the key's value off the
+  entity even when the key is `Generated`/serial.) The type-level `Generated`
+  marker drives a runtime tag on each encoded column so the operations can do
+  this filtering.
+- **`ON CONFLICT` upsert**: target columns/constraint + `DO NOTHING` / `DO UPDATE
+  SET ...`. Design alongside the first cut, or as the immediate follow-up.
+
+### Open / deferred
+
+- Composite keys: ship single-key first.
+- Transform hooks (`before_save`, `after_load`): powerful but *implicit magic*
+  (silent rewrites, ordering, testability, effectful hooks dragging `needs {…}`
+  onto the write path). Many use cases (auto `created_at`) are better served by a
+  DB `DEFAULT now()` + `Generated`. If added, keep them **pure** and opt-in, and
+  do it *after* the core DML — not baked in now.
+- The subset-aware `Insertable` derive (Rung 2) needs compiler-side validation.
+
+## Tier 8: Transactions
+
+**Priority: highest, alongside DML.** Needed as soon as there are
+multi-statement writes.
+
+A `transaction` combinator at the `Repo` level: run a closure inside `BEGIN` /
+`COMMIT`, rolling back automatically on `Err` (or on an exception). The closure
+should still have access to `Repo` so it can run normal `all` / `one` / DML
+queries against the transaction's connection.
 
 Possible shape:
 
 ```saga
-Db.insert users {
-  name: "Alice",
-  age: 42,
-}
-
-Db.update users (fun u -> {
-  set! u.name "Alice Updated"
-  where_! (Db.eq u.id 1)
-})
-
-Db.delete users (fun u -> {
-  where_! (Db.eq u.id 1)
+Db.transaction conn (fun () -> {
+  let user = all! conn (Dml.insert_returning users { name: "Alice", age: 42 } (fun u -> { id: u.id }))
+  all! conn (Dml.insert posts { author_id: user.id, title: "Hi" })
+  # commits on Ok, rolls back on Err
 })
 ```
 
-The existing `Table table row insert ...` type parameters should help here, but
-the insert/update APIs need their own planning.
+Open questions:
+
+- Whether `transaction` is its own effect/handler or threads a transaction-bound
+  `Connection` through the existing `Repo`.
+- Savepoints / nested transactions (probably a later refinement).
+- Isolation-level configuration.
 
 ## Open Design Questions
 
@@ -822,14 +1021,45 @@ Anonymous projections remain ideal for local query construction.
 
 ## Suggested Next Step
 
-After `Sql a`, grouping, having, and basic aggregates, the next useful steps
-are:
+### Prioritized roadmap (2026-06-18)
 
-- casts through `PgTypeName a`
-- `distinct!`
-- make the `ColumnSet` impl derivable (field label → SQL column name); this is
-  the last piece of per-table boilerplate, and would need compiler-side derive
-  support
+The read path is well-rounded; the headline gap is that **Kraken is read-only**.
+Priority order:
+
+**Tier 1 — structural (do first).** Without these you can't build a real app on
+Kraken.
+
+- **DML**: `insert!` / `update!` / `delete!` with `RETURNING` (reuses the
+  `Selectable`/`Projection` decode path) and `ON CONFLICT` upsert. See
+  [Tier 7: DML](#tier-7-dml). This is also the next stress test of the schema
+  representation — writes type-check the column record from the *write*
+  direction, which is where the `ColumnSet` duplication will bite again.
+- **Transactions**: a `transaction` combinator over `Repo` (begin/commit, auto
+  rollback on `Err`). Needed the moment there are multi-statement writes. See
+  [Tier 8: Transactions](#tier-8-transactions).
+
+**Tier 2 — read expressivity.**
+
+- **Subqueries**: `EXISTS` / `IN (subquery)` / scalar subqueries / CTEs
+  (`WITH`). `in_` currently only takes a literal list; correlated subqueries are
+  the most common next reach. See [Tier 6: Subqueries](#tier-6-subqueries).
+- **`SELECT DISTINCT` / `DISTINCT ON`** (`distinct!`). Row-level distinct; we
+  only have `count_distinct` today.
+- **Expression functions**: `coalesce` (the principled way to recover a non-null
+  scalar from a left join, given the Nullable-scope model), `lower`/`upper`,
+  arithmetic, `concat`, `CASE WHEN`, and a generic `not_`. A small `sql_fn`/
+  expression builder covers most of these at once rather than one-off helpers.
+  See [Tier 5: Casts And SQL Functions](#tier-5-casts-and-sql-functions).
+- **Casts** through `PgTypeName a`.
+
+**Tier 3 — polish.**
+
+- `right_join!` / `full_join!` (left covers ~90% of cases).
+- Window functions.
+- An exactly-one query variant alongside `one` (which returns `Maybe`) that
+  errors on 0 or >1 rows.
+- Make the `ColumnSet` impl derivable (field label → SQL column name) — the last
+  piece of per-table boilerplate; needs compiler-side derive support.
 
 Done since this plan was written: `SelectExpr` removed in favor of `Sql a`;
 aggregate nullability for `sum`/`avg`/`min`/`max`; the `like`/`ilike`/`between`/
