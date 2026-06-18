@@ -1,4 +1,4 @@
-module Kraken.Query.Core
+module Kraken.Db
 
 import Std.Base (Proxy, KnownSymbol)
 import Std.Dynamic (
@@ -113,20 +113,48 @@ impl PgType for Maybe a where {a: PgType} {
   decode_pg = optional decode_pg
 }
 
-pub type Required = Required
-pub type Optional = Optional
-
 @external("erlang", "kraken_unsafe", "from_dynamic")
 fun unsafe_from_dynamic : Dynamic -> a
+
+#@ True when every column in the range `[offset, offset + width)` of a result
+#@ row is SQL NULL.
+@external("erlang", "kraken_unsafe", "slice_all_null")
+fun slice_all_null : Int -> Int -> Dynamic -> Bool
+
+#@ A column scope on the nullable side of a left join.
+#@
+#@ Wraps a table's column record. Because the joined row may be absent, selecting
+#@ a `Nullable` scope yields `Maybe row` rather than `row`.
+opaque type Nullable cols = Nullable cols
+
+#@ Mark a column scope as nullable. Used by `left_join!` to wrap the joined
+#@ table's columns so that selecting the scope produces `Maybe row`.
+pub fun as_nullable : cols -> Nullable cols
+as_nullable scope = Nullable scope
+
+#@ Unwrap a nullable scope to its underlying columns.
+#@
+#@ Use this only to reference a left-joined table's columns in post-join
+#@ predicates and ordering (`where_!`, `order_by!`, `having!`) — most commonly an
+#@ anti-join such as `is_null (unwrap_cols p).id`. SQL ignores result nullability
+#@ in those positions, so the plain columns are appropriate.
+#@
+#@ Do not use the result in `select!`: it selects the columns as non-null and
+#@ turns a compile-time `Maybe` into a runtime decode error on absent rows. Join
+#@ `ON` clauses never need this — `inner_join!`/`left_join!` already pass their
+#@ callback the plain columns.
+pub fun unwrap_cols : Nullable cols -> cols
+unwrap_cols scope = case scope {
+  Nullable inner -> inner
+}
 
 record TableDef {
   name: String,
   alias: Maybe String,
-  make_required_cols: String -> Dynamic,
-  make_optional_cols: String -> Dynamic,
+  make_cols: String -> Dynamic,
 }
 
-opaque type Table table required_cols optional_cols =
+opaque type Table cols =
   | Table TableDef
 
 pub trait ColumnSet cols {
@@ -138,67 +166,46 @@ record ColumnInfo {
   name: String,
 }
 
-opaque type Column meta a = Column ColumnInfo
+opaque type Col a = Col ColumnInfo
 
-pub fun table : String -> Table table required_cols optional_cols
-  where {
-    required_cols: ColumnSet,
-    optional_cols: ColumnSet,
-  }
+pub fun table : String -> Table cols where {cols: ColumnSet}
 table name =
   Table (TableDef {
     name: name,
     alias: Nothing,
-    make_required_cols: fun source -> {
-      let columns_value: required_cols = columns source
-      from_erlang columns_value
-    },
-    make_optional_cols: fun source -> {
-      let columns_value: optional_cols = columns source
-      from_erlang columns_value
-    },
+    make_cols: fun source ->
+      {
+        let columns_value: cols = columns source
+        from_erlang columns_value
+      },
   })
 
-pub fun table_as : String
-  -> Table table required_cols optional_cols
-  -> Table table required_cols optional_cols
+pub fun table_as : String -> Table cols -> Table cols
 table_as alias table_value = {
   let Table def = table_value
   Table ({ def | alias: Just alias })
 }
 
-pub fun table_name : Table table required_cols optional_cols
-  -> String
+pub fun table_name : Table cols -> String
 table_name table_value = {
   let Table def = table_value
   def.name
 }
 
-pub fun table_alias : Table table required_cols optional_cols
-  -> Maybe String
+pub fun table_alias : Table cols -> Maybe String
 table_alias table_value = {
   let Table def = table_value
   def.alias
 }
 
-pub fun table_required_cols : String
-  -> Table table required_cols optional_cols
-  -> required_cols
-table_required_cols alias table_value = {
+pub fun table_cols : String -> Table cols -> cols
+table_cols alias table_value = {
   let Table def = table_value
-  unsafe_from_dynamic (def.make_required_cols alias)
+  unsafe_from_dynamic (def.make_cols alias)
 }
 
-pub fun table_optional_cols : String
-  -> Table table required_cols optional_cols
-  -> optional_cols
-table_optional_cols alias table_value = {
-  let Table def = table_value
-  unsafe_from_dynamic (def.make_optional_cols alias)
-}
-
-pub fun col : String -> String -> Column meta a
-col name source = Column (ColumnInfo { source: source, name: name })
+pub fun col : String -> String -> Col a
+col name source = Col (ColumnInfo { source: source, name: name })
 
 pub type SqlPart =
   | Text String
@@ -330,7 +337,7 @@ sql_param value = Fragment (param value)
 pub fun sql_value : a -> Fragment where {a: PgType}
 sql_value value = Fragment (param (encode_pg value))
 
-pub fun sql_column : Column meta a -> Fragment
+pub fun sql_column : Col a -> Fragment
 sql_column column = Fragment (column_frag column)
 
 fun sql_frag : Sql a -> SqlFrag
@@ -383,10 +390,7 @@ raw template args = make_sql (raw_template_frag template args)
 pub fun raw_array : String -> List SqlArg -> Sql (Array a) where {a: PgType}
 raw_array template args = make_sql (raw_template_frag template args)
 
-pub fun raw_array_like : Column meta (Array a)
-  -> String
-  -> List SqlArg
-  -> Sql (Array a)
+pub fun raw_array_like : Col (Array a) -> String -> List SqlArg -> Sql (Array a)
   where {a: PgType}
 raw_array_like _ template args = make_sql (raw_template_frag template args)
 
@@ -420,8 +424,8 @@ fun spaced : SqlFrag -> String -> SqlFrag -> SqlFrag
 spaced left op right =
   append_frag left (append_frag (raw_frag (" " <> op <> " ")) right)
 
-fun column_frag : Column meta a -> SqlFrag
-column_frag (Column info) = raw_frag (info.source <> "." <> info.name)
+fun column_frag : Col a -> SqlFrag
+column_frag (Col info) = raw_frag (info.source <> "." <> info.name)
 
 fun value_frag : input -> SqlFrag where {input: ToSql a}
 value_frag input = sql_frag (to_sql input)
@@ -618,16 +622,16 @@ join_exprs sep exprs = case exprs {
   }
 }
 
-fun field_as : String -> Column meta a -> Field a where {a: PgType}
+fun field_as : String -> Col a -> Field a where {a: PgType}
 field_as alias column =
   Field (FieldDef {
     selection: SelectItem { expr: column_frag column, alias: alias },
     decoder: decode_pg,
   })
 
-fun field_auto : Column meta a -> Field a where {a: PgType}
+fun field_auto : Col a -> Field a where {a: PgType}
 field_auto column = {
-  let Column info = column
+  let Col info = column
   field_as info.name column
 }
 
@@ -639,21 +643,30 @@ field_def_projection def =
     decode_at: fun offset row -> decode_element offset def.decoder row,
   })
 
-fun field_projection : Column meta a -> Projection a
-  where {a: PgType}
+fun field_projection : Col a -> Projection a where {a: PgType}
 field_projection column = {
   let Field def = field_auto column
   field_def_projection def
 }
 
-fun optional_field_projection : Column meta a
-  -> Projection (Maybe a)
-  where {a: PgType}
-optional_field_projection column = {
-  let Column info = column
-  field_def_projection (FieldDef {
-    selection: SelectItem { expr: column_frag column, alias: info.name },
-    decoder: optional decode_pg,
+#@ Adapt a whole-row projection into its nullable form for left joins.
+#@
+#@ If every column the projection spans is SQL NULL in a result row, it decodes
+#@ to `Nothing`; otherwise the row is decoded and wrapped in `Just`. The all-NULL
+#@ rule remains correct even when a domain field is itself nullable, since a
+#@ matched row still carries at least one non-null required column.
+pub fun nullable_row : Projection a -> Projection (Maybe a)
+nullable_row projection = {
+  let Projection def = projection
+  Projection (ProjectionDef {
+    selections: def.selections,
+    width: def.width,
+    decode_at: fun offset row ->
+      if slice_all_null offset def.width row then Ok Nothing
+      else case def.decode_at offset row {
+        Err err -> Err err
+        Ok value -> Ok (Just value)
+      },
   })
 }
 
@@ -723,19 +736,24 @@ projection_selections projection = {
 pub fun decode_projection : Projection a -> Dynamic -> Result a DecodeError
 decode_projection projection row = projection_decode projection row
 
-impl Selectable a for (Column Required a) where {a: PgType} {
+impl Selectable a for Col a where {a: PgType} {
   to_projection column = field_projection column
 }
 
-impl Selectable (Maybe a) for (Column Optional a) where {a: PgType} {
-  to_projection column = optional_field_projection column
+# Lifts any selectable scope to its `Maybe` form. Because nullability lives on
+# the scope rather than on individual columns, this single generic instance
+# covers every table's left-joined selection — no per-table impl is needed.
+impl Selectable (Maybe out) for Nullable s where {s: Selectable out} {
+  to_projection scope = case scope {
+    Nullable inner -> nullable_row (to_projection inner)
+  }
 }
 
 impl Selectable a for Sql a {
   to_projection sql_value = sql_projection sql_value
 }
 
-impl ToSql a for (Column meta a) where {a: PgType} {
+impl ToSql a for Col a where {a: PgType} {
   to_sql column = make_sql (column_frag column)
 }
 
@@ -743,7 +761,7 @@ impl ToSql a for Sql a {
   to_sql sql_value = sql_value
 }
 
-impl ToArraySql a for (Column meta (Array a)) where {a: PgType} {
+impl ToArraySql a for (Col (Array a)) where {a: PgType} {
   to_array_sql column = make_sql (column_frag column)
 }
 
@@ -751,7 +769,7 @@ impl ToArraySql a for (Sql (Array a)) where {a: PgType} {
   to_array_sql sql_value = sql_value
 }
 
-impl ToJsonbSql a for (Column meta (Jsonb a)) where {a: ToJson + FromJson} {
+impl ToJsonbSql a for (Col (Jsonb a)) where {a: ToJson + FromJson} {
   to_jsonb_sql column = make_sql (column_frag column)
 }
 

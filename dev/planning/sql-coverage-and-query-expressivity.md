@@ -6,6 +6,63 @@ This is a working plan for the higher-level Kraken query builder. The goal is
 not to implement all of SQL, but to decide which subset Kraken should own with
 types, and where raw SQL remains the escape hatch.
 
+## Update — Nullable-scope model (2026-06-18)
+
+The library was rewritten from scratch around a new nullability model. This
+section is authoritative; later sections that describe the `meta`
+phantom and `Required`/`Optional` scopes (notably **Schema Ergonomics**) are
+**superseded** and kept only as history. The SQL-feature tiers (predicates,
+aggregates, arrays, JSONB, raw SQL) are unchanged except for the renames noted
+below.
+
+**Module layout.** Old `Kraken.Query` / `Kraken.Query.Core` are removed and
+replaced by:
+
+- `Kraken.Db` — the vocabulary (imported as `Db`): `PgType`, `Col`, `Table`,
+  `Nullable`, `Array`, `Jsonb`, `Selectable`/`Projection`, typed SQL
+  expressions, predicates, ordering, grouping, aggregates.
+- `Kraken.Db.Query` — the `QueryBuild` effect, rendering, `Prepared`, `Repo` /
+  `pg_repo`, and `all` / `one` / `run` / `into`.
+
+**Nullability comes from exactly two places: the schema and the join kind.**
+
+- Columns are uniform `Db.Col a` — no `meta` parameter, no `Required` /
+  `Optional`. A schema-nullable column is just `Db.Col (Maybe a)`.
+- `from!` / `inner_join!` return the plain column record; `left_join!` returns a
+  `Db.Nullable cols` scope. Nullability of a left join lives on the *scope*, not
+  on each column.
+
+**Whole-row optional left joins now work** (previously the big open item).
+Selecting a left-joined scope infers `Maybe Post` with no query-site annotation:
+
+```saga
+let u = from! users
+let p = left_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
+select! ({ user: u, post: p })   # { user: User, post: Maybe Post }
+```
+
+This needs no compiler change and no per-table optional impl. It falls out of a
+single generic instance plus an all-NULL sentinel:
+
+```saga
+impl Selectable (Maybe out) for (Nullable s) where {s: Selectable out} { ... }
+# uses `nullable_row`: if every column the row spans is SQL NULL -> Nothing, else Just
+```
+
+Schema setup per table is: one domain record, one column record with
+`deriving (Db.Selectable Domain)`, one `ColumnSet` impl (SQL names), and the
+table value. (The `ColumnSet` impl is the remaining derive candidate, but
+deriving it would need compiler support, so it stays hand-written.)
+
+**The deliberate trade.** Per-scalar inference on a *left-joined* column was
+dropped: you can no longer dot-select an individual nullable scalar
+(`post_title: p.title` is not available on a left join). Instead select the whole
+`Maybe Post` and reach in (`Maybe.map`). To reference a left-joined table's
+columns in post-join predicates/ordering, unwrap with `Db.unwrap_cols` — the
+canonical use is the anti-join `where_! (Db.is_null (Db.unwrap_cols p).id)`.
+`Db.unwrap_cols` must not be used in `select!` (it would drop nullability and
+fail at decode time).
+
 ## Current State
 
 Kraken currently supports:
@@ -32,15 +89,15 @@ Kraken currently supports:
   `avg`, `min`, `max`
 - query execution through `all` and `one`
 
-Current module layout:
+Current module layout (see the Update section above):
 
-- `Kraken.Query.Core`
-  - schema/table/column types
+- `Kraken.Db`
+  - schema/table/column types (`Col`, `Table`, `Nullable`)
   - `PgType`
   - typed SQL expressions
   - projections and `Selectable`
   - predicates, ordering, grouping, and aggregates
-- `Kraken.Query`
+- `Kraken.Db.Query`
   - `QueryBuild`
   - query collection/rendering
   - prepared queries
@@ -64,19 +121,15 @@ Db.query (fun () -> {
 })
 ```
 
-Left joins currently work for nullable scalar fields by giving left-joined
-tables an optional column scope:
+Left joins yield a `Nullable` scope; selecting it whole infers `Maybe Post`
+(see the Update section for the full model):
 
 ```saga
 Db.query (fun () -> {
   let u = from! users
   let p = left_join! posts (fun post -> Db.eq_col post.author_id u.id)
 
-  select! ({
-    user: u,
-    post_id: p.id,
-    post_title: p.title,
-  })
+  select! ({ user: u, post: p })
 })
 ```
 
@@ -85,13 +138,14 @@ The inferred row shape is:
 ```saga
 {
   user: User,
-  post_id: Maybe Int,
-  post_title: Maybe String,
+  post: Maybe Post,
 }
 ```
 
-Whole-row optional projection, such as `post: p` into `Maybe Post`, is still a
-future design/compiler item.
+(Selecting an individual nullable scalar by dotting a left-joined column — the
+old `post_title: p.title` shape — is intentionally no longer supported; select
+the whole `Maybe Post` instead. Whole-row optional projection, formerly a future
+item, is now implemented.)
 
 ## Guiding Shape
 
@@ -328,6 +382,12 @@ using individual bind parameters. That keeps the common predicates useful before
 Kraken has a real array column/value model.
 
 ## Schema Ergonomics
+
+> **Superseded (2026-06-18).** This section describes the old `meta` /
+> `Required` / `Optional` schema model. It has been replaced by the uniform
+> `Db.Col a` + `Nullable` scope model — see the **Update** section at the top.
+> Kept below as history. The Array and JSONB subsections at the end remain
+> accurate (modulo the `Db.Column` → `Db.Col` rename).
 
 Current compile-time/runtime split:
 
@@ -730,28 +790,19 @@ surface API is to put raw or computed expressions behind record labels.
 
 ### How Should Whole-Row Optional Left Joins Work?
 
-Desired syntax:
+**Resolved (2026-06-18).** `left_join!` returns a `Db.Nullable cols` scope, and a
+single generic instance `Selectable (Maybe out) for (Nullable s)` lifts any
+selectable scope to its `Maybe` form, using an all-NULL sentinel (`nullable_row`)
+to decide `Just` vs `Nothing`:
 
 ```saga
-let p = left_join! posts (fun p -> Db.eq_col p.author_id u.id)
-
-select! ({
-  user: u,
-  post: p,
-})
+let p = left_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
+select! ({ user: u, post: p })   # { user: User, post: Maybe Post }
 ```
 
-Desired result:
-
-```saga
-{
-  user: User,
-  post: Maybe Post,
-}
-```
-
-Scalar optional columns already work. Whole-row optional projection needs a
-library/compiler-friendly way to map a row of `Maybe` fields into `Maybe Post`.
+No compiler change and no per-table impl. The trade was dropping per-scalar
+inference on left-joined columns (select the whole `Maybe Post` instead). See the
+**Update** section at the top for the full design and rationale.
 
 ### Should Query Result Types Be Named At Public Boundaries?
 
@@ -774,12 +825,16 @@ Anonymous projections remain ideal for local query construction.
 After `Sql a`, grouping, having, and basic aggregates, the next useful steps
 are:
 
-- remove `SelectExpr`; keep `Sql a` as the single typed SQL value expression
-- aggregate nullability for `sum`, `avg`, `min`, and `max`
-- predicate helpers like `like`, `ilike`, `between`, `in_`
 - casts through `PgTypeName a`
 - `distinct!`
-- whole-row optional left join projection, such as `post: Maybe Post`
+- make the `ColumnSet` impl derivable (field label → SQL column name); this is
+  the last piece of per-table boilerplate, and would need compiler-side derive
+  support
+
+Done since this plan was written: `SelectExpr` removed in favor of `Sql a`;
+aggregate nullability for `sum`/`avg`/`min`/`max`; the `like`/`ilike`/`between`/
+`in_` predicate family; and whole-row optional left join projection
+(`post: Maybe Post`) via the Nullable-scope model.
 
 This continues growing the SQL surface on top of the typed expression model
 instead of adding one-off APIs.

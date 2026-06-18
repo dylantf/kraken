@@ -1,11 +1,13 @@
 module Main
 
-import Std.IO (console)
-import Kraken.Query as Query
-import Kraken.Query (QueryBuild, Repo)
-import Kraken.Query.Core as Db
+import Std.IO (console, Stdio)
+import Kraken.Db as Db
+import Kraken.Db.Query as Query
+import Kraken.Db.Query (QueryBuild, Repo)
 import SagaJson.Codec (ToJson, FromJson)
 import SagaPgo (Connection, connect, default_config, pg)
+
+# Domain types
 
 record User {
   id: Int,
@@ -13,48 +15,38 @@ record User {
   age: Int,
 }
 
-record Post {
-  id: Int,
-  author_id: Int,
-  title: String,
-  published: Bool,
-}
-
-record UserPost {
-  user: User,
-  post_title: String,
-}
-
-fun make_user_post : { user: User, post_title: String } -> UserPost
-make_user_post projection = UserPost {
-  user: projection.user,
-  post_title: projection.post_title,
-}
-
 record Metadata {
   source: String,
   featured: Bool,
 } deriving (ToJson, FromJson)
 
-type UsersTable = UsersTable
-type PostsTable = PostsTable
-
-record Users meta {
-  id: Db.Column meta Int,
-  name: Db.Column meta String,
-  age: Db.Column meta Int,
-} deriving (Db.Selectable User)
-
-record Posts meta {
-  id: Db.Column meta Int,
-  author_id: Db.Column meta Int,
-  title: Db.Column meta String,
-  published: Db.Column meta Bool,
-  tags: Db.Column meta (Db.Array String),
-  metadata: Db.Column meta (Db.Jsonb Metadata),
+record Post {
+  id: Int,
+  author_id: Int,
+  title: String,
+  published: Bool,
+  tags: Db.Array String,
+  metadata: Db.Jsonb Metadata,
 }
 
-impl Db.ColumnSet for Users meta {
+# Schema
+
+record Users {
+  id: Db.Col Int,
+  name: Db.Col String,
+  age: Db.Col Int,
+} deriving (Db.Selectable User)
+
+record Posts {
+  id: Db.Col Int,
+  author_id: Db.Col Int,
+  title: Db.Col String,
+  published: Db.Col Bool,
+  tags: Db.Col (Db.Array String),
+  metadata: Db.Col (Db.Jsonb Metadata),
+} deriving (Db.Selectable Post)
+
+impl Db.ColumnSet for Users {
   columns source = Users {
     id: Db.col "id" source,
     name: Db.col "name" source,
@@ -62,7 +54,7 @@ impl Db.ColumnSet for Users meta {
   }
 }
 
-impl Db.ColumnSet for Posts meta {
+impl Db.ColumnSet for Posts {
   columns source = Posts {
     id: Db.col "id" source,
     author_id: Db.col "author_id" source,
@@ -73,12 +65,15 @@ impl Db.ColumnSet for Posts meta {
   }
 }
 
-fun users : Db.Table UsersTable (Users Db.Required) (Users Db.Optional)
+fun users : Db.Table Users
 users = Db.table "users"
 
-fun posts : Db.Table PostsTable (Posts Db.Required) (Posts Db.Optional)
+fun posts : Db.Table Posts
 posts = Db.table "posts"
 
+# Queries
+
+# Plain scalars from a non-null scope: bare dotting, inferred non-null
 fun users_query : Unit -> Query.Prepared { id: Int, name: String, age: Int }
 users_query () = Query.query (fun () -> {
   let u = from! users
@@ -88,183 +83,89 @@ users_query () = Query.query (fun () -> {
   select! ({ id: u.id, name: u.name, age: u.age })
 })
 
-fun post_count_query : Unit -> Query.Prepared { total: Int }
-post_count_query () = Query.query (fun () -> {
-  let p = from! posts
+# Whole-row required + a scalar, both from inner joins
+fun user_posts_query : Unit -> Query.Prepared { user: User, title: String }
+user_posts_query () = Query.query (fun () -> {
+  let u = from! users
+  let p = inner_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
   where_! (Db.eq p.published True)
-  select! ({ total: Db.count_star })
-})
-
-fun post_counts_by_author_query : Unit
-  -> Query.Prepared {
-    author_id: Int,
-    total: Int,
-  }
-post_counts_by_author_query () = Query.query (fun () -> {
-  let p = from! posts
-  group_by! [Db.group p.author_id]
-  having! (Db.gt (Db.count p.id) 0)
-  order_by! [Db.desc (Db.count p.id)]
-  select! ({ author_id: p.author_id, total: Db.count p.id })
-})
-
-fun user_age_stats_query : Unit
-  -> Query.Prepared {
-    average_age: Maybe Float,
-    oldest_age: Maybe Int,
-    total_age: Maybe Int,
-  }
-user_age_stats_query () = Query.query (fun () -> {
-  let u = from! users
-  select! ({
-    average_age: Db.avg u.age,
-    oldest_age: Db.max u.age,
-    total_age: Db.sum u.age,
-  })
-})
-
-fun user_posts_query : Unit -> Query.Prepared UserPost
-user_posts_query () = {
-  let prepared = Query.query (fun () -> {
-    let u = from! users
-    let p = inner_join! posts (fun post -> Db.eq_col post.author_id u.id)
-    where_! (Db.and_ [
-      Db.in_ u.name ["Alice", "Bob"],
-      Db.between u.age 18 65,
-      Db.eq p.published True,
-      Db.like p.title "Hello%",
-    ])
-    order_by! [Db.desc p.id]
-    limit! 20
-    select! ({ user: u, post_title: p.title })
-  })
-  Query.into make_user_post prepared
-}
-
-fun predicate_showcase_query : Unit -> Query.Prepared { id: Int }
-predicate_showcase_query () = Query.query (fun () -> {
-  let u = from! users
-  where_! (Db.and_ [
-    Db.ilike u.name "%alice%",
-    Db.not_in u.name ["Mallory"],
-    Db.eq_any u.id [1, 2, 3],
-    Db.not_eq_all u.id [99, 100],
-    Db.like_any u.name ["A%", "B%"],
-    Db.ilike_any u.name ["%a%", "%b%"],
-  ])
-  select! ({ id: u.id })
-})
-
-fun tagged_posts_query : Unit
-  -> Query.Prepared {
-    id: Int,
-    tags: Db.Array String,
-  }
-tagged_posts_query () = Query.query (fun () -> {
-  let p = from! posts
-  let tags =
-    Db.raw_array_like p.tags "COALESCE(?, ARRAY[]::text[])" [Db.sql p.tags]
-  where_! (Db.and_ [
-    Db.contains p.tags (Db.array ["saga"]),
-    Db.overlaps tags (Db.array ["db", "query"]),
-    Db.contained_by p.tags (Db.array ["saga", "db", "query", "typed"]),
-  ])
-  select! ({ id: p.id, tags: tags })
-})
-
-fun metadata_probe_query : Unit
-  -> Query.Prepared {
-    id: Int,
-    metadata: Db.Jsonb Metadata,
-    source: String,
-  }
-metadata_probe_query () = Query.query (fun () -> {
-  let p = from! posts
-  where_! (Db.and_ [
-    Db.json_contains p.metadata (Db.jsonb (Metadata {
-      source: "seed",
-      featured: True,
-    })),
-    Db.json_has_key p.metadata "featured",
-  ])
-  order_by! [Db.asc p.id]
-  limit! 2
-  select! ({
-    id: p.id,
-    metadata: p.metadata,
-    source: Db.json_text p.metadata "source",
-  })
+  order_by! [Db.desc p.id]
+  select! ({ user: u, title: p.title })
 })
 
 fun users_with_optional_posts_query : Unit
-  -> Query.Prepared {
-    user: User,
-    post_id: Maybe Int,
-    post_title: Maybe String,
-  }
+  -> Query.Prepared { user: User, post: Maybe Post }
 users_with_optional_posts_query () = Query.query (fun () -> {
   let u = from! users
-  let p = left_join! posts (fun post -> Db.eq_col post.author_id u.id)
+  let p =
+    left_join! posts (fun ps ->
+      Db.and_ [Db.eq_col ps.author_id u.id, Db.eq ps.published True])
   order_by! [Db.asc u.id]
-  select! ({ user: u, post_id: p.id, post_title: p.title })
+  select! ({ user: u, post: p })
 })
 
-fun load_user_posts : Connection -> Result (List UserPost) Query.DbError
-  needs {Repo}
-load_user_posts conn = Query.all conn (user_posts_query ())
+# Force Nothing path
+fun unmatched_posts_query : Unit
+  -> Query.Prepared { user: User, post: Maybe Post }
+unmatched_posts_query () = Query.query (fun () -> {
+  let u = from! users
+  let p =
+    left_join! posts (fun ps ->
+      Db.and_ [Db.eq_col ps.author_id u.id, Db.eq ps.id (-1)])
+  order_by! [Db.asc u.id]
+  select! ({ user: u, post: p })
+})
+
+# Example anti-join - needs unwrap to get around nullable col
+fun users_without_posts_query : Unit -> Query.Prepared { id: Int, name: String }
+users_without_posts_query () = Query.query (fun () -> {
+  let u = from! users
+  let p = left_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
+  where_! (Db.is_null (Db.unwrap_cols p).id)
+  order_by! [Db.asc u.id]
+  select! ({ id: u.id, name: u.name })
+})
+
+# Loaders
 
 fun load_users : Connection
-  -> Result (List {
-    id: Int,
-    name: String,
-    age: Int,
-  }) Query.DbError
+  -> Result (List { id: Int, name: String, age: Int }) Query.DbError
   needs {Repo}
 load_users conn = Query.all conn (users_query ())
 
-fun load_user_age_stats : Connection
-  -> Result (Maybe {
-    average_age: Maybe Float,
-    oldest_age: Maybe Int,
-    total_age: Maybe Int,
-  }) Query.DbError
+fun load_optional_posts : Connection
+  -> Result (List { user: User, post: Maybe Post }) Query.DbError
   needs {Repo}
-load_user_age_stats conn = Query.one conn (user_age_stats_query ())
+load_optional_posts conn = Query.all conn (users_with_optional_posts_query ())
 
-fun load_tagged_posts : Connection
-  -> Result (List {
-    id: Int,
-    tags: Db.Array String,
-  }) Query.DbError
+fun load_unmatched_posts : Connection
+  -> Result (List { user: User, post: Maybe Post }) Query.DbError
   needs {Repo}
-load_tagged_posts conn = Query.all conn (tagged_posts_query ())
+load_unmatched_posts conn = Query.all conn (unmatched_posts_query ())
 
-fun load_metadata_probe : Connection
-  -> Result (List {
-    id: Int,
-    metadata: Db.Jsonb Metadata,
-    source: String,
-  }) Query.DbError
+fun load_users_without_posts : Connection
+  -> Result (List { id: Int, name: String }) Query.DbError
   needs {Repo}
-load_metadata_probe conn = Query.all conn (metadata_probe_query ())
+load_users_without_posts conn = Query.all conn (users_without_posts_query ())
 
-fun show_maybe_int : Maybe Int -> String
-show_maybe_int value = case value {
-  Just inner -> show inner
-  Nothing -> "NULL"
-}
-
-fun show_maybe_float : Maybe Float -> String
-show_maybe_float value = case value {
-  Just inner -> show inner
-  Nothing -> "NULL"
-}
-
-fun show_string_list : List String -> String
-show_string_list values = case values {
-  [] -> ""
-  [value] -> value
-  value :: rest -> value <> ", " <> show_string_list rest
+fun print_optional_posts : Result (List {
+  user: User,
+  post: Maybe Post,
+}) Query.DbError
+  -> Unit
+  needs {Stdio}
+print_optional_posts result = case result {
+  Ok rows -> {
+    println ("rows: " <> show (List.length rows))
+    List.iter (fun row -> {
+      let post_label = case row.post {
+        Just p -> p.title
+        Nothing -> "<no post>"
+      }
+      println $"{row.user.name}: {post_label}"
+    }) rows
+  }
+  Err err -> println ("query failed: " <> debug err)
 }
 
 main () = {
@@ -275,73 +176,23 @@ main () = {
       port: 5432,
     }
   let conn = connect config
-  let users_prepared = users_query ()
-  println users_prepared.sql
 
-  let users_result = load_users conn with Query.pg_repo
-  case users_result {
-    Ok rows -> println ("users: " <> show (List.length rows))
-    Err err -> println ("users query failed: " <> debug err)
-  }
+  println (users_query ()).sql
+  println (user_posts_query ()).sql
+  println (users_with_optional_posts_query ()).sql
 
-  let prepared = user_posts_query ()
-  println prepared.sql
+  println "-- left join, real matches --"
+  print_optional_posts (load_optional_posts conn with Query.pg_repo)
 
-  let left_prepared = users_with_optional_posts_query ()
-  println left_prepared.sql
+  println "-- left join, unsatisfiable ON (forces Nothing) --"
+  print_optional_posts (load_unmatched_posts conn with Query.pg_repo)
 
-  let grouped_prepared = post_counts_by_author_query ()
-  println grouped_prepared.sql
-
-  let predicate_prepared = predicate_showcase_query ()
-  println predicate_prepared.sql
-
-  let tagged_prepared = tagged_posts_query ()
-  println tagged_prepared.sql
-
-  let tagged_result = load_tagged_posts conn with Query.pg_repo
-  case tagged_result {
-    Ok rows -> {
-      println ("tagged posts: " <> show (List.length rows))
-      List.iter (fun row ->
-        println $"{show row.id}: [{show_string_list (Db.array_to_list row.tags)}]") rows
-    }
-    Err err -> println ("tagged query failed: " <> debug err)
-  }
-
-  let metadata_prepared = metadata_probe_query ()
-  println metadata_prepared.sql
-
-  let metadata_result = load_metadata_probe conn with Query.pg_repo
-  case metadata_result {
-    Ok rows -> {
-      println ("metadata rows: " <> show (List.length rows))
-      List.iter (fun row -> {
-        let metadata = Db.jsonb_to_value row.metadata
-        println $"{show row.id}: {row.source} / {metadata.source} / {show metadata.featured}"
-      }) rows
-    }
-    Err err -> println ("metadata probe failed: " <> debug err)
-  }
-
-  let stats_prepared = user_age_stats_query ()
-  println stats_prepared.sql
-
-  let stats_result = load_user_age_stats conn with Query.pg_repo
-  case stats_result {
-    Ok (Just stats) ->
-      println $"age stats: avg={show_maybe_float stats.average_age} oldest={show_maybe_int stats.oldest_age} total={show_maybe_int stats.total_age}"
-    Ok Nothing -> println "age stats: no row"
-    Err err -> println ("stats query failed: " <> debug err)
-  }
-
-  let result = load_user_posts conn with Query.pg_repo
-
-  case result {
+  println "-- anti-join: users with no post (unwrap_cols + IS NULL) --"
+  println (users_without_posts_query ()).sql
+  case load_users_without_posts conn with Query.pg_repo {
     Ok rows -> {
       println ("rows: " <> show (List.length rows))
-      List.iter (fun row ->
-        println $"{show row.user.id}: {row.user.name}/{row.post_title}") rows
+      List.iter (fun row -> println $"{show row.id}: {row.name}") rows
     }
     Err err -> println ("query failed: " <> debug err)
   }

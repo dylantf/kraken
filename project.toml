@@ -6,7 +6,7 @@ main = "src/Main.saga"
 
 [library]
 module = "Kraken"
-expose = ["Kraken.Query", "Kraken.Query.Core"]
+expose = ["Kraken.Db", "Kraken.Db.Query"]
 
 [deps]
 saga_pgo = { path = "../saga_pgo" }
