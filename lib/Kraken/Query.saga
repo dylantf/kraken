@@ -14,7 +14,6 @@ import Kraken.Query.Core (
   SqlPart,
   Text,
   Param,
-  project,
   and_
 )
 import Kraken.Query.Core as Core
@@ -74,9 +73,19 @@ pub handler pg_repo for Repo needs {Postgres} {
 }
 
 pub effect QueryBuild {
-  fun bind_from : Table table -> Source
-  fun bind_join_source : Table table -> Source
-  fun push_join : Join -> Unit
+  fun from : Table table -> required_cols
+    where {table: Core.TableScope Core.Required required_cols}
+  fun inner_join : Table table
+    -> (required_cols -> Expr)
+    -> required_cols
+    where {table: Core.TableScope Core.Required required_cols}
+  fun left_join : Table table
+    -> (required_cols -> Expr)
+    -> optional_cols
+    where {
+      table: Core.TableScope Core.Required required_cols,
+      table: Core.TableScope Core.Optional optional_cols,
+    }
   fun where_ : Expr -> Unit
   fun group_by : List Group -> Unit
   fun having : Expr -> Unit
@@ -111,67 +120,38 @@ bind_table_source table_value state = {
   (source, { state | next_alias: state.next_alias + 1 })
 }
 
-pub fun from : Table table -> required_cols
-  needs {QueryBuild}
-  where {table: Core.TableScope Core.Required required_cols}
-from table_value = {
-  let source = bind_from! table_value
-  Core.table_required_cols source.alias table_value
-}
-
-pub fun inner_join : Table table
-  -> (required_cols -> Expr)
-  -> required_cols
-  needs {QueryBuild}
-  where {table: Core.TableScope Core.Required required_cols}
-inner_join table_value on_fn = {
-  let source = bind_join_source! table_value
-  let cols = Core.table_required_cols source.alias table_value
-  push_join! (Join { kind: InnerJoin, source: source, on: on_fn cols })
-  cols
-}
-
-pub fun left_join : Table table
-  -> (required_cols -> Expr)
-  -> optional_cols
-  needs {QueryBuild}
-  where {
-    table: Core.TableScope Core.Required required_cols,
-    table: Core.TableScope Core.Optional optional_cols,
-  }
-left_join table_value on_fn = {
-  let source = bind_join_source! table_value
-  let required_cols = Core.table_required_cols source.alias table_value
-  let optional_cols = Core.table_optional_cols source.alias table_value
-  push_join! (Join {
-    kind: LeftJoin,
-    source: source,
-    on: on_fn required_cols,
-  })
-  optional_cols
-}
-
 handler collect_query for QueryBuild {
-  bind_from table_value = {
+  from table_value = {
     QueryStep (fun state -> {
       let (source, state2) = bind_table_source table_value state
-      let QueryStep run_rest = resume source
+      let cols = Core.table_required_cols source.alias table_value
+      let QueryStep run_rest = resume cols
       run_rest ({ state2 | from_source: Just source })
     })
   }
 
-  bind_join_source table_value = {
+  inner_join table_value on_fn = {
     QueryStep (fun state -> {
       let (source, state2) = bind_table_source table_value state
-      let QueryStep run_rest = resume source
-      run_rest state2
+      let cols = Core.table_required_cols source.alias table_value
+      let join = Join { kind: InnerJoin, source: source, on: on_fn cols }
+      let QueryStep run_rest = resume cols
+      run_rest ({ state2 | joins: List.append state2.joins [join] })
     })
   }
 
-  push_join join = {
+  left_join table_value on_fn = {
     QueryStep (fun state -> {
-      let QueryStep run_rest = resume ()
-      run_rest ({ state | joins: List.append state.joins [join] })
+      let (source, state2) = bind_table_source table_value state
+      let required_cols = Core.table_required_cols source.alias table_value
+      let optional_cols = Core.table_optional_cols source.alias table_value
+      let join = Join {
+        kind: LeftJoin,
+        source: source,
+        on: on_fn required_cols,
+      }
+      let QueryStep run_rest = resume optional_cols
+      run_rest ({ state2 | joins: List.append state2.joins [join] })
     })
   }
 
@@ -223,6 +203,7 @@ handler collect_query for QueryBuild {
       run_rest state
     })
   }
+
   return value = QueryStep (fun state -> (value, state))
 }
 
@@ -231,9 +212,21 @@ pub fun query : (Unit -> selection needs {QueryBuild}) -> Prepared row
 query make = {
   let QueryStep run_query = make () with collect_query
   let (selection, state) = run_query empty_state
-  let projection: Projection row = project selection
+  let projection: Projection row = Core.select selection
   prepare projection state
 }
+
+pub fun into : (row -> out) -> Prepared row -> Prepared out
+into transform prepared =
+  Prepared {
+    sql: prepared.sql,
+    params: prepared.params,
+    decode: fun dynamic ->
+      case prepared.decode dynamic {
+        Err err -> Err err
+        Ok row -> Ok (transform row)
+      },
+  }
 
 record RenderState {
   sql: String,

@@ -154,7 +154,7 @@ Db.query (fun () -> {
 
 The current model now has:
 
-- `Column source name a`
+- `Column meta a`
 - `Sql a`
 - `Expr`
 
@@ -204,8 +204,8 @@ trait ToSql input a | input -> a {
 Implemented aggregate helpers:
 
 - `count_star : Sql Int`
-- `count : Column source name a -> Sql Int`
-- `count_distinct : Column source name a -> Sql Int`
+- `count : input -> Sql Int where {input: ToSql a}`
+- `count_distinct : input -> Sql Int where {input: ToSql a}`
 - `sum : input -> Sql (Maybe a)`
 - `avg : input -> Sql (Maybe Float)`
 - `min : input -> Sql (Maybe a)`
@@ -329,6 +329,59 @@ Kraken has a real array column/value model.
 
 ## Schema Ergonomics
 
+Current compile-time/runtime split:
+
+```saga
+record Users meta {
+  id: Db.Column meta Int,
+  name: Db.Column meta String,
+  age: Db.Column meta Int,
+}
+
+impl Db.TableScope meta (Users meta) for UsersTable {
+}
+
+impl Db.ColumnSet for Users meta {
+  columns source = Users {
+    id: Db.col "id" source,
+    name: Db.col "name" source,
+    age: Db.col "age" source,
+  }
+}
+
+fun users : Db.Table UsersTable
+users = Db.table "users"
+```
+
+Compile time only tracks:
+
+- `UsersTable`, so `from! users` can infer the right column record
+- `Required` / `Optional`, so selecting a left-joined column produces `Maybe a`
+- the value type `a` in `Db.Column meta a`
+
+Runtime owns:
+
+- table names
+- table aliases
+- SQL column names
+- generated select aliases
+
+Selection checkpoint:
+
+```saga
+Query.query (fun () -> {
+  let foo = from! foos
+  let bar = inner_join! bars (fun b -> ...)
+  select! ({ foo: foo, bar: bar.name })
+})
+|> Query.into (fun { foo, bar } -> FoosResult { foo: foo, bar: bar })
+```
+
+`select!` is part of the query-building effect again. `Query.query` builds a
+typed prepared query from the selected shape, and `Query.into` maps the prepared
+query result. Using a record-pattern mapper avoids spelling the anonymous
+projection type and also avoids ambiguous field lookup like `projection.user`.
+
 Earlier demos defined both required and optional column records:
 
 ```saga
@@ -347,8 +400,8 @@ Target direction: derive or generic-transform the nullable mirror:
 Column source name a -> Column source name (Maybe a)
 ```
 
-recursively over the table column record. `Query.from` and `Query.inner_join`
-keep the required shape; `Query.left_join` returns an optional shape.
+recursively over the table column record. `from!` and `inner_join!` keep the
+required shape; `left_join!` returns an optional shape.
 
 Older schema-trait checkpoint:
 
@@ -366,22 +419,30 @@ pub fun table_for : TableRef required_cols
   where {required_cols: TableSchema row insert optional_cols}
 ```
 
-Current code has moved to a leaner table value and a `table mode -> cols`
-relationship:
+Current code has moved to a leaner table value, a `table mode -> cols`
+relationship, and a column-record-local builder:
 
 ```saga
 pub trait TableScope table mode cols | table mode -> cols
 
+pub trait ColumnSet cols {
+  fun columns : String -> cols
+}
+
 fun users : Db.Table UsersTable
-users = Db.table_for Db.table_ref
+users = Db.table "users"
 ```
 
-That removes the separate `user_cols` / `optional_user_cols` helper functions,
-the named `OptionalFoo` record, and `NewFoo` insert shapes from table setup.
+That removes the separate required/optional column helper functions, the named
+`OptionalFoo` record, `TableSchema`, `TableRef`, and `NewFoo` insert shapes from
+table setup. Column SQL names now live in the `ColumnSet` impl for the column
+record itself. For 1:1 layouts, this is the piece that should become derivable:
+the derive can use record field labels as SQL column names, while custom names
+can keep a handwritten `ColumnSet` impl.
 Direct optional column selection works:
 
 ```saga
-let p = Query.left_join posts (fun post -> Db.eq_col post.author_id u.id)
+let p = left_join! posts (fun post -> Db.eq_col post.author_id u.id)
 select! ({ post_title: p.title })
 # post_title : Maybe String
 ```
@@ -396,17 +457,17 @@ record User {
   id: Int,
   name: String,
   age: Int,
-} deriving (Generic)
+}
 
-record Users source {
-  id: Db.Column source 'id Int,
-  name: Db.Column source 'name String,
-  age: Db.Column source 'age Int,
-} deriving (Generic, Db.Selectable User)
+record Users meta {
+  id: Db.Column meta Int,
+  name: Db.Column meta String,
+  age: Db.Column meta Int,
+}
 ```
 
 Generating this bridge would replace the public
-`impl Db.Selectable User for Users source`. It should be possible because the
+`impl Db.Selectable User for Users Db.Required`. It should be possible because the
 derive can route through `Db.map` instead of destructuring the opaque
 `Db.Projection` wrapper.
 
@@ -415,13 +476,14 @@ Remaining schema ergonomics work:
 - Generate the `Selectable User for Users ...` bridge. This is still too much
   boilerplate for users to write by hand.
 - Reduce table setup further if possible. The remaining repeated shape is
-  `record User`, `record Users source meta`, `type UsersTable`, `TableSchema`,
-  `TableScope`, and the `users` value.
+  `record User`, `record Users meta`, `type UsersTable`, `TableScope`,
+  `ColumnSet`, and the `users` value. The `ColumnSet` impl is a good derive
+  candidate when the SQL column names match the record fields.
 
 - Whole-row selection from a left join is not yet implicit. Ideally:
 
 ```saga
-let p = Query.left_join posts (fun post -> Db.eq_col post.author_id u.id)
+let p = left_join! posts (fun post -> Db.eq_col post.author_id u.id)
 select! ({ post: p })
 # post : Maybe Post
 ```
