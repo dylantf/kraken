@@ -73,19 +73,13 @@ pub handler pg_repo for Repo needs {Postgres} {
 }
 
 pub effect QueryBuild {
-  fun from : Table table -> required_cols
-    where {table: Core.TableScope Core.Required required_cols}
-  fun inner_join : Table table
+  fun from : Table table required_cols optional_cols -> required_cols
+  fun inner_join : Table table required_cols optional_cols
     -> (required_cols -> Expr)
     -> required_cols
-    where {table: Core.TableScope Core.Required required_cols}
-  fun left_join : Table table
+  fun left_join : Table table required_cols optional_cols
     -> (required_cols -> Expr)
     -> optional_cols
-    where {
-      table: Core.TableScope Core.Required required_cols,
-      table: Core.TableScope Core.Optional optional_cols,
-    }
   fun where_ : Expr -> Unit
   fun group_by : List Group -> Unit
   fun having : Expr -> Unit
@@ -108,7 +102,7 @@ empty_state = QueryState {
   next_alias: 0,
 }
 
-fun bind_table_source : Table table
+fun bind_table_source : Table table required_cols optional_cols
   -> QueryState
   -> (Source, QueryState)
 bind_table_source table_value state = {

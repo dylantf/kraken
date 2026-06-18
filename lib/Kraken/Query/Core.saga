@@ -126,10 +126,8 @@ record TableDef {
   make_optional_cols: String -> Dynamic,
 }
 
-opaque type Table table =
+opaque type Table table required_cols optional_cols =
   | Table TableDef
-
-pub trait TableScope table mode cols | table mode -> cols {}
 
 pub trait ColumnSet cols {
   fun columns : String -> cols
@@ -142,10 +140,8 @@ record ColumnInfo {
 
 opaque type Column meta a = Column ColumnInfo
 
-pub fun table : String -> Table table
+pub fun table : String -> Table table required_cols optional_cols
   where {
-    table: TableScope Required required_cols,
-    table: TableScope Optional optional_cols,
     required_cols: ColumnSet,
     optional_cols: ColumnSet,
   }
@@ -154,31 +150,31 @@ table name =
     name: name,
     alias: Nothing,
     make_required_cols: fun source -> {
-      let cols: required_cols = columns source
-      from_erlang cols
+      let columns_value: required_cols = columns source
+      from_erlang columns_value
     },
     make_optional_cols: fun source -> {
-      let cols: optional_cols = columns source
-      from_erlang cols
+      let columns_value: optional_cols = columns source
+      from_erlang columns_value
     },
   })
 
 pub fun table_as : String
-  -> Table table
-  -> Table table
+  -> Table table required_cols optional_cols
+  -> Table table required_cols optional_cols
 table_as alias table_value = {
   let Table def = table_value
   Table ({ def | alias: Just alias })
 }
 
-pub fun table_name : Table table
+pub fun table_name : Table table required_cols optional_cols
   -> String
 table_name table_value = {
   let Table def = table_value
   def.name
 }
 
-pub fun table_alias : Table table
+pub fun table_alias : Table table required_cols optional_cols
   -> Maybe String
 table_alias table_value = {
   let Table def = table_value
@@ -186,7 +182,7 @@ table_alias table_value = {
 }
 
 pub fun table_required_cols : String
-  -> Table table
+  -> Table table required_cols optional_cols
   -> required_cols
 table_required_cols alias table_value = {
   let Table def = table_value
@@ -194,7 +190,7 @@ table_required_cols alias table_value = {
 }
 
 pub fun table_optional_cols : String
-  -> Table table
+  -> Table table required_cols optional_cols
   -> optional_cols
 table_optional_cols alias table_value = {
   let Table def = table_value

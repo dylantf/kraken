@@ -43,7 +43,7 @@ record Users meta {
   id: Db.Column meta Int,
   name: Db.Column meta String,
   age: Db.Column meta Int,
-}
+} deriving (Db.Selectable User)
 
 record Posts meta {
   id: Db.Column meta Int,
@@ -73,24 +73,11 @@ impl Db.ColumnSet for Posts meta {
   }
 }
 
-fun users : Db.Table UsersTable
+fun users : Db.Table UsersTable (Users Db.Required) (Users Db.Optional)
 users = Db.table "users"
 
-fun posts : Db.Table PostsTable
+fun posts : Db.Table PostsTable (Posts Db.Required) (Posts Db.Optional)
 posts = Db.table "posts"
-
-impl Db.TableScope meta (Users meta) for UsersTable {}
-
-impl Db.TableScope meta (Posts meta) for PostsTable {}
-
-impl Db.Selectable User for (Users Db.Required) {
-  to_projection u = {
-    let projection: Db.Projection { id: Int, name: String, age: Int } =
-      Db.project ({ id: u.id, name: u.name, age: u.age })
-    projection
-    |> Db.map (fun row -> User { id: row.id, name: row.name, age: row.age })
-  }
-}
 
 fun users_query : Unit -> Query.Prepared { id: Int, name: String, age: Int }
 users_query () = Query.query (fun () -> {

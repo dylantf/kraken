@@ -338,9 +338,6 @@ record Users meta {
   age: Db.Column meta Int,
 }
 
-impl Db.TableScope meta (Users meta) for UsersTable {
-}
-
 impl Db.ColumnSet for Users meta {
   columns source = Users {
     id: Db.col "id" source,
@@ -349,7 +346,7 @@ impl Db.ColumnSet for Users meta {
   }
 }
 
-fun users : Db.Table UsersTable
+fun users : Db.Table UsersTable (Users Db.Required) (Users Db.Optional)
 users = Db.table "users"
 ```
 
@@ -419,26 +416,36 @@ pub fun table_for : TableRef required_cols
   where {required_cols: TableSchema row insert optional_cols}
 ```
 
-Current code has moved to a leaner table value, a `table mode -> cols`
-relationship, and a column-record-local builder:
+Current code has moved to a leaner table value that carries the required and
+optional column-record types directly, plus a column-record-local builder:
 
 ```saga
-pub trait TableScope table mode cols | table mode -> cols
-
 pub trait ColumnSet cols {
   fun columns : String -> cols
 }
 
-fun users : Db.Table UsersTable
+fun users : Db.Table UsersTable (Users Db.Required) (Users Db.Optional)
 users = Db.table "users"
 ```
 
 That removes the separate required/optional column helper functions, the named
-`OptionalFoo` record, `TableSchema`, `TableRef`, and `NewFoo` insert shapes from
-table setup. Column SQL names now live in the `ColumnSet` impl for the column
-record itself. For 1:1 layouts, this is the piece that should become derivable:
-the derive can use record field labels as SQL column names, while custom names
-can keep a handwritten `ColumnSet` impl.
+`OptionalFoo` record, `TableSchema`, `TableRef`, `TableScope`, and `NewFoo`
+insert shapes from table setup. Column SQL names now live in the `ColumnSet`
+impl for the column record itself. For 1:1 layouts, this is the piece that
+should become derivable: the derive can use record field labels as SQL column
+names, while custom names can keep a handwritten `ColumnSet` impl.
+
+Tradeoff: deleting `TableScope` means exported table values need to name both
+column scopes in their signature:
+
+```saga
+Db.Table UsersTable (Users Db.Required) (Users Db.Optional)
+```
+
+The previously explored `Db.Table UsersTable Users` shape would hide that, but
+the current function-constraint grammar cannot express the needed
+`ColumnSet (Users Db.Required)` / `ColumnSet (Users Db.Optional)` constraints
+through a type-constructor parameter.
 Direct optional column selection works:
 
 ```saga
@@ -449,8 +456,8 @@ select! ({ post_title: p.title })
 
 Whole-row projection checkpoint:
 
-Selecting a whole required row currently still needs a user-written bridge. The
-desired user-facing shape is still:
+Selecting a whole required row now uses an applied derive. The user-facing
+shape is:
 
 ```saga
 record User {
@@ -463,22 +470,32 @@ record Users meta {
   id: Db.Column meta Int,
   name: Db.Column meta String,
   age: Db.Column meta Int,
-}
+} deriving (Db.Selectable User)
 ```
 
-Generating this bridge would replace the public
-`impl Db.Selectable User for Users Db.Required`. It should be possible because the
-derive can route through `Db.map` instead of destructuring the opaque
-`Db.Projection` wrapper.
+The derive specializes the generated bridge to the required table scope because
+Kraken intentionally has different selected row types for required and optional
+columns:
+
+```saga
+Db.Column Db.Required a -> a
+Db.Column Db.Optional a -> Maybe a
+```
+
+So the generated impl is effectively:
+
+```saga
+impl Db.Selectable User for Users Db.Required
+```
+
+without also claiming that `Users Db.Optional` selects `User`.
 
 Remaining schema ergonomics work:
 
-- Generate the `Selectable User for Users ...` bridge. This is still too much
-  boilerplate for users to write by hand.
 - Reduce table setup further if possible. The remaining repeated shape is
-  `record User`, `record Users meta`, `type UsersTable`, `TableScope`,
-  `ColumnSet`, and the `users` value. The `ColumnSet` impl is a good derive
-  candidate when the SQL column names match the record fields.
+  `record User`, `record Users meta`, `type UsersTable`, `ColumnSet`, and the
+  `users` value. The `ColumnSet` impl is a good derive candidate when the SQL
+  column names match the record fields.
 
 - Whole-row selection from a left join is not yet implicit. Ideally:
 
