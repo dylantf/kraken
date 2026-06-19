@@ -896,8 +896,8 @@ DO-NOTHING row returns nothing, so `Query.one` gives `Ok Nothing` on conflict).
 
 Tier 7 is complete. Not yet built (smaller follow-ups): `DO UPDATE` to a chosen
 *subset* of columns or to arbitrary expressions (e.g. `count = users.count + 1`);
-`ON CONSTRAINT <name>` conflict targets. (Transactions are Tier 8 — pgo already
-exposes a `Transaction` effect to build on.)
+`ON CONSTRAINT <name>` conflict targets. (Transactions — Tier 8 — are now done,
+built as a thin wrapper over saga_pgo's `Transaction` effect.)
 
 Inference note worth remembering: a DML op taking *two* column-record callbacks
 (e.g. `*_returning` conflict ops: a conflict-target `(cols -> List ColRef)` and a
@@ -1093,30 +1093,49 @@ Staging ladder (stop where cost/benefit feels right):
 
 ## Tier 8: Transactions
 
-**Priority: highest, alongside DML.** Needed as soon as there are
-multi-statement writes.
+**Done (2026-06-19).** `Query.transaction conn body` runs a closure atomically,
+committing on `Ok` and rolling back on `Err`. It's a thin wrapper over
+`SagaPgo.transaction` — **no direct Erlang/pgo bridging** (per the saga_pgo
+transaction guide, the library already drives the BEGIN/COMMIT/ROLLBACK lifecycle
+and routes every `Postgres` op on the same connection into the transaction via
+pgo's process dictionary).
 
-A `transaction` combinator at the `Repo` level: run a closure inside `BEGIN` /
-`COMMIT`, rolling back automatically on `Err` (or on an exception). The closure
-should still have access to `Repo` so it can run normal `all` / `one` / DML
-queries against the transaction's connection.
-
-Possible shape:
+Final shape:
 
 ```saga
-Db.transaction conn (fun () -> {
-  let user = all! conn (Dml.insert_returning users { name: "Alice", age: 42 } (fun u -> { id: u.id }))
-  all! conn (Dml.insert posts { author_id: user.id, title: "Hi" })
+pub fun transaction : Connection
+  -> (Unit -> Result a DbError needs {Repo})
+  -> Result a DbError
+  needs {Postgres, Transaction}
+
+Query.transaction conn (fun () -> {
+  case Dml.exec conn (Dml.insert users new_row) {
+    Err err -> Err err                       # rolls back
+    Ok _ -> Dml.exec conn (bump_age_query ()) |> Result.map (fun _ -> ())
+  }
   # commits on Ok, rolls back on Err
 })
 ```
 
-Open questions:
+Resolved design decisions:
 
-- Whether `transaction` is its own effect/handler or threads a transaction-bound
-  `Connection` through the existing `Repo`.
-- Savepoints / nested transactions (probably a later refinement).
-- Isolation-level configuration.
+- **Not its own effect.** `transaction` is a plain function over saga_pgo's
+  `Postgres` + `Transaction` effects. It provides `pg_repo` *inside* the body, so
+  the body uses the ordinary Kraken `Repo` API (`all`/`one`/`exec`/the DML
+  helpers) and those calls auto-join the transaction. The boundary therefore needs
+  `{Postgres, Transaction}` (wire `with {pg_transaction, pg, ...}` — dependent
+  handler first), not `Repo`.
+- **Error-channel impedance.** saga_pgo's callback rolls back via a
+  `QueryError`-typed `Err`, but Kraken bodies fail with `DbError`. A `QueryFailed`
+  round-trips losslessly; a `DecodeFailed` (a row returned but undecodable) rolls
+  back with its message preserved (mapped onto `UnexpectedResultType`). This is the
+  one lossy corner and it's documented.
+- **Continuation caveat (inherited from saga_pgo):** don't let a continuation
+  captured inside the body escape and run later — its re-invocation happens after
+  commit/rollback, outside the transaction.
+
+Still open (later refinements): savepoints / nested transactions, isolation-level
+configuration.
 
 ## Open Design Questions
 
@@ -1182,9 +1201,9 @@ Kraken.
   [Tier 7: DML](#tier-7-dml). This is also the next stress test of the schema
   representation — writes type-check the column record from the *write*
   direction, which is where the `ColumnSet` duplication will bite again.
-- **Transactions**: a `transaction` combinator over `Repo` (begin/commit, auto
-  rollback on `Err`). Needed the moment there are multi-statement writes. See
-  [Tier 8: Transactions](#tier-8-transactions).
+- **Transactions** *(done 2026-06-19)*: `Query.transaction conn body` runs a
+  closure atomically (commit on `Ok`, rollback on `Err`), wrapping
+  `SagaPgo.transaction`. See [Tier 8: Transactions](#tier-8-transactions).
 
 **Tier 2 — read expressivity.**
 

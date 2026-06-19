@@ -3,10 +3,10 @@ module Write
 import Kraken.Db
 import Kraken.Db.Dml
 import Kraken.Db.Dml (Update)
-import Kraken.Db.Query (Prepared, Repo, DbError)
+import Kraken.Db.Query (Prepared, Repo, DbError, QueryFailed)
 import Kraken.Db.Query as Query
 import Read (users, User, UsersInsert)
-import SagaPgo (Connection)
+import SagaPgo (Connection, Postgres, Transaction, QueryError)
 
 # INSERT using the schema-generated insert type. Generated id via Db.auto.
 pub fun insert_user_query : Unit -> Prepared Unit
@@ -71,6 +71,36 @@ insert_user_if_new_returning () = {
 # Run an upsert-returning and decode the resulting row.
 pub fun run_upsert_returning : Connection -> Result (Maybe User) DbError needs {Repo}
 run_upsert_returning conn = Query.one conn (upsert_user_returning ())
+
+# Atomic multi-statement write: insert a user and bump another's age in one
+# transaction. Both commit together, or — if either op fails — both roll back.
+# Returns the total number of affected rows. Only Postgres + Transaction need
+# handlers; the body's Repo capability is provided by `transaction` itself.
+pub fun atomic_writes : Connection -> Result Int DbError needs {Postgres, Transaction}
+atomic_writes conn = Query.transaction conn (fun () -> {
+  let new_row = UsersInsert { id: Db.auto, name: "Dave", age: 40 }
+  case Dml.exec conn (Dml.insert users new_row) {
+    Err err -> Err err
+    Ok inserted -> case Dml.exec conn (bump_age_query ()) {
+      Err err -> Err err
+      Ok bumped -> Ok (inserted + bumped)
+    }
+  }
+})
+
+# Rollback path: the INSERT itself succeeds, but the body returns Err, so the
+# transaction rolls back and the row never persists.
+pub fun rolled_back_write : Connection
+  -> QueryError
+  -> Result Unit DbError
+  needs {Postgres, Transaction}
+rolled_back_write conn abort = Query.transaction conn (fun () -> {
+  let new_row = UsersInsert { id: Db.auto, name: "Ghost", age: 99 }
+  case Dml.exec conn (Dml.insert users new_row) {
+    Err err -> Err err
+    Ok _ -> Err (QueryFailed abort)
+  }
+})
 
 # Surgical UPDATE: only the columns that change.
 pub fun bump_age_query : Unit -> Prepared Unit

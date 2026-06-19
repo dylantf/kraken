@@ -111,6 +111,12 @@ Kraken uses Saga's algebraic effects:
 - `Repo` — the execute capability. `pg_repo` is the production handler (runs
   against `Postgres`); provide your own in tests. Wired at the call boundary with
   `... with Query.pg_repo` (see `Main.saga`).
+- Transactions reuse saga_pgo's `Postgres` + `Transaction` effects directly.
+  `Query.transaction conn body` wraps `SagaPgo.transaction`: it provides `pg_repo`
+  *inside* the body (so the body uses the full `Repo` API — `all`/`one`/`exec`/the
+  DML helpers — and they auto-join the tx via pgo's process dictionary), commits on
+  `Ok`, rolls back on `Err`. So a transaction needs `{Postgres, Transaction}` at the
+  boundary (wire `with {pg_transaction, pg, ...}`), not `Repo`.
 
 ### Schema declaration pattern
 
@@ -149,6 +155,10 @@ future derive, but that needs compiler support).
   late — notably a DML op taking *two* column-record callbacks (a conflict target
   + a projection). Lambda param annotations don't parse and a typed `let` flows too
   late. Workaround: use a whole-row projection (`fun u -> u`), which pins `cols`.
+- **`with {…}` handler order: a dependent handler must be listed before the one it
+  needs.** `pg_transaction needs {Postgres}`, so the boundary is
+  `with {pg_transaction, pg, console}` — listing `pg` first leaves `Postgres`
+  unhandled and `main` errors with "entry point … cannot use `needs`".
 
 ## Status
 
@@ -170,7 +180,15 @@ decode. Upserts are covered by `insert_on_conflict_do_nothing` and `upsert`
 (`ON CONFLICT (<target>) DO UPDATE SET … = EXCLUDED.…`), with conflict targets
 named type-safely via `Db.ref`; both have `*_returning` variants that append
 `RETURNING` and decode through the projection. Schema columns the DB fills are marked
-`Db.Generated a` (reads like a column, unsettable via `set!`). The roadmap (in the
-planning doc) prioritizes transactions (Tier 8) next. When extending SQL
+`Db.Generated a` (reads like a column, unsettable via `set!`). **Transactions**
+(Tier 8) are done: `Query.transaction conn body` runs a `body :
+Unit -> Result a DbError needs {Repo}` atomically — committing on `Ok`, rolling
+back on `Err` — as a thin wrapper over `SagaPgo.transaction` (no direct Erlang
+bridging). The body uses the ordinary Kraken `Repo` API; the only impedance is the
+error channel — saga_pgo's rollback path is `QueryError`-typed, so a `QueryFailed`
+round-trips losslessly while a `DecodeFailed` (a row that came back but didn't
+decode) rolls back with its message preserved. The roadmap's remaining items are
+smaller (DO UPDATE column subsets / arbitrary expressions like
+`count = users.count + 1`, `ON CONSTRAINT` conflict targets). When extending SQL
 coverage, prefer growing the typed `Sql a` expression model over adding one-off
 APIs.

@@ -3,7 +3,7 @@ module Main
 import Std.IO (console, Stdio)
 import Kraken.Db.Query
 import Read
-import SagaPgo (Connection, connect, default_config, pg)
+import SagaPgo (Connection, connect, default_config, pg, pg_transaction)
 import Write
 
 main () = {
@@ -39,4 +39,10 @@ main () = {
     age: 31,
   })).sql
   println (Write.delete_user_query ()).sql
-} with {pg, console}
+
+  println "-- transaction: atomic insert + age bump (commits together) --"
+  case Write.atomic_writes conn {
+    Ok affected -> println $"committed: {show affected} rows affected"
+    Err err -> println ("transaction failed: " <> debug err)
+  }
+} with {pg_transaction, pg, console}
