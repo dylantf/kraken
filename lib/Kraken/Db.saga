@@ -232,6 +232,39 @@ opaque type Col a = Col ColumnInfo
 #@ convention.
 opaque type Generated a = Generated ColumnInfo
 
+#@ The value of a DB-generated column in an insert input. `Auto` lets the database
+#@ assign it (the column is omitted from the INSERT); `Provide v` forces a value.
+#@ A `deriving (Db.Insertable …)` insert type maps each `Generated a` schema column
+#@ to a `Writable a` field.
+pub type Writable a =
+  | Auto
+  | Provide a
+
+#@ Let the database assign a generated column (the common case).
+pub fun auto : Writable a
+auto = Auto
+
+#@ Force a specific value into a normally-generated column.
+pub fun provide : a -> Writable a
+provide value = Provide value
+
+#@ The per-field type map that drives insert-type synthesis: it rewrites each
+#@ schema column type to its insert-input field type. The method-less impls below
+#@ ARE the rewrite table — a plain `Col a` field binds its value directly, a
+#@ `Generated a` field becomes `Writable a` (so it can be omitted with `Db.auto`).
+pub trait InsertField col ins | col -> ins {}
+impl InsertField a for Col a {}
+impl InsertField (Writable a) for Generated a {}
+
+#@ Links a table's column record to its generated insert-shape type. Emitted by
+#@ `deriving (Db.Insertable <Name>)` on the column record; consumed by `Dml.insert`
+#@ to fix the accepted input type from the table (`cols` determines `ins`). The
+#@ `synthesizes` clause tells the compiler to create the insert record by mapping
+#@ each column field through `InsertField` and to attach `deriving (InsertRow)` so
+#@ Kraken can encode it.
+pub trait Insertable cols ins | cols -> ins
+  synthesizes via InsertField deriving (InsertRow)
+
 pub fun table : String -> Table cols where {cols: ColumnSet}
 table name =
   Table (TableDef {
@@ -913,15 +946,60 @@ impl Selectable (Record out) for Record fields
   }
 }
 
-#@ Encode a single record field's value to a Postgres parameter. Implemented for
-#@ the `Leaf` building block of the Generic representation.
-pub trait EncodeLeaf rep {
-  fun encode_leaf : rep -> Value
+#@ Encode one insert column value: `Just param` to bind it, `Nothing` to omit the
+#@ column (let the database supply it). Plain column types always bind; `Writable`
+#@ (a generated column) omits on `Auto` and binds on `Provide`.
+#@
+#@ Instances are keyed per column-type head (no blanket over `PgType`, since Saga
+#@ forbids overlapping/bare-variable instance heads — a blanket would clash with
+#@ the `Writable` instance). A column type not listed here is not insertable.
+pub trait InsertCol a {
+  fun insert_col : a -> Maybe Value
 }
 
-impl EncodeLeaf for Leaf a where {a: PgType} {
+impl InsertCol for Int {
+  insert_col v = Just (encode_value v)
+}
+impl InsertCol for Float {
+  insert_col v = Just (encode_value v)
+}
+impl InsertCol for String {
+  insert_col v = Just (encode_value v)
+}
+impl InsertCol for Bool {
+  insert_col v = Just (encode_value v)
+}
+impl InsertCol for T.Uuid {
+  insert_col v = Just (encode_value v)
+}
+
+impl InsertCol for Array a where {a: PgType} {
+  insert_col v = Just (encode_value v)
+}
+
+impl InsertCol for Jsonb a where {a: ToJson + FromJson} {
+  insert_col v = Just (encode_value v)
+}
+
+impl InsertCol for Maybe a where {a: PgType} {
+  insert_col v = Just (encode_value v)
+}
+
+impl InsertCol for Writable a where {a: PgType} {
+  insert_col w = case w {
+    Auto -> Nothing
+    Provide value -> Just (encode_value value)
+  }
+}
+
+# Unwrap a `Leaf` and encode its value (or omit it).
+pub trait EncodeLeaf rep {
+  fun encode_leaf : rep -> Maybe Value
+}
+
+impl EncodeLeaf for Leaf a where {a: InsertCol} {
   encode_leaf leaf = case leaf {
-    Leaf value -> encode_value value
+    Leaf value -> insert_col value
   }
 }
 
@@ -958,10 +1036,9 @@ impl InsertFields for And l r where {l: InsertFields, r: InsertFields} {
 
 impl InsertFields for Labeled n a where {n: KnownSymbol, a: EncodeLeaf} {
   insert_fields rep = case rep {
-    Labeled inner -> {
-      let name = symbol_name (Proxy : Proxy n)
-      let value = encode_leaf inner
-      [(name, value)]
+    Labeled inner -> case encode_leaf inner {
+      Nothing -> []
+      Just value -> [(symbol_name (Proxy : Proxy n), value)]
     }
   }
 }

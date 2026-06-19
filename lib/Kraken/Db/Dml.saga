@@ -9,6 +9,7 @@ import Kraken.Db (
   Text,
   Param,
   InsertRow,
+  Insertable,
   ColumnSet,
   primary_key_columns,
   encode_value,
@@ -152,7 +153,8 @@ value_placeholder_parts vals = case vals {
 #@ or wrong-typed field fails to typecheck against that type). Column names come
 #@ from the record's fields; declare the columns you want to set and omit the
 #@ rest (e.g. DB-generated ones).
-pub fun insert : Table cols -> input -> Prepared Unit where {input: InsertRow}
+pub fun insert : Table cols -> ins -> Prepared Unit
+  where {cols: Insertable ins, ins: InsertRow}
 insert table_value value = {
   let pairs = insert_row value
   let names = List.map (fun pair -> { let (name, _v) = pair; name }) pairs

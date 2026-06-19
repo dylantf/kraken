@@ -148,10 +148,14 @@ future derive, but that needs compiler support).
 
 Kraken has a well-rounded **read** path (selects, inner/left joins, where/group/
 having/order/limit/offset, aggregates, arrays, JSONB, raw-SQL escapes) and a
-**write** path in `Kraken.Db.Dml`: `insert` (dedicated named insert type deriving
-`Db.InsertRow`), `update` (partial, `set!`/`where_!`), `update_all` (whole-entity
-save keyed by `primary_key`), `delete`, and `exec` (affected-row count). Schema
-columns the DB fills are marked `Db.Generated a` (reads like a column, unsettable
-via `set!`). The roadmap (in the planning doc) prioritizes `RETURNING`, `ON
-CONFLICT`, and transactions next. When extending SQL coverage, prefer growing the
+**write** path in `Kraken.Db.Dml`: `insert` (the insert-shape record is
+**synthesized** from the schema by `deriving (Db.Insertable <Name>)` — the
+compiler's generic `synthesizes via <FieldMap> deriving (...)` trait mechanism,
+driven by Kraken's `InsertField` rewrite map: `Col a → a`, `Generated a →
+Writable a` — and `deriving (Db.InsertRow)` is attached for encoding), `update`
+(partial, `set!`/`where_!`), `update_all` (whole-entity save keyed by
+`primary_key`), `delete`, and `exec` (affected-row count). Schema columns the DB
+fills are marked `Db.Generated a` (reads like a column, unsettable via `set!`).
+The roadmap (in the planning doc) prioritizes `RETURNING`, `ON CONFLICT`, and
+transactions next. When extending SQL coverage, prefer growing the
 typed `Sql a` expression model over adding one-off APIs.

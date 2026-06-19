@@ -35,7 +35,7 @@ pub record Users {
   id: Db.Generated Int,
   name: Db.Col String,
   age: Db.Col Int,
-} deriving (Db.Selectable User)
+} deriving (Db.Selectable User, Db.Insertable UsersInsert)
 
 pub record Posts {
   id: Db.Generated Int,

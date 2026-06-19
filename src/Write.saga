@@ -1,21 +1,16 @@
 module Write
 
-import Kraken.Db as Db
-import Kraken.Db.Dml as Dml
+import Kraken.Db
+import Kraken.Db.Dml
 import Kraken.Db.Dml (Update)
 import Kraken.Db.Query (Prepared, Repo, DbError)
-import Read (users, User)
+import Read (users, User, UsersInsert)
 import SagaPgo (Connection)
 
-# A dedicated insert type: declare the columns you set, omit the generated id.
-record NewUser {
-  name: String,
-  age: Int,
-} deriving (Db.InsertRow)
-
-# INSERT — the named type enforces field types (NewUser { name: 31 } won't compile).
+# INSERT using the schema-generated insert type. Generated id via Db.auto.
 pub fun insert_user_query : Unit -> Prepared Unit
-insert_user_query () = Dml.insert users (NewUser { name: "Carol", age: 31 })
+insert_user_query () =
+  Dml.insert users (UsersInsert { id: Db.auto, name: "Carol", age: 31 })
 
 # Surgical UPDATE: only the columns that change.
 pub fun bump_age_query : Unit -> Prepared Unit
@@ -24,7 +19,7 @@ bump_age_query () = Dml.update users (fun u -> {
   where_! (Db.eq u.id 1)
 })
 
-# Whole-entity save: read → modify → save, keyed by primary_key. No conversion.
+# Whole-entity save: read -> modify -> save, keyed by primary_key
 pub fun save_user_query : User -> Prepared Unit
 save_user_query user = Dml.update_all users user
 

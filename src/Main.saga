@@ -1,10 +1,10 @@
 module Main
 
 import Std.IO (console, Stdio)
-import Kraken.Db.Query as Query
+import Kraken.Db.Query
 import Read
-import Write
 import SagaPgo (Connection, connect, default_config, pg)
+import Write
 
 main () = {
   let config =
@@ -27,11 +27,16 @@ main () = {
 
   println "-- anti-join: users with no post (unwrap_cols + IS NULL) --"
   println (Read.users_without_posts_query ()).sql
-  Read.print_users_without_posts (Read.load_users_without_posts conn with Query.pg_repo)
+  Read.print_users_without_posts (Read.load_users_without_posts conn
+    with Query.pg_repo)
 
   println "-- DML: insert / update / update_all / delete (rendered SQL) --"
   println (Write.insert_user_query ()).sql
   println (Write.bump_age_query ()).sql
-  println (Write.save_user_query (Read.User { id: 1, name: "Alice Updated", age: 31 })).sql
+  println (Write.save_user_query (User {
+    id: 1,
+    name: "Alice Updated",
+    age: 31,
+  })).sql
   println (Write.delete_user_query ()).sql
 } with {pg, console}
