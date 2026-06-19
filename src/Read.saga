@@ -31,13 +31,13 @@ pub record Post {
 
 # Schema
 
-record Users {
+pub record Users {
   id: Db.Col Int,
   name: Db.Col String,
   age: Db.Col Int,
 } deriving (Db.Selectable User)
 
-record Posts {
+pub record Posts {
   id: Db.Col Int,
   author_id: Db.Col Int,
   title: Db.Col String,

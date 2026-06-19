@@ -207,6 +207,17 @@ table_cols alias table_value = {
 pub fun col : String -> String -> Col a
 col name source = Col (ColumnInfo { source: source, name: name })
 
+#@ Encode a value into a Postgres bind parameter via its `PgType` instance.
+pub fun encode_value : a -> Value where {a: PgType}
+encode_value value = encode_pg value
+
+#@ The bare column name (no table qualifier), e.g. for an `UPDATE ... SET` target.
+pub fun col_name : Col a -> String
+col_name column = {
+  let Col info = column
+  info.name
+}
+
 pub type SqlPart =
   | Text String
   | Param Value

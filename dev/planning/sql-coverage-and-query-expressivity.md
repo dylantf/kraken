@@ -764,6 +764,39 @@ scope with generated columns.
 
 **Priority: highest. Kraken is read-only today — this is the structural gap.**
 
+### Implementation status (2026-06-19)
+
+Built and compiling in `Kraken.Db.Dml`: **`update`**, **`delete`**, and **`exec`**
+(non-returning, returns affected-row count via `Returned.count`). Demonstrated in
+`src/Write.saga`. Schema column records (`Users`/`Posts`) are now `pub` in
+`src/Read.saga` so the write side can reference their columns; a shared `Schema`
+module is the next cleanup.
+
+The builder is a uniform `!`-effect-operation DSL — `set!` / `where_!` inside the
+`update` closure:
+
+```saga
+Dml.update users (fun u -> {
+  set! u.age 43
+  where_! (Db.eq u.id 1)
+})
+```
+
+This briefly hit a wall: an effect operation's `where` constraints did not reach
+its handler, so a handler for `set : Col a -> a -> Unit where {a: PgType}` could
+not call `encode_value` (no `PgType a` in scope). That was **fixed in the compiler
+on 2026-06-19** — operation constraints now deliver their evidence to the handler
+— so `set!`/`where_!` work as effect ops and DML stays consistent with the read
+DSL. (Two parser quirks remembered along the way: `(List.append …)` fails to parse
+because `List` is also a type, so a parenthesized `List.append` reads as a
+qualified type; and multi-line function application with args on following lines
+leaves the function unapplied. Both are avoided by binding intermediate `let`s.)
+
+Remaining in Tier 7: `insert` + `Insertable` derive, `update_all`, the
+`Generated` marker + `Schema` trait + `primary_key`, and `RETURNING`.
+
+### Worked design
+
 This section is the worked-out DML design (2026-06-18). New module
 `Kraken.Db.Dml` (imported as `Dml`), parallel to `Kraken.Db.Query`, reusing the
 existing `Db` vocabulary: `Table` / `Col` / the `Schema` trait, `PgType.encode_pg`
@@ -879,11 +912,12 @@ Dml.insert users { name: "Alice", age: 42 }
 # INSERT ... RETURNING — closure ends in a selection, exactly like select!
 Dml.insert_returning users { name: "Alice", age: 42 } (fun u -> { id: u.id })
 
-# UPDATE (targeted/partial) — `set!` is the sweet spot here: only write what changes.
-Dml.update users (fun u -> {
-  set! u.age 43
-  where_! (Db.eq u.id 1)
-})
+# UPDATE (targeted/partial) — only write what changes. `set`/`where_` are plain
+# functions returning clauses (see Implementation status for why not `!`-ops).
+Dml.update users (fun u -> [
+  Dml.set u.age 43,
+  Dml.where_ (Db.eq u.id 1),
+])
 
 # UPDATE (save whole entity) — eats the domain record as-is, keyed by primary_key.
 let updated = { user | age: 43 }       # native record update; no UserUpdate type

@@ -1,0 +1,25 @@
+module Write
+
+import Kraken.Db as Db
+import Kraken.Db.Dml as Dml
+import Kraken.Db.Dml (Update)
+import Kraken.Db.Query (Prepared, Repo, DbError)
+import Read (users)
+import SagaPgo (Connection)
+
+# Surgical UPDATE: only the columns that change.
+pub fun bump_age_query : Unit -> Prepared Unit
+bump_age_query () = Dml.update users (fun u -> {
+  set! u.age 43
+  where_! (Db.eq u.id 1)
+})
+
+# DELETE with a predicate.
+pub fun delete_user_query : Unit -> Prepared Unit
+delete_user_query () = Dml.delete users (fun u -> Db.eq u.id 999)
+
+pub fun run_bump_age : Connection -> Result Int DbError needs {Repo}
+run_bump_age conn = Dml.exec conn (bump_age_query ())
+
+pub fun run_delete_user : Connection -> Result Int DbError needs {Repo}
+run_delete_user conn = Dml.exec conn (delete_user_query ())

@@ -1,0 +1,161 @@
+module Kraken.Db.Dml
+
+import Kraken.Db (
+  Table,
+  Col,
+  Expr,
+  PgType,
+  SqlPart,
+  Text,
+  Param,
+  encode_value,
+  col_name,
+  expr_frag,
+  table_name,
+  table_cols,
+  and_
+)
+import Kraken.Db.Query (Prepared, DbError, QueryFailed, Repo)
+import SagaPgo (Connection)
+import SagaPgo.Types (Value)
+
+# A single `column = value` assignment in an UPDATE ... SET clause.
+record Assignment {
+  column: String,
+  value: Value,
+}
+
+record UpdateState {
+  assignments: List Assignment,
+  wheres: List Expr,
+}
+
+fun empty_update_state : UpdateState
+empty_update_state = UpdateState { assignments: [], wheres: [] }
+
+type UpdateStep a = UpdateStep (UpdateState -> (a, UpdateState))
+
+#@ The UPDATE builder DSL. Use `set!` and `where_!` inside the closure passed to
+#@ `update`. This is the surgical update path: you write only the columns that
+#@ change, so it stays compact even on wide tables.
+pub effect Update {
+  #@ Assign a column a new value; the value type must match the column's.
+  fun set : Col a -> a -> Unit where {a: PgType}
+  #@ Restrict which rows are updated. Repeated calls combine with `AND`. With no
+  #@ `where_!`, every row is updated.
+  fun where_ : Expr -> Unit
+}
+
+handler collect_update for Update {
+  set col val = {
+    UpdateStep (fun state -> {
+      let assignment = Assignment { column: col_name col, value: encode_value val }
+      let UpdateStep run_rest = resume ()
+      run_rest ({ state |
+        assignments: List.append state.assignments [assignment],
+      })
+    })
+  }
+
+  where_ expr = {
+    UpdateStep (fun state -> {
+      let UpdateStep run_rest = resume ()
+      run_rest ({ state | wheres: List.append state.wheres [expr] })
+    })
+  }
+
+  return value = UpdateStep (fun state -> (value, state))
+}
+
+# --- Rendering ---
+
+record Rendered {
+  sql: String,
+  params: List Value,
+  next: Int,
+}
+
+fun render_parts : List SqlPart -> Rendered -> Rendered
+render_parts parts acc = case parts {
+  [] -> acc
+  Text text :: rest -> render_parts rest ({ acc | sql: acc.sql <> text })
+  Param value :: rest ->
+    render_parts rest ({ acc |
+      sql: acc.sql <> "$" <> show acc.next,
+      params: List.append acc.params [value],
+      next: acc.next + 1,
+    })
+}
+
+fun finish : List SqlPart -> Prepared Unit
+finish parts = {
+  let rendered = render_parts parts (Rendered { sql: "", params: [], next: 1 })
+  Prepared {
+    sql: rendered.sql,
+    params: rendered.params,
+    decode: fun _ -> Ok (),
+  }
+}
+
+fun where_parts : List Expr -> List SqlPart
+where_parts wheres = case wheres {
+  [] -> []
+  _ -> {
+    let frag = expr_frag (and_ wheres)
+    List.append [Text " WHERE "] frag.parts
+  }
+}
+
+fun one_assignment : Assignment -> List SqlPart
+one_assignment assignment = {
+  let name = assignment.column
+  let value = assignment.value
+  [Text (name <> " = "), Param value]
+}
+
+fun assignment_parts : List Assignment -> List SqlPart
+assignment_parts assignments = case assignments {
+  [] -> []
+  [assignment] -> one_assignment assignment
+  assignment :: rest -> {
+    let head = List.append (one_assignment assignment) [Text ", "]
+    let tail = assignment_parts rest
+    List.append head tail
+  }
+}
+
+# --- Operations ---
+
+#@ Build an UPDATE statement. Columns are referenced through the callback's
+#@ column record; `set!`/`where_!` describe the assignments and row filter.
+pub fun update : Table cols -> (cols -> Unit needs {Update}) -> Prepared Unit
+update table_value build = {
+  let alias = table_name table_value
+  let cols = table_cols alias table_value
+  let UpdateStep run = (build cols) with collect_update
+  let (_result, state) = run empty_update_state
+  let prefix = [Text ("UPDATE " <> table_name table_value <> " SET ")]
+  let head = List.append prefix (assignment_parts state.assignments)
+  let parts = List.append head (where_parts state.wheres)
+  finish parts
+}
+
+#@ Build a DELETE statement. The predicate callback receives the table's columns.
+pub fun delete : Table cols -> (cols -> Expr) -> Prepared Unit
+delete table_value predicate = {
+  let alias = table_name table_value
+  let cols = table_cols alias table_value
+  let pred = predicate cols
+  let prefix = [Text ("DELETE FROM " <> table_name table_value)]
+  let parts = List.append prefix (where_parts [pred])
+  finish parts
+}
+
+#@ Execute a non-returning DML statement and return the number of affected rows.
+#@ For statements with `RETURNING`, decode rows with `Query.all` / `Query.one`
+#@ instead.
+pub fun exec : Connection -> Prepared a -> Result Int DbError needs {Repo}
+exec conn prepared = case execute! conn prepared {
+  Ok returned -> Ok returned.count
+  Err err -> Err (QueryFailed err)
+}
