@@ -11,6 +11,12 @@ import Kraken.Db (
   InsertRow,
   Insertable,
   ColumnSet,
+  Selectable,
+  Projection,
+  SelectItem,
+  select,
+  projection_selections,
+  decode_projection,
   primary_key_columns,
   encode_value,
   col_name,
@@ -20,6 +26,7 @@ import Kraken.Db (
   and_
 )
 import Kraken.Db.Query (Prepared, DbError, QueryFailed, Repo)
+import Std.Generic (Generic)
 import SagaPgo (Connection)
 import SagaPgo.Types (Value)
 
@@ -101,6 +108,36 @@ finish parts = {
   }
 }
 
+# Render a projection's selection list as the body of a RETURNING clause. Decoding
+# is positional, so the column aliases are dropped — only the column expressions
+# matter.
+fun returning_parts : List SelectItem -> List SqlPart
+returning_parts items = case items {
+  [] -> [Text "*"]
+  [item] -> { let frag = item.expr; frag.parts }
+  item :: rest -> {
+    let frag = item.expr
+    let head = List.append frag.parts [Text ", "]
+    let tail = returning_parts rest
+    List.append head tail
+  }
+}
+
+# Append `RETURNING <projection>` to a statement body and decode rows through the
+# projection, yielding a `Prepared row` runnable by `Query.all` / `Query.one`.
+fun finish_returning : List SqlPart -> Projection a -> Prepared a
+finish_returning body projection = {
+  let returning = returning_parts (projection_selections projection)
+  let clause = List.append [Text " RETURNING "] returning
+  let parts = List.append body clause
+  let rendered = render_parts parts (Rendered { sql: "", params: [], next: 1 })
+  Prepared {
+    sql: rendered.sql,
+    params: rendered.params,
+    decode: decode_projection projection,
+  }
+}
+
 fun where_parts : List Expr -> List SqlPart
 where_parts wheres = case wheres {
   [] -> []
@@ -148,6 +185,17 @@ value_placeholder_parts vals = case vals {
 
 # --- Operations ---
 
+fun insert_parts : Table cols -> List (String, Value) -> List SqlPart
+insert_parts table_value pairs = {
+  let names = List.map (fun pair -> { let (name, _v) = pair; name }) pairs
+  let vals = List.map (fun pair -> { let (_n, v) = pair; v }) pairs
+  let header = "INSERT INTO " <> table_name table_value <> " (" <> comma_join names <> ") VALUES ("
+  let prefix = [Text header]
+  let mid = value_placeholder_parts vals
+  let tail = List.append mid [Text ")"]
+  List.append prefix tail
+}
+
 #@ Build an INSERT statement from a dedicated insert record. The input must be a
 #@ named type deriving `Db.InsertRow` (anonymous records are rejected, so a typo'd
 #@ or wrong-typed field fails to typecheck against that type). Column names come
@@ -155,30 +203,66 @@ value_placeholder_parts vals = case vals {
 #@ rest (e.g. DB-generated ones).
 pub fun insert : Table cols -> ins -> Prepared Unit
   where {cols: Insertable ins, ins: InsertRow}
-insert table_value value = {
-  let pairs = insert_row value
-  let names = List.map (fun pair -> { let (name, _v) = pair; name }) pairs
-  let vals = List.map (fun pair -> { let (_n, v) = pair; v }) pairs
-  let header = "INSERT INTO " <> table_name table_value <> " (" <> comma_join names <> ") VALUES ("
-  let prefix = [Text header]
-  let mid = value_placeholder_parts vals
-  let tail = List.append mid [Text ")"]
-  let parts = List.append prefix tail
-  finish parts
+insert table_value value = finish (insert_parts table_value (insert_row value))
+
+#@ Like `insert`, but appends a `RETURNING` clause built from the projection
+#@ callback (the table's columns are passed in, exactly like `select!`). The result
+#@ is a `Prepared row`; run it with `Query.one` (single insert) or `Query.all`.
+pub fun insert_returning : Table cols -> ins -> (cols -> selection) -> Prepared row
+  where {
+    cols: Insertable ins,
+    ins: InsertRow,
+    selection: Generic selection_rep,
+    selection_rep: Selectable row_rep,
+    row: Generic row_rep,
+  }
+insert_returning table_value value project = {
+  let body = insert_parts table_value (insert_row value)
+  let alias = table_name table_value
+  let cols = table_cols alias table_value
+  let projection = select (project cols)
+  finish_returning body projection
+}
+
+fun update_body : Table cols -> UpdateState -> List SqlPart
+update_body table_value state = {
+  let prefix = [Text ("UPDATE " <> table_name table_value <> " SET ")]
+  let head = List.append prefix (assignment_parts state.assignments)
+  List.append head (where_parts state.wheres)
+}
+
+fun run_update : Table cols -> (cols -> Unit needs {Update}) -> (cols, UpdateState)
+run_update table_value build = {
+  let alias = table_name table_value
+  let cols = table_cols alias table_value
+  let UpdateStep run = (build cols) with collect_update
+  let (_result, state) = run empty_update_state
+  (cols, state)
 }
 
 #@ Build an UPDATE statement. Columns are referenced through the callback's
 #@ column record; `set!`/`where_!` describe the assignments and row filter.
 pub fun update : Table cols -> (cols -> Unit needs {Update}) -> Prepared Unit
 update table_value build = {
-  let alias = table_name table_value
-  let cols = table_cols alias table_value
-  let UpdateStep run = (build cols) with collect_update
-  let (_result, state) = run empty_update_state
-  let prefix = [Text ("UPDATE " <> table_name table_value <> " SET ")]
-  let head = List.append prefix (assignment_parts state.assignments)
-  let parts = List.append head (where_parts state.wheres)
-  finish parts
+  let (_cols, state) = run_update table_value build
+  finish (update_body table_value state)
+}
+
+#@ Like `update`, but appends a `RETURNING` clause built from the projection
+#@ callback. Returns a `Prepared row`; run it with `Query.all` / `Query.one`.
+pub fun update_returning : Table cols
+  -> (cols -> Unit needs {Update})
+  -> (cols -> selection)
+  -> Prepared row
+  where {
+    selection: Generic selection_rep,
+    selection_rep: Selectable row_rep,
+    row: Generic row_rep,
+  }
+update_returning table_value build project = {
+  let (cols, state) = run_update table_value build
+  let projection = select (project cols)
+  finish_returning (update_body table_value state) projection
 }
 
 fun contains_name : List String -> String -> Bool
@@ -234,9 +318,11 @@ key_where_parts pairs = case pairs {
 #@ Save a whole entity: `UPDATE <table> SET <every non-key column> WHERE <pk>`.
 #@ The entity is the domain record as-is (read → modify → save, no conversion);
 #@ the key columns come from the table's `primary_key` and form the `WHERE`, the
-#@ rest become the `SET`.
+#@ rest become the `SET`. The `Selectable cols row` constraint ties the accepted
+#@ entity to the table's own domain type (the same `cols -> row` link the read
+#@ path uses), so you cannot pass an unrelated record.
 pub fun update_all : Table cols -> row -> Prepared Unit
-  where {cols: ColumnSet, row: InsertRow}
+  where {cols: ColumnSet + Selectable row, row: InsertRow}
 update_all table_value entity = {
   let alias = table_name table_value
   let cols = table_cols alias table_value
@@ -251,15 +337,36 @@ update_all table_value entity = {
   finish parts
 }
 
+fun delete_body : Table cols -> Expr -> List SqlPart
+delete_body table_value pred = {
+  let prefix = [Text ("DELETE FROM " <> table_name table_value)]
+  List.append prefix (where_parts [pred])
+}
+
 #@ Build a DELETE statement. The predicate callback receives the table's columns.
 pub fun delete : Table cols -> (cols -> Expr) -> Prepared Unit
 delete table_value predicate = {
   let alias = table_name table_value
   let cols = table_cols alias table_value
-  let pred = predicate cols
-  let prefix = [Text ("DELETE FROM " <> table_name table_value)]
-  let parts = List.append prefix (where_parts [pred])
-  finish parts
+  finish (delete_body table_value (predicate cols))
+}
+
+#@ Like `delete`, but appends a `RETURNING` clause built from the projection
+#@ callback. Returns a `Prepared row`; run it with `Query.all` / `Query.one`.
+pub fun delete_returning : Table cols
+  -> (cols -> Expr)
+  -> (cols -> selection)
+  -> Prepared row
+  where {
+    selection: Generic selection_rep,
+    selection_rep: Selectable row_rep,
+    row: Generic row_rep,
+  }
+delete_returning table_value predicate project = {
+  let alias = table_name table_value
+  let cols = table_cols alias table_value
+  let projection = select (project cols)
+  finish_returning (delete_body table_value (predicate cols)) projection
 }
 
 #@ Execute a non-returning DML statement and return the number of affected rows.

@@ -4,6 +4,7 @@ import Kraken.Db
 import Kraken.Db.Dml
 import Kraken.Db.Dml (Update)
 import Kraken.Db.Query (Prepared, Repo, DbError)
+import Kraken.Db.Query as Query
 import Read (users, User, UsersInsert)
 import SagaPgo (Connection)
 
@@ -11,6 +12,31 @@ import SagaPgo (Connection)
 pub fun insert_user_query : Unit -> Prepared Unit
 insert_user_query () =
   Dml.insert users (UsersInsert { id: Db.auto, name: "Carol", age: 31 })
+
+# INSERT ... RETURNING the whole inserted row, decoded back into the domain type.
+pub fun insert_user_returning : Unit -> Prepared User
+insert_user_returning () = {
+  let row = UsersInsert { id: Db.auto, name: "Carol", age: 31 }
+  Dml.insert_returning users row (fun u -> u)
+}
+
+# INSERT ... RETURNING just the generated id (the common "get my new id" case).
+pub fun insert_user_returning_id : Unit -> Prepared { id: Int }
+insert_user_returning_id () = {
+  let row = UsersInsert { id: Db.auto, name: "Carol", age: 31 }
+  Dml.insert_returning users row (fun u -> { id: u.id })
+}
+
+# UPDATE ... RETURNING the updated row.
+pub fun bump_age_returning : Unit -> Prepared User
+bump_age_returning () = Dml.update_returning users (fun u -> {
+  set! u.age 43
+  where_! (Db.eq u.id 1)
+}) (fun u -> u)
+
+# Run an INSERT ... RETURNING and decode the single row back.
+pub fun run_insert_returning : Connection -> Result (Maybe User) DbError needs {Repo}
+run_insert_returning conn = Query.one conn (insert_user_returning ())
 
 # Surgical UPDATE: only the columns that change.
 pub fun bump_age_query : Unit -> Prepared Unit

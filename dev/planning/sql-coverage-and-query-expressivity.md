@@ -866,9 +866,23 @@ because `List` is also a type, so a parenthesized `List.append` reads as a
 qualified type; and multi-line function application with args on following lines
 leaves the function unapplied. Both are avoided by binding intermediate `let`s.)
 
-Remaining in Tier 7: `RETURNING` (insert/update returning rows, via the
-`Selectable` decode path), and `ON CONFLICT` upsert. (Transactions are Tier 8 —
-pgo already exposes a `Transaction` effect to build on.)
+**`update_all` schema-tied** (done 2026-06-19): the accepted entity type is now
+pinned to the table via the read path's own `Selectable cols row | cols -> row`
+link (`where {cols: ColumnSet + Selectable row, row: InsertRow}`), so passing an
+unrelated record is a compile error (`no impl of Selectable for <Table>`). No new
+trait — it reuses the same `cols -> row` fundep that `select`/`all` rely on.
+
+**`RETURNING`** (done 2026-06-19): `insert_returning` / `update_returning` /
+`delete_returning` take a projection callback over the table's columns (exactly
+like `select!`) and return a `Prepared row`, runnable with `Query.all` /
+`Query.one`. Implemented by reusing `Db.select` to build the `Projection`,
+rendering its selection frags as the RETURNING list (positional decode, so aliases
+are dropped), and setting `Prepared.decode = decode_projection`. E.g.
+`INSERT INTO users (name, age) VALUES ($1, $2) RETURNING users.id` decoded into
+`{ id: Int }`, or `(fun u -> u)` to get the whole row back as the domain type.
+
+Remaining in Tier 7: `ON CONFLICT` upsert. (Transactions are Tier 8 — pgo already
+exposes a `Transaction` effect to build on.)
 
 ### Worked design
 

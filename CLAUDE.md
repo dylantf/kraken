@@ -154,8 +154,13 @@ compiler's generic `synthesizes via <FieldMap> deriving (...)` trait mechanism,
 driven by Kraken's `InsertField` rewrite map: `Col a → a`, `Generated a →
 Writable a` — and `deriving (Db.InsertRow)` is attached for encoding), `update`
 (partial, `set!`/`where_!`), `update_all` (whole-entity save keyed by
-`primary_key`), `delete`, and `exec` (affected-row count). Schema columns the DB
-fills are marked `Db.Generated a` (reads like a column, unsettable via `set!`).
-The roadmap (in the planning doc) prioritizes `RETURNING`, `ON CONFLICT`, and
-transactions next. When extending SQL coverage, prefer growing the
-typed `Sql a` expression model over adding one-off APIs.
+`primary_key`, with the accepted entity type tied to the table via the read
+path's `Selectable cols row | cols -> row` link), `delete`, and `exec`
+(affected-row count). `insert`/`update`/`delete` each have a `*_returning`
+variant: they take a projection callback over the table's columns (like
+`select!`), append `RETURNING`, and yield a `Prepared row` runnable with
+`Query.all`/`Query.one` — reusing the read path's `Selectable`/`Projection`
+decode. Schema columns the DB fills are marked `Db.Generated a` (reads like a
+column, unsettable via `set!`). The roadmap (in the planning doc) prioritizes
+`ON CONFLICT` and transactions next. When extending SQL coverage, prefer growing
+the typed `Sql a` expression model over adding one-off APIs.
