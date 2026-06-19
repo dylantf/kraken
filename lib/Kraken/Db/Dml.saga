@@ -14,10 +14,12 @@ import Kraken.Db (
   Selectable,
   Projection,
   SelectItem,
+  ColRef,
   select,
   projection_selections,
   decode_projection,
   primary_key_columns,
+  ref_name,
   encode_value,
   col_name,
   expr_frag,
@@ -222,6 +224,139 @@ insert_returning table_value value project = {
   let cols = table_cols alias table_value
   let projection = select (project cols)
   finish_returning body projection
+}
+
+# --- ON CONFLICT (upsert) ---
+
+fun conflict_target_parts : List String -> List SqlPart
+conflict_target_parts names =
+  [Text (" ON CONFLICT (" <> comma_join names <> ")")]
+
+# `name = EXCLUDED.name` for each column, comma-joined — the standard upsert SET
+# that overwrites the conflicting row with the values from this insert.
+fun excluded_set_parts : List String -> List SqlPart
+excluded_set_parts names = case names {
+  [] -> []
+  [name] -> [Text (name <> " = EXCLUDED." <> name)]
+  name :: rest -> {
+    let head = [Text (name <> " = EXCLUDED." <> name <> ", ")]
+    List.append head (excluded_set_parts rest)
+  }
+}
+
+# Drop every name in `remove` from `names`, preserving order.
+fun drop_names : List String -> List String -> List String
+drop_names remove names = case names {
+  [] -> []
+  name :: rest ->
+    if contains_name remove name then drop_names remove rest
+    else name :: drop_names remove rest
+}
+
+fun conflict_update_parts : List String -> List String -> List SqlPart
+conflict_update_parts target_names set_names = case set_names {
+  [] -> panic "Dml.upsert: conflict target covers every inserted column; nothing to update (use insert_on_conflict_do_nothing)"
+  _ -> {
+    let target = conflict_target_parts target_names
+    let head = List.append target [Text " DO UPDATE SET "]
+    List.append head (excluded_set_parts set_names)
+  }
+}
+
+# Full `INSERT ... ON CONFLICT (<target>) DO NOTHING` statement parts.
+fun do_nothing_parts : Table cols -> List (String, Value) -> List String -> List SqlPart
+do_nothing_parts table_value pairs target_names = {
+  let body = insert_parts table_value pairs
+  let conflict = List.append (conflict_target_parts target_names) [Text " DO NOTHING"]
+  List.append body conflict
+}
+
+# Full `INSERT ... ON CONFLICT (<target>) DO UPDATE SET <rest> = EXCLUDED.<rest>`.
+fun upsert_parts : Table cols -> List (String, Value) -> List String -> List SqlPart
+upsert_parts table_value pairs target_names = {
+  let body = insert_parts table_value pairs
+  let inserted_names = List.map (fun pair -> { let (name, _v) = pair; name }) pairs
+  let set_names = drop_names target_names inserted_names
+  let conflict = conflict_update_parts target_names set_names
+  List.append body conflict
+}
+
+fun target_names_of : Table cols -> (cols -> List ColRef) -> List String
+target_names_of table_value target = {
+  let alias = table_name table_value
+  let cols = table_cols alias table_value
+  List.map ref_name (target cols)
+}
+
+#@ `INSERT ... ON CONFLICT (<target>) DO NOTHING` — insert the row unless it would
+#@ collide on the target columns, in which case skip it silently. The target
+#@ callback names the conflict columns with `Db.ref` (e.g. `fun u -> [Db.ref u.email]`).
+pub fun insert_on_conflict_do_nothing : Table cols
+  -> ins
+  -> (cols -> List ColRef)
+  -> Prepared Unit
+  where {cols: Insertable ins, ins: InsertRow}
+insert_on_conflict_do_nothing table_value value target = {
+  let target_names = target_names_of table_value target
+  finish (do_nothing_parts table_value (insert_row value) target_names)
+}
+
+#@ Upsert: `INSERT ... ON CONFLICT (<target>) DO UPDATE SET <rest> = EXCLUDED.<rest>`.
+#@ On a collision on the target columns, overwrite every *other* inserted column
+#@ with the value from this insert. The target callback names the conflict columns
+#@ with `Db.ref`. Panics at build time if the target covers every inserted column
+#@ (nothing left to update — use `insert_on_conflict_do_nothing`).
+pub fun upsert : Table cols -> ins -> (cols -> List ColRef) -> Prepared Unit
+  where {cols: Insertable ins, ins: InsertRow}
+upsert table_value value target = {
+  let target_names = target_names_of table_value target
+  finish (upsert_parts table_value (insert_row value) target_names)
+}
+
+#@ Like `insert_on_conflict_do_nothing`, but appends a `RETURNING` clause. Note a
+#@ skipped (conflicting) row produces *no* returned row, so `Query.one` yields
+#@ `Ok Nothing` on conflict.
+pub fun insert_on_conflict_do_nothing_returning : Table cols
+  -> ins
+  -> (cols -> List ColRef)
+  -> (cols -> selection)
+  -> Prepared row
+  where {
+    cols: Insertable ins,
+    ins: InsertRow,
+    selection: Generic selection_rep,
+    selection_rep: Selectable row_rep,
+    row: Generic row_rep,
+  }
+insert_on_conflict_do_nothing_returning table_value value target project = {
+  let alias = table_name table_value
+  let cols = table_cols alias table_value
+  let target_names = List.map ref_name (target cols)
+  let body = do_nothing_parts table_value (insert_row value) target_names
+  finish_returning body (select (project cols))
+}
+
+#@ Like `upsert`, but appends a `RETURNING` clause built from the projection
+#@ callback. Both the inserted and the updated row are returned, so `Query.one`
+#@ always yields the resulting row.
+pub fun upsert_returning : Table cols
+  -> ins
+  -> (cols -> List ColRef)
+  -> (cols -> selection)
+  -> Prepared row
+  where {
+    cols: Insertable ins,
+    ins: InsertRow,
+    selection: Generic selection_rep,
+    selection_rep: Selectable row_rep,
+    row: Generic row_rep,
+  }
+upsert_returning table_value value target project = {
+  let alias = table_name table_value
+  let cols = table_cols alias table_value
+  let target_names = List.map ref_name (target cols)
+  let body = upsert_parts table_value (insert_row value) target_names
+  finish_returning body (select (project cols))
 }
 
 fun update_body : Table cols -> UpdateState -> List SqlPart

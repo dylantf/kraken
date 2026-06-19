@@ -143,6 +143,12 @@ future derive, but that needs compiler support).
   (good for `Selectable`/`Projection`, which *produces* a row; not for an encoder
   that *consumes* one). Encode by folding the domain record's Generic rep via a
   derivable single-param trait (`InsertRow`), mirroring saga_json's `ToJson`.
+- **`fun u -> u.field` can report "ambiguous field"** when the column-record type
+  isn't pinned and `field` also exists on other in-scope records (e.g. the domain
+  + synthesized insert records). It bites a callback whose `cols` type is inferred
+  late — notably a DML op taking *two* column-record callbacks (a conflict target
+  + a projection). Lambda param annotations don't parse and a typed `let` flows too
+  late. Workaround: use a whole-row projection (`fun u -> u`), which pins `cols`.
 
 ## Status
 
@@ -160,7 +166,11 @@ path's `Selectable cols row | cols -> row` link), `delete`, and `exec`
 variant: they take a projection callback over the table's columns (like
 `select!`), append `RETURNING`, and yield a `Prepared row` runnable with
 `Query.all`/`Query.one` — reusing the read path's `Selectable`/`Projection`
-decode. Schema columns the DB fills are marked `Db.Generated a` (reads like a
-column, unsettable via `set!`). The roadmap (in the planning doc) prioritizes
-`ON CONFLICT` and transactions next. When extending SQL coverage, prefer growing
-the typed `Sql a` expression model over adding one-off APIs.
+decode. Upserts are covered by `insert_on_conflict_do_nothing` and `upsert`
+(`ON CONFLICT (<target>) DO UPDATE SET … = EXCLUDED.…`), with conflict targets
+named type-safely via `Db.ref`; both have `*_returning` variants that append
+`RETURNING` and decode through the projection. Schema columns the DB fills are marked
+`Db.Generated a` (reads like a column, unsettable via `set!`). The roadmap (in the
+planning doc) prioritizes transactions (Tier 8) next. When extending SQL
+coverage, prefer growing the typed `Sql a` expression model over adding one-off
+APIs.

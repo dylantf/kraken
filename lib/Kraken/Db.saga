@@ -223,6 +223,10 @@ primary_key_columns pk = case pk {
   Composite refs -> List.map col_ref_name refs
 }
 
+#@ The column name a `ColRef` points to (e.g. for an `ON CONFLICT` target).
+pub fun ref_name : ColRef -> String
+ref_name reference = col_ref_name reference
+
 opaque type Col a = Col ColumnInfo
 
 #@ A column the database fills in (SERIAL / identity / `DEFAULT`). Marking a

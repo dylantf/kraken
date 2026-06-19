@@ -881,8 +881,33 @@ are dropped), and setting `Prepared.decode = decode_projection`. E.g.
 `INSERT INTO users (name, age) VALUES ($1, $2) RETURNING users.id` decoded into
 `{ id: Int }`, or `(fun u -> u)` to get the whole row back as the domain type.
 
-Remaining in Tier 7: `ON CONFLICT` upsert. (Transactions are Tier 8 — pgo already
+**`ON CONFLICT` upsert** (done 2026-06-19): two type-safe entry points, conflict
+targets named with `Db.ref` (not raw strings):
+- `insert_on_conflict_do_nothing table row (fun u -> [Db.ref u.email])` →
+  `INSERT … ON CONFLICT (email) DO NOTHING`.
+- `upsert table row (fun u -> [Db.ref u.id])` →
+  `INSERT … ON CONFLICT (id) DO UPDATE SET <every other inserted col> = EXCLUDED.<col>`
+  — the standard "insert or overwrite with my new values" upsert. Panics at build
+  time if the target covers every inserted column (nothing left to update).
+
+`ON CONFLICT` + `RETURNING` (done 2026-06-19): `upsert_returning` and
+`insert_on_conflict_do_nothing_returning` mirror the plain returning ops (a skipped
+DO-NOTHING row returns nothing, so `Query.one` gives `Ok Nothing` on conflict).
+
+Tier 7 is complete. Not yet built (smaller follow-ups): `DO UPDATE` to a chosen
+*subset* of columns or to arbitrary expressions (e.g. `count = users.count + 1`);
+`ON CONSTRAINT <name>` conflict targets. (Transactions are Tier 8 — pgo already
 exposes a `Transaction` effect to build on.)
+
+Inference note worth remembering: a DML op taking *two* column-record callbacks
+(e.g. `*_returning` conflict ops: a conflict-target `(cols -> List ColRef)` and a
+projection `(cols -> selection)`) can fail to pin `cols` early enough, so a bare
+`u.field` in the target lambda reports "ambiguous field" when `field` also exists
+on the domain/insert records in scope. A whole-row projection (`fun u -> u`) pins
+`cols` strongly enough for both lambdas; an anonymous projection (`fun u -> { … }`)
+may not. Annotating the lambda doesn't help (param annotations don't parse, and a
+typed `let` flows too late for field disambiguation). Workaround: use a whole-row
+projection, or reference the column from a scope where `cols` is already fixed.
 
 ### Worked design
 

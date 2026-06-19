@@ -38,6 +38,40 @@ bump_age_returning () = Dml.update_returning users (fun u -> {
 pub fun run_insert_returning : Connection -> Result (Maybe User) DbError needs {Repo}
 run_insert_returning conn = Query.one conn (insert_user_returning ())
 
+# Upsert: insert, or on a primary-key collision overwrite name/age with the new
+# values. Provides the id so the conflict can actually fire.
+pub fun upsert_user_query : Unit -> Prepared Unit
+upsert_user_query () = {
+  let row = UsersInsert { id: Db.provide 1, name: "Carol", age: 31 }
+  Dml.upsert users row (fun u -> [Db.ref u.id])
+}
+
+# Insert-or-skip: do nothing if a row with this name already exists.
+pub fun insert_user_if_new_query : Unit -> Prepared Unit
+insert_user_if_new_query () = {
+  let row = UsersInsert { id: Db.auto, name: "Carol", age: 31 }
+  Dml.insert_on_conflict_do_nothing users row (fun u -> [Db.ref u.name])
+}
+
+# Upsert and read back the resulting row (inserted or updated).
+pub fun upsert_user_returning : Unit -> Prepared User
+upsert_user_returning () = {
+  let row = UsersInsert { id: Db.provide 1, name: "Carol", age: 31 }
+  Dml.upsert_returning users row (fun u -> [Db.ref u.id]) (fun u -> u)
+}
+
+# Insert-if-new and read back the row (Nothing on conflict, since a skipped row
+# returns nothing).
+pub fun insert_user_if_new_returning : Unit -> Prepared User
+insert_user_if_new_returning () = {
+  let row = UsersInsert { id: Db.auto, name: "Carol", age: 31 }
+  Dml.insert_on_conflict_do_nothing_returning users row (fun u -> [Db.ref u.name]) (fun u -> u)
+}
+
+# Run an upsert-returning and decode the resulting row.
+pub fun run_upsert_returning : Connection -> Result (Maybe User) DbError needs {Repo}
+run_upsert_returning conn = Query.one conn (upsert_user_returning ())
+
 # Surgical UPDATE: only the columns that change.
 pub fun bump_age_query : Unit -> Prepared Unit
 bump_age_query () = Dml.update users (fun u -> {
