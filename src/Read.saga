@@ -13,7 +13,7 @@ pub record User {
   id: Int,
   name: String,
   age: Int,
-}
+} deriving (Db.InsertRow)
 
 pub record Metadata {
   source: String,
@@ -32,13 +32,13 @@ pub record Post {
 # Schema
 
 pub record Users {
-  id: Db.Col Int,
+  id: Db.Generated Int,
   name: Db.Col String,
   age: Db.Col Int,
 } deriving (Db.Selectable User)
 
 pub record Posts {
-  id: Db.Col Int,
+  id: Db.Generated Int,
   author_id: Db.Col Int,
   title: Db.Col String,
   published: Db.Col Bool,
@@ -48,15 +48,16 @@ pub record Posts {
 
 impl Db.ColumnSet for Users {
   columns source = Users {
-    id: Db.col "id" source,
+    id: Db.generated "id" source,
     name: Db.col "name" source,
     age: Db.col "age" source,
   }
+  primary_key u = Db.key u.id
 }
 
 impl Db.ColumnSet for Posts {
   columns source = Posts {
-    id: Db.col "id" source,
+    id: Db.generated "id" source,
     author_id: Db.col "author_id" source,
     title: Db.col "title" source,
     published: Db.col "published" source,

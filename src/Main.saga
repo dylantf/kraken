@@ -29,7 +29,9 @@ main () = {
   println (Read.users_without_posts_query ()).sql
   Read.print_users_without_posts (Read.load_users_without_posts conn with Query.pg_repo)
 
-  println "-- DML: update / delete (rendered SQL) --"
+  println "-- DML: insert / update / update_all / delete (rendered SQL) --"
+  println (Write.insert_user_query ()).sql
   println (Write.bump_age_query ()).sql
+  println (Write.save_user_query (Read.User { id: 1, name: "Alice Updated", age: 31 })).sql
   println (Write.delete_user_query ()).sql
 } with {pg, console}

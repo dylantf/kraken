@@ -135,12 +135,23 @@ future derive, but that needs compiler support).
 - The Erlang FFI uses `@external("erlang", "module", "fun")` annotations; the
   hand-written bridge modules (`kraken_unsafe`, `saga_pgo_bridge`) live in
   Erlang. pgo represents SQL `NULL` as the atom `null`.
+- **Trait methods can't be imported by name** (e.g. `encode_pg`); import the trait
+  and the method comes with it, or expose a plain `pub fun` wrapper.
+- **Single-param trait impls need `for`**: `impl EncodeLeaf for Leaf a where {…}`.
+- **A covariant `deriving`-routed bridge can't build a contravariant encoder** —
+  the applied functional-bridge derive only emits `map from` over the wrapper
+  (good for `Selectable`/`Projection`, which *produces* a row; not for an encoder
+  that *consumes* one). Encode by folding the domain record's Generic rep via a
+  derivable single-param trait (`InsertRow`), mirroring saga_json's `ToJson`.
 
 ## Status
 
 Kraken has a well-rounded **read** path (selects, inner/left joins, where/group/
 having/order/limit/offset, aggregates, arrays, JSONB, raw-SQL escapes) and a
-**minimal write** path (`update`/`delete`/`exec`). The roadmap (in the planning
-doc) prioritizes `insert` + `Insertable` derive, `RETURNING`, and transactions
-next. When extending SQL coverage, prefer growing the typed `Sql a` expression
-model over adding one-off APIs.
+**write** path in `Kraken.Db.Dml`: `insert` (dedicated named insert type deriving
+`Db.InsertRow`), `update` (partial, `set!`/`where_!`), `update_all` (whole-entity
+save keyed by `primary_key`), `delete`, and `exec` (affected-row count). Schema
+columns the DB fills are marked `Db.Generated a` (reads like a column, unsettable
+via `set!`). The roadmap (in the planning doc) prioritizes `RETURNING`, `ON
+CONFLICT`, and transactions next. When extending SQL coverage, prefer growing the
+typed `Sql a` expression model over adding one-off APIs.

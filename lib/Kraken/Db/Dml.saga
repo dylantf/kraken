@@ -8,6 +8,9 @@ import Kraken.Db (
   SqlPart,
   Text,
   Param,
+  InsertRow,
+  ColumnSet,
+  primary_key_columns,
   encode_value,
   col_name,
   expr_frag,
@@ -124,7 +127,43 @@ assignment_parts assignments = case assignments {
   }
 }
 
+fun comma_join : List String -> String
+comma_join names = case names {
+  [] -> ""
+  [name] -> name
+  name :: rest -> name <> ", " <> comma_join rest
+}
+
+fun value_placeholder_parts : List Value -> List SqlPart
+value_placeholder_parts vals = case vals {
+  [] -> []
+  [value] -> [Param value]
+  value :: rest -> {
+    let head = [Param value, Text ", "]
+    let tail = value_placeholder_parts rest
+    List.append head tail
+  }
+}
+
 # --- Operations ---
+
+#@ Build an INSERT statement from a dedicated insert record. The input must be a
+#@ named type deriving `Db.InsertRow` (anonymous records are rejected, so a typo'd
+#@ or wrong-typed field fails to typecheck against that type). Column names come
+#@ from the record's fields; declare the columns you want to set and omit the
+#@ rest (e.g. DB-generated ones).
+pub fun insert : Table cols -> input -> Prepared Unit where {input: InsertRow}
+insert table_value value = {
+  let pairs = insert_row value
+  let names = List.map (fun pair -> { let (name, _v) = pair; name }) pairs
+  let vals = List.map (fun pair -> { let (_n, v) = pair; v }) pairs
+  let header = "INSERT INTO " <> table_name table_value <> " (" <> comma_join names <> ") VALUES ("
+  let prefix = [Text header]
+  let mid = value_placeholder_parts vals
+  let tail = List.append mid [Text ")"]
+  let parts = List.append prefix tail
+  finish parts
+}
 
 #@ Build an UPDATE statement. Columns are referenced through the callback's
 #@ column record; `set!`/`where_!` describe the assignments and row filter.
@@ -137,6 +176,76 @@ update table_value build = {
   let prefix = [Text ("UPDATE " <> table_name table_value <> " SET ")]
   let head = List.append prefix (assignment_parts state.assignments)
   let parts = List.append head (where_parts state.wheres)
+  finish parts
+}
+
+fun contains_name : List String -> String -> Bool
+contains_name names target = case names {
+  [] -> False
+  name :: rest -> if name == target then True else contains_name rest target
+}
+
+# Split (name, value) pairs into (set columns, key columns) by the key names.
+fun partition_by_key : List String
+  -> List (String, Value)
+  -> (List (String, Value), List (String, Value))
+partition_by_key key_names pairs = case pairs {
+  [] -> ([], [])
+  pair :: rest -> {
+    let (set_rest, key_rest) = partition_by_key key_names rest
+    let (name, _value) = pair
+    if contains_name key_names name then (set_rest, pair :: key_rest)
+    else (pair :: set_rest, key_rest)
+  }
+}
+
+fun pair_to_assignment : (String, Value) -> Assignment
+pair_to_assignment pair = {
+  let (name, value) = pair
+  Assignment { column: name, value: value }
+}
+
+fun key_conditions : List (String, Value) -> List SqlPart
+key_conditions pairs = case pairs {
+  [] -> []
+  [pair] -> {
+    let (name, value) = pair
+    [Text (name <> " = "), Param value]
+  }
+  pair :: rest -> {
+    let (name, value) = pair
+    let head = [Text (name <> " = "), Param value, Text " AND "]
+    let tail = key_conditions rest
+    List.append head tail
+  }
+}
+
+fun key_where_parts : List (String, Value) -> List SqlPart
+key_where_parts pairs = case pairs {
+  [] -> panic "Dml.update_all: table has no primary_key (declare one in its ColumnSet impl)"
+  _ -> {
+    let conds = key_conditions pairs
+    List.append [Text " WHERE "] conds
+  }
+}
+
+#@ Save a whole entity: `UPDATE <table> SET <every non-key column> WHERE <pk>`.
+#@ The entity is the domain record as-is (read → modify → save, no conversion);
+#@ the key columns come from the table's `primary_key` and form the `WHERE`, the
+#@ rest become the `SET`.
+pub fun update_all : Table cols -> row -> Prepared Unit
+  where {cols: ColumnSet, row: InsertRow}
+update_all table_value entity = {
+  let alias = table_name table_value
+  let cols = table_cols alias table_value
+  let key_names = primary_key_columns (primary_key cols)
+  let pairs = insert_row entity
+  let (set_pairs, key_pairs) = partition_by_key key_names pairs
+  let set_assignments = List.map pair_to_assignment set_pairs
+  let prefix = [Text ("UPDATE " <> table_name table_value <> " SET ")]
+  let set_parts = assignment_parts set_assignments
+  let head = List.append prefix set_parts
+  let parts = List.append head (key_where_parts key_pairs)
   finish parts
 }
 

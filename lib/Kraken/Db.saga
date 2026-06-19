@@ -158,7 +158,12 @@ opaque type Table cols =
   | Table TableDef
 
 pub trait ColumnSet cols {
+  #@ Build the column record for a given table alias (maps fields to SQL names).
   fun columns : String -> cols
+  #@ The table's primary key, used by `Dml.update_all` to build its `WHERE`.
+  #@ Defaults to `NoKey`; override it for tables you save whole entities into.
+  fun primary_key : cols -> PrimaryKey
+  primary_key _cols = NoKey
 }
 
 record ColumnInfo {
@@ -166,7 +171,66 @@ record ColumnInfo {
   name: String,
 }
 
+#@ An erased column reference (name + source) that drops the value type, so a
+#@ primary key can name columns of differing types.
+opaque type ColRef = ColRef ColumnInfo
+
+#@ A table's primary key, as declared by `ColumnSet.primary_key`.
+pub type PrimaryKey =
+  | NoKey
+  | Key ColRef
+  | Composite (List ColRef)
+
+#@ Columns (`Col` / `Generated`) that can be erased to a `ColRef`.
+pub trait AsColRef c {
+  fun as_col_ref : c -> ColRef
+}
+
+impl AsColRef for Col a {
+  as_col_ref column = case column {
+    Col info -> ColRef info
+  }
+}
+
+impl AsColRef for Generated a {
+  as_col_ref column = case column {
+    Generated info -> ColRef info
+  }
+}
+
+#@ Name a single-column primary key (the common case): `primary_key u = key u.id`.
+pub fun key : c -> PrimaryKey where {c: AsColRef}
+key column = Key (as_col_ref column)
+
+#@ Erase a column to a `ColRef`, for assembling a composite key.
+pub fun ref : c -> ColRef where {c: AsColRef}
+ref column = as_col_ref column
+
+#@ Name a composite (multi-column) primary key.
+pub fun composite : List ColRef -> PrimaryKey
+composite refs = Composite refs
+
+fun col_ref_name : ColRef -> String
+col_ref_name reference = case reference {
+  ColRef info -> info.name
+}
+
+#@ The primary key's column names in order (empty for `NoKey`).
+pub fun primary_key_columns : PrimaryKey -> List String
+primary_key_columns pk = case pk {
+  NoKey -> []
+  Key reference -> [col_ref_name reference]
+  Composite refs -> List.map col_ref_name refs
+}
+
 opaque type Col a = Col ColumnInfo
+
+#@ A column the database fills in (SERIAL / identity / `DEFAULT`). Marking a
+#@ schema column `Generated a` instead of `Col a` keeps it readable and usable in
+#@ predicates exactly like a normal column, but the type prevents it from being
+#@ supplied in an `insert` input — id-omission becomes a type guarantee, not a
+#@ convention.
+opaque type Generated a = Generated ColumnInfo
 
 pub fun table : String -> Table cols where {cols: ColumnSet}
 table name =
@@ -206,6 +270,15 @@ table_cols alias table_value = {
 
 pub fun col : String -> String -> Col a
 col name source = Col (ColumnInfo { source: source, name: name })
+
+#@ Declare a DB-generated column in a `ColumnSet` impl, mirroring `col`.
+pub fun generated : String -> String -> Generated a
+generated name source = Generated (ColumnInfo { source: source, name: name })
+
+fun generated_as_col : Generated a -> Col a
+generated_as_col gen = case gen {
+  Generated info -> Col info
+}
 
 #@ Encode a value into a Postgres bind parameter via its `PgType` instance.
 pub fun encode_value : a -> Value where {a: PgType}
@@ -751,6 +824,11 @@ impl Selectable a for Col a where {a: PgType} {
   to_projection column = field_projection column
 }
 
+# Generated columns read back exactly like normal columns.
+impl Selectable a for Generated a where {a: PgType} {
+  to_projection column = field_projection (generated_as_col column)
+}
+
 # Lifts any selectable scope to its `Maybe` form. Because nullability lives on
 # the scope rather than on individual columns, this single generic instance
 # covers every table's left-joined selection — no per-table impl is needed.
@@ -766,6 +844,11 @@ impl Selectable a for Sql a {
 
 impl ToSql a for Col a where {a: PgType} {
   to_sql column = make_sql (column_frag column)
+}
+
+# Generated columns are usable in predicates / joins / ordering like any column.
+impl ToSql a for Generated a where {a: PgType} {
+  to_sql column = make_sql (column_frag (generated_as_col column))
 }
 
 impl ToSql a for Sql a {
@@ -827,6 +910,59 @@ impl Selectable (Record out) for Record fields
     Record name fields ->
       to_projection fields
       |> map (fun out -> Record name out)
+  }
+}
+
+#@ Encode a single record field's value to a Postgres parameter. Implemented for
+#@ the `Leaf` building block of the Generic representation.
+pub trait EncodeLeaf rep {
+  fun encode_leaf : rep -> Value
+}
+
+impl EncodeLeaf for Leaf a where {a: PgType} {
+  encode_leaf leaf = case leaf {
+    Leaf value -> encode_value value
+  }
+}
+
+#@ Encode a whole record to an ordered list of `(column_name, parameter)` pairs.
+#@ Column names are taken from the record's field labels, in declaration order.
+#@ This is the write-direction counterpart of `Selectable`: derive it on a domain
+#@ record (`deriving (Db.InsertRow)`) and `Dml.insert` uses it to build the column
+#@ list and bound values.
+pub trait InsertRow a {
+  fun insert_row : a -> List (String, Value)
+}
+
+# Field-level walk over the Generic representation, mirroring the `ToJsonFields`
+# split in saga_json.
+trait InsertFields a {
+  fun insert_fields : a -> List (String, Value)
+}
+
+impl InsertRow for Record a where {a: InsertFields} {
+  insert_row rep = case rep {
+    Record _name inner -> insert_fields inner
+  }
+}
+
+impl InsertFields for And l r where {l: InsertFields, r: InsertFields} {
+  insert_fields rep = case rep {
+    And l r -> {
+      let left = insert_fields l
+      let right = insert_fields r
+      List.append left right
+    }
+  }
+}
+
+impl InsertFields for Labeled n a where {n: KnownSymbol, a: EncodeLeaf} {
+  insert_fields rep = case rep {
+    Labeled inner -> {
+      let name = symbol_name (Proxy : Proxy n)
+      let value = encode_leaf inner
+      [(name, value)]
+    }
   }
 }
 

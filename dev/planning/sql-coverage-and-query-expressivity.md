@@ -766,11 +766,85 @@ scope with generated columns.
 
 ### Implementation status (2026-06-19)
 
-Built and compiling in `Kraken.Db.Dml`: **`update`**, **`delete`**, and **`exec`**
-(non-returning, returns affected-row count via `Returned.count`). Demonstrated in
-`src/Write.saga`. Schema column records (`Users`/`Posts`) are now `pub` in
-`src/Read.saga` so the write side can reference their columns; a shared `Schema`
-module is the next cleanup.
+Built and compiling in `Kraken.Db.Dml`: **`insert`** (Rung 1), **`update`**,
+**`delete`**, and **`exec`** (non-returning, returns affected-row count via
+`Returned.count`). Demonstrated in `src/Write.saga`. Schema column records
+(`Users`/`Posts`) are now `pub` in `src/Read.saga` so the write side can reference
+their columns; a shared `Schema` module is the next cleanup.
+
+Rendered SQL (verified by tracing):
+
+```
+INSERT INTO users (name, age) VALUES ($1, $2)              -- ["Carol", 31]
+UPDATE users SET age = $1 WHERE users.id = $2              -- [43, 1]   (set!)
+UPDATE users SET name = $1, age = $2 WHERE id = $3         -- ["Alice Updated", 31, 1]  (update_all)
+DELETE FROM users WHERE users.id = $1                      -- [999]
+```
+
+**`update_all` (whole-entity save) + `primary_key`** (done 2026-06-19): takes the
+domain record as-is, encodes it via `InsertRow`, and partitions the columns by the
+table's primary key — key columns form the `WHERE`, the rest the `SET`. The key is
+declared on the per-table `ColumnSet` impl:
+
+```saga
+impl Db.ColumnSet for Users {
+  columns source = Users { id: Db.generated "id" source, ... }
+  primary_key u = Db.key u.id          -- key : c -> PrimaryKey where {c: AsColRef}
+}
+```
+
+`primary_key : cols -> PrimaryKey` has a **default of `NoKey`**, so tables you
+never `update_all` skip it. `PrimaryKey = NoKey | Key ColRef | Composite (List
+ColRef)`; `key`/`ref`/`composite` build it, and `AsColRef` is implemented for both
+`Col` and `Generated` so a serial PK (`u.id : Generated Int`) works. `update_all`
+on a `NoKey` table panics with a clear message.
+
+**Insert takes a dedicated, named insert type** (`record NewUser { name, age }
+deriving (Db.InsertRow)`), not the domain record and not an anonymous record:
+
+- `insert : Table cols -> input -> Prepared Unit where {input: InsertRow}`.
+- Type safety comes from the named type itself — `NewUser { name: 31 }` fails
+  ("expected String, got Int"), and an anonymous record is rejected outright
+  ("no impl of InsertRow for anonymous record type"). So you can't fat-finger a
+  column type or pass an ad-hoc shape.
+- You declare the columns you set and omit the rest (DB-generated columns, or
+  any with a default). To *force* a normally-generated column (e.g. a specific
+  `created_at`), just include it in your insert type — insert never consults the
+  schema, so it inserts whatever columns the type carries.
+
+**Kraken does not cross-validate the insert type against the schema** (that
+`{name: 31}` started this discussion was a red herring — it only typechecked
+because insert briefly accepted anonymous records). Checking that an *input DTO*
+is well-formed is a separate concern (an input-validation library in the
+`input |> validate |> insert` pipeline), explicitly out of scope here. The
+`validate` step constructs the named insert type; `insert` consumes it.
+
+**`Generated a` marker** (added 2026-06-19): schema columns that the DB fills
+(`id : Db.Generated Int`). It reads and behaves exactly like `Col a` in
+selects/predicates/joins (mirror `Selectable`/`ToSql` instances), and because
+`set`/`value` only accept `Col a`, it also makes generated columns
+**unsettable** in `set!` (can't accidentally update a PK).
+
+**How insert encoding was solved (and why not a mirror derive).** `Insertable`
+cannot be the contravariant write-mirror of `Selectable` via the routed
+functional-bridge derive: `derive_applied_functional_bridge` only ever emits a
+*covariant* bridge (`map from` over the wrapper), which suits `Projection`
+(produces the row) but not an encoder (consumes the row). Instead, insert encoding
+is a **covariant fold over the domain record's Generic representation**, exactly
+mirroring saga_json's `ToJson` / `ToJsonFields` split:
+
+- `InsertRow a` — single-param, **derivable** (`deriving (Db.InsertRow)` on the
+  domain record). The bare derive generates a concrete `impl InsertRow for User`
+  that delegates through `to` to the rep instances (where the rep type expands).
+- `InsertFields` (internal) walks `And` / `Labeled`; `EncodeLeaf` encodes each
+  `Leaf` value via `PgType`. The `Labeled n` node carries the field label, which
+  becomes the column name (Rung 1: column name = field name).
+
+A generic `row_columns_values : row -> … where {row: Generic rep, rep: …}` did
+*not* work — at the call site `rep` unified to the nominal `Rep__User`, which has
+no structural instance. Routing through a derived single-param trait (like
+`ToJson`) is the pattern that resolves, because the generated concrete impl is
+where the rep expands.
 
 The builder is a uniform `!`-effect-operation DSL — `set!` / `where_!` inside the
 `update` closure:
@@ -792,8 +866,9 @@ because `List` is also a type, so a parenthesized `List.append` reads as a
 qualified type; and multi-line function application with args on following lines
 leaves the function unapplied. Both are avoided by binding intermediate `let`s.)
 
-Remaining in Tier 7: `insert` + `Insertable` derive, `update_all`, the
-`Generated` marker + `Schema` trait + `primary_key`, and `RETURNING`.
+Remaining in Tier 7: `RETURNING` (insert/update returning rows, via the
+`Selectable` decode path), and `ON CONFLICT` upsert. (Transactions are Tier 8 —
+pgo already exposes a `Transaction` effect to build on.)
 
 ### Worked design
 
