@@ -84,6 +84,14 @@ users_query () = Query.query (fun () -> {
   select! ({ id: u.id, name: u.name, age: u.age })
 })
 
+# Cast: render the numeric age as text (`(t0.age)::text`) alongside the id.
+pub fun users_age_text_query : Unit
+  -> Query.Prepared { id: Int, age_text: String }
+users_age_text_query () = Query.query (fun () -> {
+  let u = from! users
+  select! ({ id: u.id, age_text: Db.as_text u.age })
+})
+
 # Whole-row required + a scalar, both from inner joins
 pub fun user_posts_query : Unit -> Query.Prepared { user: User, title: String }
 user_posts_query () = Query.query (fun () -> {

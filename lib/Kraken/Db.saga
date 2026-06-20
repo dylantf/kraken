@@ -113,6 +113,31 @@ impl PgType for Maybe a where {a: PgType} {
   decode_pg = optional decode_pg
 }
 
+#@ A phantom carrier for a (`Star`-kinded) type, so a cast can name its target type
+#@ without having a value of it. (`Std.Base.Proxy` is `Symbol`-kinded only.)
+pub type TypeTag a = TypeTag
+
+#@ The Postgres type name a Saga type casts to (`x::<name>`). Only types you cast
+#@ *to* need an instance.
+pub trait PgTypeName a {
+  fun pg_type_name : TypeTag a -> String
+}
+impl PgTypeName for Int {
+  pg_type_name _ = "integer"
+}
+impl PgTypeName for Float {
+  pg_type_name _ = "double precision"
+}
+impl PgTypeName for String {
+  pg_type_name _ = "text"
+}
+impl PgTypeName for Bool {
+  pg_type_name _ = "boolean"
+}
+impl PgTypeName for T.Uuid {
+  pg_type_name _ = "uuid"
+}
+
 @external("erlang", "kraken_unsafe", "from_dynamic")
 fun unsafe_from_dynamic : Dynamic -> a
 
@@ -569,6 +594,35 @@ value_frag input = sql_frag (to_sql input)
 #@ left-hand value and a rendered subquery.
 pub fun frag_of : input -> SqlFrag where {input: ToSql a}
 frag_of input = value_frag input
+
+#@ A SQL cast: render `(<input>)::<target>` and decode as the target type. The
+#@ result is a first-class `Sql b` usable in `select!` / predicates. This is a
+#@ *typed assertion*, not a checked conversion — you vouch that the cast yields a
+#@ `b` (Postgres validates at runtime, like `raw`); Kraken just renders `::b` and
+#@ decodes accordingly. The target `b` must be annotated or fixed by an `as_*`
+#@ helper, since it isn't determined by the input.
+pub fun cast : input -> Sql b where {input: ToSql a, b: PgType + PgTypeName}
+cast input = {
+  let name = pg_type_name (TypeTag : TypeTag b)
+  let inner = append_frag (raw_frag "(") (append_frag (value_frag input) (raw_frag ")"))
+  make_sql (append_frag inner (raw_frag ("::" <> name)))
+}
+
+#@ `<input>::integer`.
+pub fun as_int : input -> Sql Int where {input: ToSql a}
+as_int input = cast input
+
+#@ `<input>::double precision`.
+pub fun as_float : input -> Sql Float where {input: ToSql a}
+as_float input = cast input
+
+#@ `<input>::text` — e.g. a timestamp or number rendered as a string.
+pub fun as_text : input -> Sql String where {input: ToSql a}
+as_text input = cast input
+
+#@ `<input>::boolean`.
+pub fun as_bool : input -> Sql Bool where {input: ToSql a}
+as_bool input = cast input
 
 fun array_frag : input -> SqlFrag where {input: ToArraySql a}
 array_frag input = sql_frag (to_array_sql input)
