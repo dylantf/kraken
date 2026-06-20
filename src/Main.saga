@@ -19,6 +19,11 @@ main () = {
   println (Read.user_posts_query ()).sql
   println (Read.users_with_optional_posts_query ()).sql
 
+  println "-- dynamic filters: min_age=Just 18, name=Nothing, newest_first --"
+  println (Read.search_users_query (Just 18) Nothing True).sql
+  println "-- dynamic filters: min_age=Nothing, name=Just, oldest_first --"
+  println (Read.search_users_query Nothing (Just "Alice") False).sql
+
   println "-- left join, real matches --"
   Read.print_optional_posts (Read.load_optional_posts conn with Query.pg_repo)
 

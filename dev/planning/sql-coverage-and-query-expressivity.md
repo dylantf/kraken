@@ -1152,6 +1152,57 @@ Resolved design decisions:
 Still open (later refinements): savepoints / nested transactions, isolation-level
 configuration.
 
+## Dynamic queries (ran down 2026-06-20)
+
+Question that came up: are we blocked on building queries whose shape depends on
+runtime values (conditional filters, conditional joins, conditional selects)?
+**Answer: no — and the line is exactly where the type system says it is.** This was
+verified empirically with `saga check`, not reasoned about; the failing cases below
+were compiled and produce the quoted errors.
+
+Because the DSL is **algebraic effects, not a builder monad**, the closure passed
+to `Query.query` is ordinary code — effect ops are ordinary calls. So `if`/`case`/
+`List.iter` compose freely around any op that returns `Unit` and **accumulates**:
+`where_!`, `having!`, `group_by!`, `order_by!`, `limit!`, `offset!`. Multiple
+`where_!`s append and get AND-ed at render, so a runtime-built list of predicates is
+just `List.iter (fun f -> where_! f) filters`. This covers the bulk of real-world
+"dynamic query" needs (optional search filters, conditional ordering/pagination).
+Worked demo: `search_users_query : Maybe Int -> Maybe String -> Bool -> …` in
+`src/Read.saga` — green.
+
+```saga
+case min_age {
+  Just n  -> where_! (Db.gt u.age n)   # filter only when present
+  Nothing -> ()
+}
+if newest_first then order_by! [Db.desc u.id] else order_by! [Db.asc u.id]
+```
+
+Two things genuinely **don't** work — and both are caught at typecheck, not runtime:
+
+- **Conditional `select!` shape.** `select!` infers `row`, which is the function's
+  `Prepared row` return type. Two branches selecting different columns don't unify:
+  ```
+  type mismatch: expected { id: Generated Int, name: Col String },
+                 got { age: Col Int, id: Generated Int }
+  ```
+  This is the direct cost of static row inference. Escape: select the superset, or
+  drop to a raw query for that case.
+- **Conditional `join!` that binds a downstream scope.** `let p = if flag then
+  inner_join! posts (…) else ()` fails because the `if` branches must agree:
+  ```
+  type mismatch: expected Posts, got Unit
+  ```
+  The JOIN *clause* can be conditional, but a bound column scope can't be. Outs: if
+  the join only feeds a filter, make it a conditional `where_! (Query.exists (…))`
+  / `in_subquery` (those nest cleanly and add nothing to the row type); otherwise
+  you're back to the superset/raw escape.
+
+Net: **filters, ordering, grouping, pagination → fully dynamic; output shape and
+bound joins → static by design.** There are no silent footguns — an inconsistent
+dynamic query is a local type error at the offending branch, never a runtime
+surprise. That tradeoff is the same one that buys the typed result rows.
+
 ## Open Design Questions
 
 ### Should `Sql a` Replace `SelectExpr a`?

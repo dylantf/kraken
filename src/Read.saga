@@ -92,6 +92,24 @@ users_age_text_query () = Query.query (fun () -> {
   select! ({ id: u.id, age_text: Db.as_text u.age })
 })
 
+# SPIKE: dynamic query — optional filters chosen at runtime. The closure is
+# ordinary code, so `if`/`else` and `List.iter` over effect ops just compose.
+pub fun search_users_query : Maybe Int -> Maybe String -> Bool
+  -> Query.Prepared { id: Int, name: String, age: Int }
+search_users_query min_age name_like newest_first = Query.query (fun () -> {
+  let u = from! users
+  case min_age {
+    Just n -> where_! (Db.gt u.age n)
+    Nothing -> ()
+  }
+  case name_like {
+    Just pat -> where_! (Db.eq u.name pat)
+    Nothing -> ()
+  }
+  if newest_first then order_by! [Db.desc u.id] else order_by! [Db.asc u.id]
+  select! ({ id: u.id, name: u.name, age: u.age })
+})
+
 # Whole-row required + a scalar, both from inner joins
 pub fun user_posts_query : Unit -> Query.Prepared { user: User, title: String }
 user_posts_query () = Query.query (fun () -> {
