@@ -352,6 +352,12 @@ opaque type Expr = Expr SqlFrag
 fun make_expr : SqlFrag -> Expr
 make_expr frag = Expr frag
 
+#@ Build a boolean `Expr` from a raw fragment. Used by the query layer to wrap a
+#@ rendered subquery (e.g. `EXISTS (…)`) as a predicate; the fragment's `Param`s are
+#@ numbered by the enclosing query at render time.
+pub fun expr_from_frag : SqlFrag -> Expr
+expr_from_frag frag = make_expr frag
+
 pub record SelectItem {
   expr: SqlFrag,
   alias: String,
@@ -406,6 +412,13 @@ project selection =
 pub fun select : selection -> Projection row
   where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 select selection = project selection
+
+#@ The `SelectItem`s a selection renders to, without committing to the decoded row
+#@ type. Used to render a subquery's `SELECT` list (a derived table decodes through
+#@ the *outer* query, so the subquery's own row type is never needed).
+pub fun selection_items : selection -> List SelectItem
+  where {selection: Generic selection_rep, selection_rep: Selectable row_rep}
+selection_items selection = projection_selections (to_projection (to selection))
 
 pub fun into : (row -> out) -> Projection row -> Projection out
 into transform projection = map transform projection
@@ -550,6 +563,12 @@ column_frag (Col info) = raw_frag (info.source <> "." <> info.name)
 
 fun value_frag : input -> SqlFrag where {input: ToSql a}
 value_frag input = sql_frag (to_sql input)
+
+#@ The SQL fragment of any `ToSql` value (a column, raw expression, aggregate, …).
+#@ Exposed so the query layer can build predicates like `IN (subquery)` from a
+#@ left-hand value and a rendered subquery.
+pub fun frag_of : input -> SqlFrag where {input: ToSql a}
+frag_of input = value_frag input
 
 fun array_frag : input -> SqlFrag where {input: ToArraySql a}
 array_frag input = sql_frag (to_array_sql input)
@@ -949,6 +968,69 @@ impl Selectable (Record out) for Record fields
       |> map (fun out -> Record name out)
   }
 }
+
+# --- Derived tables (subquery in FROM) ---
+#
+# A derived table's columns are whatever the subquery selected. `derived_columns`
+# turns the subquery's selection (a record of `Sql`/`Col` values) into a column
+# scope — a record of `Col a` named by each select label and sourced at the derived
+# table's alias — so the outer query can dot into it (`t.total`, `is_null t.id`).
+
+# What a selected value exposes as a derived-table column: always a `Col` of the
+# same element type (the value itself is irrelevant — only its type matters).
+pub trait DerivedField value out | value -> out {}
+impl DerivedField (Col a) for Col a {}
+impl DerivedField (Col a) for Sql a {}
+impl DerivedField (Col a) for Generated a {}
+
+# A selection leaf becomes a `Col` leaf of the same element type, named by its
+# label and sourced at the derived table's alias. (Separate from `DerivedScope` so
+# the `for` head stays a constructor over bare vars, which is all Saga accepts.)
+pub trait DerivedLeaf rep_in rep_out | rep_in -> rep_out {
+  fun derived_leaf : rep_in -> String -> String -> rep_out
+}
+impl DerivedLeaf (Leaf out_col) for Leaf value where {value: DerivedField out_col} {
+  derived_leaf _leaf alias name = Leaf (col name alias)
+}
+
+# Generic walk that rewrites a selection's representation into the column scope's
+# representation, threading the derived table's alias down to each labeled leaf.
+pub trait DerivedScope rep_in rep_out | rep_in -> rep_out {
+  fun build_scope : rep_in -> String -> rep_out
+}
+
+impl DerivedScope (Record out) for Record fields where {fields: DerivedScope out} {
+  build_scope rep alias = case rep {
+    Record name fields -> Record name (build_scope fields alias)
+  }
+}
+
+impl DerivedScope (And lo ro) for And li ri
+  where {li: DerivedScope lo, ri: DerivedScope ro}
+{
+  build_scope rep alias = case rep {
+    And l r -> And (build_scope l alias) (build_scope r alias)
+  }
+}
+
+impl DerivedScope (Labeled n out) for Labeled n field
+  where {n: KnownSymbol, field: DerivedLeaf out}
+{
+  build_scope rep alias = case rep {
+    Labeled inner -> Labeled (derived_leaf inner alias (symbol_name (Proxy : Proxy n)))
+  }
+}
+
+#@ Build a derived-table column scope from the subquery's selection value and the
+#@ alias assigned to the derived table. Each labeled selection becomes a `Col`
+#@ named by its label and qualified by `alias`.
+pub fun derived_columns : selection -> String -> scope
+  where {
+    selection: Generic sel_rep,
+    sel_rep: DerivedScope scope_rep,
+    scope: Generic scope_rep,
+  }
+derived_columns selection alias = from (build_scope (to selection) alias)
 
 #@ Encode one insert column value: `Just param` to bind it, `Nothing` to omit the
 #@ column (let the database supply it). Plain column types always bind; `Writable`

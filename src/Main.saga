@@ -30,6 +30,15 @@ main () = {
   Read.print_users_without_posts (Read.load_users_without_posts conn
     with Query.pg_repo)
 
+  println "-- correlated EXISTS subquery (rendered SQL) --"
+  println (Read.users_with_published_posts_query ()).sql
+
+  println "-- IN (subquery), rendered SQL --"
+  println (Read.users_in_published_query ()).sql
+
+  println "-- derived table (subquery in FROM, rendered SQL) --"
+  println (Read.prolific_authors_query ()).sql
+
   println "-- DML: insert / update / update_all / delete (rendered SQL) --"
   println (Write.insert_user_query ()).sql
   println (Write.bump_age_query ()).sql

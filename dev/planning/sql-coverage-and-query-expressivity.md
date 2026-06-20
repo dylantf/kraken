@@ -731,34 +731,49 @@ Placeholder argument rules:
 
 ## Tier 6: Subqueries
 
-Raw SQL can cover early needs:
+A subquery is a nested `QueryBuild` handler: the builder closure runs under its own
+`collect_query`, and the result is embedded into the outer query as a `SqlFrag`. The
+enabler is that rendering now builds a flat `List SqlPart` and defers `$n` numbering
+to one final pass (`number_parts`) — so a subquery's params are numbered *in
+sequence by the outer query*, no renumbering or placeholder rewriting. Aliases are
+namespaced by a per-scope prefix in `QueryState` (`t` outer, `s` subquery) so a
+correlated subquery never collides with the outer scope.
 
-```saga
-select! ({
-  latest_title: Db.raw "(SELECT title FROM posts ORDER BY id DESC LIMIT 1)" []
-})
-```
+Status:
 
-Typed subqueries split into several features:
+- **`EXISTS` / `NOT EXISTS`** (done) — `Query.exists` / `Query.not_exists` take a
+  builder closure and return an `Expr` for `where_!`. Renders `EXISTS (SELECT 1 …)`;
+  reference outer columns directly inside for correlation.
+- **Derived table / subquery in `FROM`** (done) — `Query.from_subquery` runs the
+  closure, turns its `select!` labels into a column scope (the `DerivedScope` generic
+  walk rewrites `Sql a`/`Col a` → `Col a`, named by label, sourced at the derived
+  alias), and binds it as the FROM source. The outer query dots into it
+  (`t.posts`, `is_null t.id`) with full inference — no annotation (this is what the
+  compiler's `rep -> type` inference fix on 2026-06-20 unblocked).
+- **`IN (subquery)` / `NOT IN (subquery)`** (done) — `Query.in_subquery` /
+  `not_in_subquery`. The subquery closure *returns* the single column to match
+  (no `select!`), and both the left input and that column are `ToSql a`, so their
+  element types must agree (`id IN (subquery of names)` won't compile). Renders
+  `<left> IN (SELECT <col> FROM …)`. (Literal-list `in_` still exists for the
+  in-memory case.)
+- **scalar subquery as `Sql a`** (todo) — the same "closure returns the column"
+  pattern, but wrapping the rendered `SELECT` as a `Sql a` (with the column's
+  decoder) so it can be used in `select!` / comparisons; needs single-row semantics.
+- **CTEs (`WITH`)** (todo).
 
-- scalar subquery as `Sql a`
-- `EXISTS` / `NOT EXISTS`
-- `IN (subquery)` (today `in_` only takes a literal list)
-- derived table / subquery join
-- CTEs (`WITH`)
+Design decisions:
 
-Possible future syntax:
-
-```saga
-where_! (Db.exists (fun () -> {
-  let p = from! posts
-  where_! (Db.eq_col p.author_id u.id)
-  select! ({ one: Db.raw "1" [] })
-}))
-```
-
-Derived tables are a larger design because a subquery needs to become a table
-scope with generated columns.
+- **One FROM per query, enforced.** `from!` / `from_subquery` set a single
+  `from_source`; a second one now panics with a clear message (it used to silently
+  clobber the first). Add more tables with `inner_join!` / `left_join!`.
+- **No comma joins.** `FROM a, b` (old-style cross join filtered in `WHERE`) is
+  strictly redundant with the explicit `inner_join!` / `left_join!` we already have,
+  so it is deliberately not supported.
+- **Alias nesting is one level deep.** Sibling subqueries are fine (each `s0` lives
+  in its own parenthesized SQL scope), but a *correlated subquery nested inside
+  another subquery* reuses the `s` prefix and would be ambiguous. Fixing it means
+  threading a monotonic alias counter through the effect rather than a fixed `t`/`s`
+  prefix — deferred until a real need appears.
 
 ## Tier 7: DML
 

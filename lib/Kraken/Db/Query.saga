@@ -10,6 +10,11 @@ import Kraken.Db (
   Group,
   Projection,
   Selectable,
+  ToSql,
+  frag_of,
+  DerivedScope,
+  derived_columns,
+  selection_items,
   SelectItem,
   SqlFrag,
   SqlPart,
@@ -29,9 +34,23 @@ import SagaPgo (
 import SagaPgo as Pgo
 import SagaPgo.Types (Value)
 
+# A FROM / JOIN source: either a named table or a derived table (a subquery
+# fragment), each bound to an alias.
+type SourceRef =
+  | NamedSource String
+  | SubquerySource SqlFrag
+
 record Source {
-  name: String,
+  ref: SourceRef,
   alias: String,
+}
+
+# A derived table prepared by `from_subquery`: the rendered subquery fragment plus a
+# deferred scope builder (`alias -> column scope`), since the alias is only assigned
+# when the `bind_derived` op threads it through `QueryState`.
+record DerivedTable scope {
+  frag: SqlFrag,
+  make_scope: String -> scope,
 }
 
 type QueryStep a = QueryStep (QueryState -> (a, QueryState))
@@ -56,6 +75,9 @@ record QueryState {
   limit_count: Maybe Int,
   offset_count: Maybe Int,
   next_alias: Int,
+  # Prefix for generated table aliases ("t" for the outer query, "s" for a
+  # subquery) so a correlated subquery's aliases never collide with the outer's.
+  alias_prefix: String,
 }
 
 #@ A compiled query: rendered SQL, its bound parameters, and a decoder that turns
@@ -92,6 +114,10 @@ pub handler pg_repo for Repo needs {Postgres} {
 pub effect QueryBuild {
   #@ Set the query's primary table and bind its columns for use in the body.
   fun from : Table cols -> cols
+  #@ Bind a prepared derived table into `FROM`, assigning its alias and returning
+  #@ the column scope. Use `from_subquery` (which builds the `DerivedTable`) rather
+  #@ than calling this directly.
+  fun bind_derived : DerivedTable scope -> scope
   #@ Inner join a table on the given predicate; returns its (non-null) columns.
   fun inner_join : Table cols -> (cols -> Expr) -> cols
   #@ Left join a table on the given predicate. The predicate callback receives the
@@ -126,16 +152,33 @@ empty_state = QueryState {
   limit_count: Nothing,
   offset_count: Nothing,
   next_alias: 0,
+  alias_prefix: "t",
 }
+
+# A subquery's initial state: a distinct alias prefix so its tables don't collide
+# with the enclosing query's `t0`, `t1`, … (needed for correlated subqueries).
+fun empty_state_sub : QueryState
+empty_state_sub = { empty_state | alias_prefix: "s" }
 
 fun bind_table_source : Table cols -> QueryState -> (Source, QueryState)
 bind_table_source table_value state = {
   let alias = case Core.table_alias table_value {
     Just name -> name
-    Nothing -> "t" <> show state.next_alias
+    Nothing -> state.alias_prefix <> show state.next_alias
   }
-  let source = Source { name: Core.table_name table_value, alias: alias }
+  let source = Source { ref: NamedSource (Core.table_name table_value), alias: alias }
   (source, { state | next_alias: state.next_alias + 1 })
+}
+
+# Set the query's single FROM source, refusing a second one. Two `from!` (or
+# `from!` + `from_subquery`) would otherwise silently clobber the first, leaving its
+# bound columns referencing a table no longer in the query. Add more tables with
+# `inner_join!` / `left_join!` instead.
+fun set_from_source : QueryState -> Source -> QueryState
+set_from_source state source = case state.from_source {
+  Just _ ->
+    panic "Kraken.Query: a query already has a FROM (from! / from_subquery); add more tables with inner_join! or left_join!"
+  Nothing -> { state | from_source: Just source }
 }
 
 handler collect_query for QueryBuild {
@@ -144,7 +187,17 @@ handler collect_query for QueryBuild {
       let (source, state2) = bind_table_source table_value state
       let cols = Core.table_cols source.alias table_value
       let QueryStep run_rest = resume cols
-      run_rest ({ state2 | from_source: Just source })
+      run_rest (set_from_source state2 source)
+    })
+  }
+
+  bind_derived dt = {
+    QueryStep (fun state -> {
+      let alias = state.alias_prefix <> show state.next_alias
+      let source = Source { ref: SubquerySource dt.frag, alias: alias }
+      let scope = dt.make_scope alias
+      let QueryStep run_rest = resume scope
+      run_rest (set_from_source ({ state | next_alias: state.next_alias + 1 }) source)
     })
   }
 
@@ -231,6 +284,38 @@ query make = {
   prepare projection state
 }
 
+#@ Use a subquery as a derived table in `FROM`. The builder closure is the same
+#@ `from!`/`where_!`/`select!` DSL under a nested handler; each `select!` label
+#@ becomes a column of the derived table, returned as a scope you dot into in the
+#@ outer query:
+#@
+#@     let t = from_subquery (fun () -> {
+#@       let p = from! posts
+#@       group_by! [Db.group p.author_id]
+#@       select! ({ author_id: p.author_id, posts: Db.count_star })
+#@     })
+#@     where_! (Db.gt t.posts 5)
+#@     select! ({ author: t.author_id, posts: t.posts })
+#@
+#@ The subquery's params are numbered in sequence by the outer query, and its own
+#@ tables get an `s`-prefixed alias so they never clash with the outer `t`-aliases.
+pub fun from_subquery : (Unit -> selection needs {QueryBuild}) -> scope
+  needs {QueryBuild}
+  where {
+    selection: Generic sel_rep,
+    sel_rep: Selectable row_rep + DerivedScope scope_rep,
+    scope: Generic scope_rep,
+  }
+from_subquery make = {
+  let QueryStep run_sub = make () with collect_query
+  let (selection, sub_state) = run_sub empty_state_sub
+  let frag = select_frag (selection_items selection) sub_state
+  bind_derived! (DerivedTable {
+    frag: frag,
+    make_scope: fun alias -> derived_columns selection alias,
+  })
+}
+
 #@ Map a prepared query's decoded rows through `transform`. The SQL and parameters
 #@ are unchanged; only the decoded result type changes. Useful for turning an
 #@ anonymous projection record into a named domain type.
@@ -245,37 +330,33 @@ into transform prepared = Prepared {
     },
 }
 
+# Rendering builds a flat `List SqlPart` (deferred param numbering); `number_parts`
+# assigns `$1`, `$2`, … in a single final pass. Deferring the numbering is what lets
+# a subquery be embedded as a fragment and have its params numbered in sequence by
+# the enclosing query — no renumbering, no placeholder rewriting.
 record RenderState {
-  sql: String,
-  params: List Value,
-  next_index: Int,
+  parts: List SqlPart,
 }
 
 fun render_text : String -> RenderState -> RenderState
-render_text text state = { state | sql: state.sql <> text }
-
-fun render_param : Value -> RenderState -> RenderState
-render_param value state =
-  { state |
-    sql: state.sql <> "$" <> show state.next_index,
-    params: List.append state.params [value],
-    next_index: state.next_index + 1,
-  }
+render_text text state = { state | parts: List.append state.parts [Text text] }
 
 fun render_frag : SqlFrag -> RenderState -> RenderState
-render_frag frag state = render_parts frag.parts state
+render_frag frag state = { state | parts: List.append state.parts frag.parts }
 
-fun render_parts : List SqlPart -> RenderState -> RenderState
-render_parts parts state = case parts {
-  [] -> state
-  Text text :: rest -> render_parts rest (render_text text state)
-  Param value :: rest -> render_parts rest (render_param value state)
+# Render a source as parts. A named table is `name` (or `name AS alias`); a derived
+# table is `(<subquery fragment>) AS alias`, with the fragment's params left for the
+# enclosing query to number.
+fun render_source_into : Source -> RenderState -> RenderState
+render_source_into source state = case source.ref {
+  NamedSource name ->
+    render_text (if name == source.alias then name else name <> " AS " <> source.alias) state
+  SubquerySource frag ->
+    state
+    |> render_text "("
+    |> render_frag frag
+    |> render_text (") AS " <> source.alias)
 }
-
-fun render_source : Source -> String
-render_source source =
-  if source.name == source.alias then source.name
-  else source.name <> " AS " <> source.alias
 
 fun render_join_kind : JoinKind -> String
 render_join_kind kind = case kind {
@@ -289,11 +370,9 @@ render_expr expr state = render_frag (Core.expr_frag expr) state
 fun render_join : Join -> RenderState -> RenderState
 render_join join state =
   state
-  |> render_text (" "
-    <> render_join_kind join.kind
-    <> " "
-    <> render_source join.source
-    <> " ON ")
+  |> render_text (" " <> render_join_kind join.kind <> " ")
+  |> render_source_into join.source
+  |> render_text " ON "
   |> render_expr join.on
 
 fun render_joins : List Join -> RenderState -> RenderState
@@ -410,31 +489,156 @@ render_offset count state = case count {
   Just n -> render_text (" OFFSET " <> show n) state
 }
 
-fun prepare : Projection a -> QueryState -> Prepared a
-prepare projection state = case state.from_source {
-  Nothing -> panic "Kraken.Query.query: missing from!"
-  Just source -> {
-    let initial = RenderState { sql: "SELECT ", params: [], next_index: 1 }
+# Render everything after the SELECT list: FROM, joins, and the trailing clauses.
+# Shared by the top-level query and subqueries.
+fun render_from_onward : Source -> QueryState -> RenderState -> RenderState
+render_from_onward source state st =
+  st
+  |> render_text " FROM "
+  |> render_source_into source
+  |> render_joins state.joins
+  |> render_wheres state.wheres
+  |> render_groups state.group_bys
+  |> render_havings state.havings
+  |> render_orders state.order_bys
+  |> render_limit state.limit_count
+  |> render_offset state.offset_count
 
-    let rendered =
-      initial
-      |> render_selects (Core.projection_selections projection)
-      |> render_text (" FROM " <> render_source source)
-      |> render_joins state.joins
-      |> render_wheres state.wheres
-      |> render_groups state.group_bys
-      |> render_havings state.havings
-      |> render_orders state.order_bys
-      |> render_limit state.limit_count
-      |> render_offset state.offset_count
-
-    Prepared {
-      sql: rendered.sql,
-      params: rendered.params,
-      decode: Core.decode_projection projection,
-    }
+# Final pass: turn the flat parts into SQL text with `$1`, `$2`, … and the ordered
+# parameter list. Numbering follows part order, so embedded subquery params fall
+# into the right positions automatically.
+fun number_parts : List SqlPart -> Int -> (String, List Value)
+number_parts parts idx = case parts {
+  [] -> ("", [])
+  Text text :: rest -> {
+    let (sql, params) = number_parts rest idx
+    (text <> sql, params)
+  }
+  Param value :: rest -> {
+    let (sql, params) = number_parts rest (idx + 1)
+    ("$" <> show idx <> sql, value :: params)
   }
 }
+
+# Render a full `SELECT <list> FROM …` as a deferred fragment (no `$n` numbering).
+# Used both for the top-level query and for a derived-table subquery.
+fun select_frag : List SelectItem -> QueryState -> SqlFrag
+select_frag items state = case state.from_source {
+  Nothing -> panic "Kraken.Query.query: missing from!"
+  Just source -> {
+    let built =
+      RenderState { parts: [] }
+      |> render_text "SELECT "
+      |> render_selects items
+      |> render_from_onward source state
+    SqlFrag { parts: built.parts }
+  }
+}
+
+fun prepare : Projection a -> QueryState -> Prepared a
+prepare projection state = {
+  let frag = select_frag (Core.projection_selections projection) state
+  let (sql, params) = number_parts frag.parts 1
+  Prepared {
+    sql: sql,
+    params: params,
+    decode: Core.decode_projection projection,
+  }
+}
+
+# Render a subquery body as a deferred fragment (`SELECT 1 FROM … WHERE …`), with
+# its `Param`s left unnumbered so the enclosing query numbers them in sequence.
+fun subquery_frag : QueryState -> SqlFrag
+subquery_frag state = case state.from_source {
+  Nothing -> panic "Kraken.Query: subquery missing from!"
+  Just source -> {
+    let built =
+      RenderState { parts: [] }
+      |> render_text "SELECT 1"
+      |> render_from_onward source state
+    SqlFrag { parts: built.parts }
+  }
+}
+
+# Run a subquery builder closure under its own `collect_query` handler (the nested
+# effect) and render it to a fragment.
+fun build_subquery : (Unit -> a needs {QueryBuild}) -> SqlFrag
+build_subquery make = {
+  let QueryStep run_sub = make () with collect_query
+  let (_value, state) = run_sub empty_state_sub
+  subquery_frag state
+}
+
+fun wrap_subquery : String -> SqlFrag -> Expr
+wrap_subquery keyword body = {
+  let opened = List.append [Text keyword] body.parts
+  let closed = List.append opened [Text ")"]
+  Core.expr_from_frag (SqlFrag { parts: closed })
+}
+
+#@ A correlated `EXISTS (…)` subquery predicate. The builder closure uses the same
+#@ `from!` / `where_!` / … DSL; reference an outer table's columns directly inside it
+#@ for correlation (their aliases are captured at bind time). The subquery's own
+#@ tables get an `s`-prefixed alias so they never clash with the outer `t`-aliases.
+#@
+#@     where_! (Query.exists (fun () -> {
+#@       let p = from! posts
+#@       where_! (Db.eq_col p.author_id u.id)
+#@     }))
+pub fun exists : (Unit -> a needs {QueryBuild}) -> Expr
+exists make = wrap_subquery "EXISTS (" (build_subquery make)
+
+#@ The negation of `exists`: `NOT EXISTS (…)`.
+pub fun not_exists : (Unit -> a needs {QueryBuild}) -> Expr
+not_exists make = wrap_subquery "NOT EXISTS (" (build_subquery make)
+
+# Render a single-column subquery (`SELECT <col> FROM …`) as a deferred fragment.
+# The selected column is the value the builder closure returns, so no `select!` /
+# row machinery is involved.
+fun scalar_select_frag : SqlFrag -> QueryState -> SqlFrag
+scalar_select_frag col_frag state = case state.from_source {
+  Nothing -> panic "Kraken.Query: subquery missing from!"
+  Just source -> {
+    let built =
+      RenderState { parts: [] }
+      |> render_text "SELECT "
+      |> render_frag col_frag
+      |> render_from_onward source state
+    SqlFrag { parts: built.parts }
+  }
+}
+
+# Build `<left> <keyword> (<SELECT col FROM …>)` from the left value and the column
+# the subquery closure returns. `input` and the returned `col` share element type
+# `a`, so a type mismatch (e.g. `id IN (subquery of names)`) fails to compile.
+fun membership : String -> input -> (Unit -> col needs {QueryBuild}) -> Expr
+  where {input: ToSql a, col: ToSql a}
+membership keyword input make = {
+  let QueryStep run_sub = make () with collect_query
+  let (selected, sub_state) = run_sub empty_state_sub
+  let body = scalar_select_frag (frag_of selected) sub_state
+  let left = frag_of input
+  let opened = List.append left.parts (List.append [Text keyword] body.parts)
+  let closed = List.append opened [Text ")"]
+  Core.expr_from_frag (SqlFrag { parts: closed })
+}
+
+#@ `<input> IN (subquery)`. The subquery closure ends by *returning* the single
+#@ column to select (not via `select!`); its element type must match `input`'s:
+#@
+#@     where_! (Query.in_subquery u.id (fun () -> {
+#@       let p = from! posts
+#@       where_! (Db.eq p.published True)
+#@       p.author_id
+#@     }))
+pub fun in_subquery : input -> (Unit -> col needs {QueryBuild}) -> Expr
+  where {input: ToSql a, col: ToSql a}
+in_subquery input make = membership " IN (" input make
+
+#@ The negation of `in_subquery`: `<input> NOT IN (subquery)`.
+pub fun not_in_subquery : input -> (Unit -> col needs {QueryBuild}) -> Expr
+  where {input: ToSql a, col: ToSql a}
+not_in_subquery input make = membership " NOT IN (" input make
 
 #@ Execute a prepared query and return the raw, undecoded rows. Low-level: most
 #@ callers want `all` or `one`, which decode through the `Repo` effect.
