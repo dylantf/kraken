@@ -1220,6 +1220,81 @@ impl InsertFields for Labeled n a where {n: KnownSymbol, a: EncodeLeaf} {
   }
 }
 
+# --- Field-label -> SQL-column-name map (honors `ColumnSet` renames) ---
+#
+# The insert/DML paths emit values keyed by the Saga *field label*, but the actual
+# SQL column name lives in each `Col`/`Generated`'s `ColumnInfo` (set by the
+# `ColumnSet` impl, which may rename — e.g. field `location` -> column
+# `location_name`). Walking a table's column record yields `(field_label,
+# column_name)` pairs, which the DML layer uses to translate labels to real names.
+
+# A single column leaf's declared SQL name.
+trait ColumnNamed c {
+  fun column_named : c -> String
+}
+
+impl ColumnNamed for Col a {
+  column_named column = case column {
+    Col info -> info.name
+  }
+}
+
+impl ColumnNamed for Generated a {
+  column_named column = case column {
+    Generated info -> info.name
+  }
+}
+
+# Unwrap a `Leaf` and read its column name.
+trait ColumnNameLeaf rep {
+  fun column_name_leaf : rep -> String
+}
+
+impl ColumnNameLeaf for Leaf a where {a: ColumnNamed} {
+  column_name_leaf leaf = case leaf {
+    Leaf value -> column_named value
+  }
+}
+
+# Field-level walk over the column record's Generic rep, mirroring `InsertFields`.
+trait ColumnNameFields a {
+  fun column_name_fields : a -> List (String, String)
+}
+
+impl ColumnNameFields for And l r where {l: ColumnNameFields, r: ColumnNameFields} {
+  column_name_fields rep = case rep {
+    And l r -> {
+      let left = column_name_fields l
+      let right = column_name_fields r
+      List.append left right
+    }
+  }
+}
+
+impl ColumnNameFields for Labeled n a where {n: KnownSymbol, a: ColumnNameLeaf} {
+  column_name_fields rep = case rep {
+    Labeled inner -> [(symbol_name (Proxy : Proxy n), column_name_leaf inner)]
+  }
+}
+
+pub trait ColumnNameMap a {
+  fun column_name_map_rep : a -> List (String, String)
+}
+
+impl ColumnNameMap for Record a where {a: ColumnNameFields} {
+  column_name_map_rep rep = case rep {
+    Record _name inner -> column_name_fields inner
+  }
+}
+
+#@ Recover `(field_label, sql_column_name)` pairs from a table's column record,
+#@ honoring `ColumnSet` renames. The DML layer uses this to translate the
+#@ field-labelled output of `insert_row` to real SQL column names. Attach
+#@ `deriving (Db.ColumnNameMap)` to the column record (like `Db.InsertRow` on the
+#@ domain record) to make the bridge available.
+pub fun column_name_map : cols -> List (String, String) where {cols: ColumnNameMap}
+column_name_map cols = column_name_map_rep cols
+
 pub fun asc : input -> Order where {input: ToSql a, a: PgType}
 asc input = Order (OrderItem { expr: value_frag input, direction: "ASC" })
 

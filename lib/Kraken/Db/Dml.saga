@@ -20,6 +20,8 @@ import Kraken.Db (
   decode_projection,
   primary_key_columns,
   ref_name,
+  ColumnNameMap,
+  column_name_map,
   encode_value,
   col_name,
   expr_frag,
@@ -198,28 +200,52 @@ insert_parts table_value pairs = {
   List.append prefix tail
 }
 
+# Resolve an `insert_row`'s field labels to real SQL column names via the table's
+# `ColumnSet`, then keep the bound values. Look up each label in the column-name
+# map; fall back to the label itself if absent (shouldn't happen — the insert
+# record is synthesized from the column record, so every field has a column).
+fun lookup_name : List (String, String) -> String -> String
+lookup_name name_map label = case name_map {
+  [] -> label
+  pair :: rest -> {
+    let (field_label, sql_name) = pair
+    if field_label == label then sql_name else lookup_name rest label
+  }
+}
+
+# The column-name-resolved `(sql_name, value)` pairs for an insert value.
+fun insert_pairs : Table cols -> ins -> List (String, Value)
+  where {ins: InsertRow, cols: ColumnNameMap}
+insert_pairs table_value value = {
+  let name_map = column_name_map (table_cols (table_name table_value) table_value)
+  List.map (fun pair -> {
+    let (label, v) = pair
+    (lookup_name name_map label, v)
+  }) (insert_row value)
+}
+
 #@ Build an INSERT statement from a dedicated insert record. The input must be a
 #@ named type deriving `Db.InsertRow` (anonymous records are rejected, so a typo'd
 #@ or wrong-typed field fails to typecheck against that type). Column names come
 #@ from the record's fields; declare the columns you want to set and omit the
 #@ rest (e.g. DB-generated ones).
 pub fun insert : Table cols -> ins -> Prepared Unit
-  where {cols: Insertable ins, ins: InsertRow}
-insert table_value value = finish (insert_parts table_value (insert_row value))
+  where {cols: Insertable ins + ColumnNameMap, ins: InsertRow}
+insert table_value value = finish (insert_parts table_value (insert_pairs table_value value))
 
 #@ Like `insert`, but appends a `RETURNING` clause built from the projection
 #@ callback (the table's columns are passed in, exactly like `select!`). The result
 #@ is a `Prepared row`; run it with `Query.one` (single insert) or `Query.all`.
 pub fun insert_returning : Table cols -> ins -> (cols -> selection) -> Prepared row
   where {
-    cols: Insertable ins,
+    cols: Insertable ins + ColumnNameMap,
     ins: InsertRow,
     selection: Generic selection_rep,
     selection_rep: Selectable row_rep,
     row: Generic row_rep,
   }
 insert_returning table_value value project = {
-  let body = insert_parts table_value (insert_row value)
+  let body = insert_parts table_value (insert_pairs table_value value)
   let alias = table_name table_value
   let cols = table_cols alias table_value
   let projection = select (project cols)
@@ -295,10 +321,10 @@ pub fun insert_on_conflict_do_nothing : Table cols
   -> ins
   -> (cols -> List ColRef)
   -> Prepared Unit
-  where {cols: Insertable ins, ins: InsertRow}
+  where {cols: Insertable ins + ColumnNameMap, ins: InsertRow}
 insert_on_conflict_do_nothing table_value value target = {
   let target_names = target_names_of table_value target
-  finish (do_nothing_parts table_value (insert_row value) target_names)
+  finish (do_nothing_parts table_value (insert_pairs table_value value) target_names)
 }
 
 #@ Upsert: `INSERT ... ON CONFLICT (<target>) DO UPDATE SET <rest> = EXCLUDED.<rest>`.
@@ -307,10 +333,10 @@ insert_on_conflict_do_nothing table_value value target = {
 #@ with `Db.ref`. Panics at build time if the target covers every inserted column
 #@ (nothing left to update — use `insert_on_conflict_do_nothing`).
 pub fun upsert : Table cols -> ins -> (cols -> List ColRef) -> Prepared Unit
-  where {cols: Insertable ins, ins: InsertRow}
+  where {cols: Insertable ins + ColumnNameMap, ins: InsertRow}
 upsert table_value value target = {
   let target_names = target_names_of table_value target
-  finish (upsert_parts table_value (insert_row value) target_names)
+  finish (upsert_parts table_value (insert_pairs table_value value) target_names)
 }
 
 #@ Like `insert_on_conflict_do_nothing`, but appends a `RETURNING` clause. Note a
@@ -322,7 +348,7 @@ pub fun insert_on_conflict_do_nothing_returning : Table cols
   -> (cols -> selection)
   -> Prepared row
   where {
-    cols: Insertable ins,
+    cols: Insertable ins + ColumnNameMap,
     ins: InsertRow,
     selection: Generic selection_rep,
     selection_rep: Selectable row_rep,
@@ -332,7 +358,7 @@ insert_on_conflict_do_nothing_returning table_value value target project = {
   let alias = table_name table_value
   let cols = table_cols alias table_value
   let target_names = List.map ref_name (target cols)
-  let body = do_nothing_parts table_value (insert_row value) target_names
+  let body = do_nothing_parts table_value (insert_pairs table_value value) target_names
   finish_returning body (select (project cols))
 }
 
@@ -345,7 +371,7 @@ pub fun upsert_returning : Table cols
   -> (cols -> selection)
   -> Prepared row
   where {
-    cols: Insertable ins,
+    cols: Insertable ins + ColumnNameMap,
     ins: InsertRow,
     selection: Generic selection_rep,
     selection_rep: Selectable row_rep,
@@ -355,7 +381,7 @@ upsert_returning table_value value target project = {
   let alias = table_name table_value
   let cols = table_cols alias table_value
   let target_names = List.map ref_name (target cols)
-  let body = upsert_parts table_value (insert_row value) target_names
+  let body = upsert_parts table_value (insert_pairs table_value value) target_names
   finish_returning body (select (project cols))
 }
 
