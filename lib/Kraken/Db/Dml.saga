@@ -29,7 +29,13 @@ import Kraken.Db (
   expr_frag,
   table_name,
   table_cols,
-  and_
+  and_,
+  ConflictTarget,
+  OnColumns,
+  OnConstraint,
+  SetExpr,
+  set_expr_column,
+  set_expr_frag
 )
 import Kraken.Db.Query (Prepared, DbError, QueryFailed, Repo)
 import SagaPgo (Connection)
@@ -524,6 +530,87 @@ upsert_returning table_value value target project = {
   let target_names = List.map ref_name (target cols)
   let body =
     upsert_parts table_value (insert_pairs table_value value) target_names
+  finish_returning body (select (project cols))
+}
+
+# --- ON CONFLICT with a custom DO UPDATE SET (subsets / arbitrary expressions) ---
+
+# Render `ON CONFLICT (cols)` or `ON CONFLICT ON CONSTRAINT name`.
+fun conflict_target_of : ConflictTarget -> List SqlPart
+conflict_target_of target = case target {
+  OnColumns refs -> {
+    let names = List.map ref_name refs
+    conflict_target_parts names
+  }
+  OnConstraint name -> [Text (" ON CONFLICT ON CONSTRAINT " <> name)]
+}
+
+# Render one `column = <expr>` assignment from a `SetExpr`.
+fun one_set_expr : SetExpr -> List SqlPart
+one_set_expr set = {
+  let frag = set_expr_frag set
+  List.append [Text (set_expr_column set <> " = ")] frag.parts
+}
+
+# Comma-join the custom DO UPDATE SET assignments.
+fun set_expr_parts : List SetExpr -> List SqlPart
+set_expr_parts sets = case sets {
+  [] -> panic "Dml.upsert_set: no assignments (use insert_on_conflict_do_nothing for DO NOTHING)"
+  [set] -> one_set_expr set
+  set :: rest -> {
+    let head = List.append (one_set_expr set) [Text ", "]
+    List.append head (set_expr_parts rest)
+  }
+}
+
+# `INSERT … ON CONFLICT <target> DO UPDATE SET <custom assignments>`.
+fun upsert_set_parts : Table cols
+  -> List (String, Value)
+  -> ConflictTarget
+  -> List SetExpr
+  -> List SqlPart
+upsert_set_parts table_value pairs target sets = {
+  let body = insert_parts table_value pairs
+  let conflict = conflict_target_of target
+  let head = List.append body (List.append conflict [Text " DO UPDATE SET "])
+  List.append head (set_expr_parts sets)
+}
+
+#@ Upsert with an explicit `DO UPDATE SET`: update only the columns you list, to
+#@ arbitrary expressions over the existing row, the proposed row (`Db.excluded`),
+#@ and literals — e.g. a counter `Db.assign u.count (Db.add u.count 1)` or a merge
+#@ `Db.assign u.total (Db.add_sql u.total (Db.excluded u.total))`. The conflict
+#@ target is a `Db.ConflictTarget` (`Db.on_columns [Db.ref u.id]` or
+#@ `Db.on_constraint "…"`). For the "overwrite every other column with EXCLUDED"
+#@ default, use `upsert` instead.
+pub fun upsert_set : Table cols
+  -> ins
+  -> (cols -> ConflictTarget)
+  -> (cols -> List SetExpr)
+  -> Prepared Unit
+  where {cols: Insertable ins + ColumnNameMap, ins: InsertRow}
+upsert_set table_value value target set_fn = {
+  let alias = table_name table_value
+  let cols = table_cols alias table_value
+  let parts =
+    upsert_set_parts table_value (insert_pairs table_value value) (target cols) (set_fn cols)
+  finish parts
+}
+
+#@ Like `upsert_set`, but appends a `RETURNING` clause built from the projection
+#@ callback. Yields the resulting row (inserted or updated) via `Query.one`.
+pub fun upsert_set_returning : Table cols
+  -> ins
+  -> (cols -> ConflictTarget)
+  -> (cols -> List SetExpr)
+  -> (cols -> selection)
+  -> Prepared row
+  where {cols: Insertable ins + ColumnNameMap, ins: InsertRow, selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
+upsert_set_returning table_value value target set_fn project = {
+  let alias = table_name table_value
+  let cols = table_cols alias table_value
+  let body =
+    upsert_set_parts table_value (insert_pairs table_value value) (target cols) (set_fn cols)
   finish_returning body (select (project cols))
 }
 

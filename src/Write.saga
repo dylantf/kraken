@@ -63,6 +63,23 @@ upsert_user_query () = {
   Dml.upsert users row (fun u -> [Db.ref u.id])
 }
 
+# Upsert with a custom DO UPDATE SET: on id conflict, bump age by 1 (an expression
+# over the existing row) and take the name from the proposed row (EXCLUDED). Only
+# these two columns are touched — a partial update, not the blanket overwrite.
+pub fun upsert_bump_query : Unit -> Prepared Unit
+upsert_bump_query () = {
+  let row = UsersInsert { id: Db.provide 1, name: "Carol", age: 31 }
+  Dml.upsert_set users row (fun u -> Db.on_columns [Db.ref u.id]) (fun u -> [Db.assign u.age (Db.add u.age 1), Db.assign u.name (Db.excluded u.name)])
+}
+
+# Same, but the conflict is detected by a named constraint (ON CONSTRAINT) rather
+# than a column list — for composite / named / exclusion constraints.
+pub fun upsert_on_constraint_query : Unit -> Prepared Unit
+upsert_on_constraint_query () = {
+  let row = UsersInsert { id: Db.provide 1, name: "Carol", age: 31 }
+  Dml.upsert_set users row (fun _ -> Db.on_constraint "users_pkey") (fun u -> [Db.assign u.age (Db.excluded u.age)])
+}
+
 # Insert-or-skip: do nothing if a row with this name already exists.
 pub fun insert_user_if_new_query : Unit -> Prepared Unit
 insert_user_if_new_query () = {

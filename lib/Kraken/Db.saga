@@ -390,6 +390,56 @@ col_name column = {
   info.name
 }
 
+# --- Upsert `DO UPDATE` vocabulary (Tier 7 follow-ups) ---
+
+#@ Reference a column on the `EXCLUDED` pseudo-table — the row proposed by the
+#@ conflicting insert — inside an upsert `DO UPDATE`: `Db.excluded u.name` renders
+#@ `EXCLUDED.name`. The existing row is referenced by the plain column (`u.name`).
+pub fun excluded : Col a -> Col a
+excluded column = {
+  let Col info = column
+  Col (ColumnInfo { source: "EXCLUDED", name: info.name })
+}
+
+record SetExprDef {
+  column: String,
+  frag: SqlFrag,
+}
+
+#@ One `column = <expr>` assignment in an upsert `DO UPDATE SET`. Build with `assign`.
+opaque type SetExpr = SetExpr SetExprDef
+
+#@ Assign a column an arbitrary SQL expression in a `DO UPDATE SET`. The RHS is any
+#@ `ToSql` value of the column's type, so it can combine the existing row, the
+#@ proposed row, and literals: `Db.assign u.count (Db.add_sql u.count (Db.excluded
+#@ u.count))` → `count = users.count + EXCLUDED.count`. Listing only the columns you
+#@ want also gives a partial DO UPDATE (a subset, not the blanket overwrite).
+pub fun assign : Col a -> rhs -> SetExpr where {rhs: ToSql a}
+assign column rhs = SetExpr (SetExprDef { column: col_name column, frag: frag_of rhs })
+
+pub fun set_expr_column : SetExpr -> String
+set_expr_column set = case set {
+  SetExpr def -> def.column
+}
+
+pub fun set_expr_frag : SetExpr -> SqlFrag
+set_expr_frag set = case set {
+  SetExpr def -> def.frag
+}
+
+#@ Where an `ON CONFLICT` detects a collision: a column list
+#@ (`on_columns [Db.ref u.id]` → `ON CONFLICT (id)`) or a named constraint
+#@ (`on_constraint "users_email_key"` → `ON CONFLICT ON CONSTRAINT users_email_key`).
+pub type ConflictTarget =
+  | OnColumns (List ColRef)
+  | OnConstraint String
+
+pub fun on_columns : List ColRef -> ConflictTarget
+on_columns refs = OnColumns refs
+
+pub fun on_constraint : String -> ConflictTarget
+on_constraint name = OnConstraint name
+
 pub type SqlPart =
   | Text String
   | Param Value

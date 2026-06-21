@@ -962,6 +962,27 @@ targets named with `Db.ref` (not raw strings):
 `insert_on_conflict_do_nothing_returning` mirror the plain returning ops (a skipped
 DO-NOTHING row returns nothing, so `Query.one` gives `Ok Nothing` on conflict).
 
+**Custom `DO UPDATE SET` + `ON CONSTRAINT`** (done 2026-06-21): `upsert_set` /
+`upsert_set_returning` take an explicit assignment callback instead of the blanket
+`EXCLUDED.*` overwrite, which covers both remaining follow-ups at once:
+- **Column subsets** — list only the columns you want; the rest are left untouched.
+- **Arbitrary expressions** — each assignment is `Db.assign col rhs` where `rhs` is
+  any `ToSql` value of the column's type, built over the existing row (`u.count`),
+  the proposed row (`Db.excluded u.count` → `EXCLUDED.count`), and literals. So the
+  counter idiom is `Db.assign u.count (Db.add u.count 1)` → `count = users.count + $n`
+  and a merge is `Db.assign u.total (Db.add_sql u.total (Db.excluded u.total))`.
+  (`Db.excluded` just re-sources a `Col` to the `EXCLUDED` pseudo-table; `assign`
+  pairs a bare column name with the RHS fragment via a new opaque `SetExpr`.)
+- **`ON CONSTRAINT`** — the conflict target is now a `Db.ConflictTarget`, built by
+  `Db.on_columns [Db.ref u.id]` (→ `ON CONFLICT (id)`) or `Db.on_constraint "name"`
+  (→ `ON CONFLICT ON CONSTRAINT name`), for composite / named / exclusion
+  constraints. The blanket `upsert` / `insert_on_conflict_do_nothing` keep their
+  simpler column-only `(cols -> List ColRef)` target; the constraint form lives on
+  the custom-set path where it's most needed.
+
+This clears the Tier 7 follow-ups. (Still not built, and lower priority: `ON
+CONSTRAINT` + `DO NOTHING`, and a custom-set variant of the plain `do_nothing`.)
+
 **Bulk / multi-row insert** (done 2026-06-21): `insert_all table rows` and
 `insert_all_returning table rows project` render a single
 `INSERT … VALUES (…), (…), …` — one round trip instead of one statement per row,
@@ -990,13 +1011,12 @@ three bulk inserts this now covers. Scope/known limits:
   for a single multi-row insert), which is what makes `List.zip ids inputs` work —
   but it isn't standard-guaranteed.
 
-Tier 7 is complete, including the read path's `Gap 1` (bulk insert) and `Gap 2`
+Tier 7 is complete, including the read path's `Gap 1` (bulk insert), `Gap 2`
 (insert column-name resolution through `ColumnSet`, done 2026-06-21 — names come
-from the column record's `ColumnSet`, not Saga field labels). Not yet built
-(smaller follow-ups): `DO UPDATE` to a chosen *subset* of columns or to arbitrary
-expressions (e.g. `count = users.count + 1`); `ON CONSTRAINT <name>` conflict
-targets. (Transactions — Tier 8 — are now done, built as a thin wrapper over
-saga_pgo's `Transaction` effect.)
+from the column record's `ColumnSet`, not Saga field labels), and the upsert
+follow-ups (custom `DO UPDATE SET` subsets/expressions and `ON CONSTRAINT` targets
+via `upsert_set` — see above). (Transactions — Tier 8 — are now done, built as a
+thin wrapper over saga_pgo's `Transaction` effect.)
 
 Inference note worth remembering: a DML op taking *two* column-record callbacks
 (e.g. `*_returning` conflict ops: a conflict-target `(cols -> List ColRef)` and a
