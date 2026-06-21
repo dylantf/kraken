@@ -187,6 +187,25 @@ value_placeholder_parts vals = case vals {
   }
 }
 
+# One row's worth of placeholders wrapped in parens: `($1, $2, …)`.
+fun value_group_parts : List Value -> List SqlPart
+value_group_parts vals = {
+  let inner = value_placeholder_parts vals
+  let opened = List.append [Text "("] inner
+  List.append opened [Text ")"]
+}
+
+# Comma-join one parenthesized placeholder group per row: `(…), (…), …`.
+fun value_groups_parts : List (List Value) -> List SqlPart
+value_groups_parts rows = case rows {
+  [] -> []
+  [vals] -> value_group_parts vals
+  vals :: rest -> {
+    let head = List.append (value_group_parts vals) [Text ", "]
+    List.append head (value_groups_parts rest)
+  }
+}
+
 # --- Operations ---
 
 fun insert_parts : Table cols -> List (String, Value) -> List SqlPart
@@ -198,6 +217,16 @@ insert_parts table_value pairs = {
   let mid = value_placeholder_parts vals
   let tail = List.append mid [Text ")"]
   List.append prefix tail
+}
+
+# `INSERT INTO t (cols) VALUES (…), (…), …` — one VALUES group per row. The column
+# list is shared, so every row's values must be in the same order; `insert_pairs`
+# guarantees this since it walks the same synthesized insert record each time.
+fun insert_all_parts : Table cols -> List String -> List (List Value) -> List SqlPart
+insert_all_parts table_value names rows = {
+  let header = "INSERT INTO " <> table_name table_value <> " (" <> comma_join names <> ") VALUES "
+  let prefix = [Text header]
+  List.append prefix (value_groups_parts rows)
 }
 
 # Resolve an `insert_row`'s field labels to real SQL column names via the table's
@@ -224,6 +253,26 @@ insert_pairs table_value value = {
   }) (insert_row value)
 }
 
+# Build the parts for a multi-row insert from a list of insert values. Resolves
+# each row to `(sql_name, value)` pairs (honoring `ColumnSet` renames), takes the
+# shared column list from the first row, and emits one VALUES group per row.
+# Panics on an empty list: there is no valid zero-row `VALUES` SQL, so callers
+# should guard empty batches (insert nothing) before calling.
+fun insert_all_parts_of : Table cols -> List ins -> List SqlPart
+  where {ins: InsertRow, cols: ColumnNameMap}
+insert_all_parts_of table_value values = {
+  let rows_pairs = List.map (fun v -> insert_pairs table_value v) values
+  case rows_pairs {
+    [] -> panic "Dml.insert_all: empty row list (guard the call and insert nothing when the batch is empty)"
+    first_pairs :: _ -> {
+      let names = List.map (fun pair -> { let (name, _v) = pair; name }) first_pairs
+      let row_values = fun pairs -> List.map (fun pair -> { let (_n, v) = pair; v }) pairs
+      let rows_vals = List.map row_values rows_pairs
+      insert_all_parts table_value names rows_vals
+    }
+  }
+}
+
 #@ Build an INSERT statement from a dedicated insert record. The input must be a
 #@ named type deriving `Db.InsertRow` (anonymous records are rejected, so a typo'd
 #@ or wrong-typed field fails to typecheck against that type). Column names come
@@ -246,6 +295,39 @@ pub fun insert_returning : Table cols -> ins -> (cols -> selection) -> Prepared 
   }
 insert_returning table_value value project = {
   let body = insert_parts table_value (insert_pairs table_value value)
+  let alias = table_name table_value
+  let cols = table_cols alias table_value
+  let projection = select (project cols)
+  finish_returning body projection
+}
+
+#@ Bulk insert: one `INSERT … VALUES (…), (…), …` statement for a list of rows.
+#@ A single round trip instead of one per row — meaningful over a network, where
+#@ a per-row loop (even inside a transaction) pays N round trips. Column names and
+#@ value order come from the synthesized insert record, exactly like `insert`.
+#@ Panics on an empty list (no valid zero-row VALUES SQL); guard empty batches.
+#@ Note Postgres caps a statement at 65535 bind parameters, so a single call is
+#@ limited to ~`floor(65535 / columns)` rows — chunk larger batches caller-side.
+pub fun insert_all : Table cols -> List ins -> Prepared Unit
+  where {cols: Insertable ins + ColumnNameMap, ins: InsertRow}
+insert_all table_value values = finish (insert_all_parts_of table_value values)
+
+#@ Like `insert_all`, but appends a `RETURNING` clause built from the projection
+#@ callback (the table's columns, exactly like `select!`). Yields a `Prepared row`
+#@ with one row per inserted row; run it with `Query.all`.
+pub fun insert_all_returning : Table cols
+  -> List ins
+  -> (cols -> selection)
+  -> Prepared row
+  where {
+    cols: Insertable ins + ColumnNameMap,
+    ins: InsertRow,
+    selection: Generic selection_rep,
+    selection_rep: Selectable row_rep,
+    row: Generic row_rep,
+  }
+insert_all_returning table_value values project = {
+  let body = insert_all_parts_of table_value values
   let alias = table_name table_value
   let cols = table_cols alias table_value
   let projection = select (project cols)

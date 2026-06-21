@@ -13,6 +13,23 @@ pub fun insert_user_query : Unit -> Prepared Unit
 insert_user_query () =
   Dml.insert users (UsersInsert { id: Db.auto, name: "Carol", age: 31 })
 
+# Bulk INSERT: many rows in one statement (one round trip).
+pub fun insert_users_query : Unit -> Prepared Unit
+insert_users_query () =
+  Dml.insert_all users [
+    UsersInsert { id: Db.auto, name: "Carol", age: 31 },
+    UsersInsert { id: Db.auto, name: "Dave", age: 40 },
+    UsersInsert { id: Db.auto, name: "Erin", age: 22 },
+  ]
+
+# Bulk INSERT ... RETURNING the generated ids of every inserted row.
+pub fun insert_users_returning_ids : Unit -> Prepared { id: Int }
+insert_users_returning_ids () =
+  Dml.insert_all_returning users [
+    UsersInsert { id: Db.auto, name: "Carol", age: 31 },
+    UsersInsert { id: Db.auto, name: "Dave", age: 40 },
+  ] (fun u -> { id: u.id })
+
 # INSERT ... RETURNING the whole inserted row, decoded back into the domain type.
 pub fun insert_user_returning : Unit -> Prepared User
 insert_user_returning () = {

@@ -46,6 +46,8 @@ main () = {
 
   println "-- DML: insert / update / update_all / delete (rendered SQL) --"
   println (Write.insert_user_query ()).sql
+  println (Write.insert_users_query ()).sql
+  println (Write.insert_users_returning_ids ()).sql
   println (Write.bump_age_query ()).sql
   println (Write.save_user_query (User {
     id: 1,
