@@ -267,6 +267,24 @@ users_with_total_posts_query () = Query.query (fun () -> {
   })
 })
 
+# Scalar subquery that can match zero rows: each user with the title of one of their
+# posts (limit 1), or Nothing if they have none. `scalar_subquery_maybe` types the
+# empty-result case as `Maybe String` instead of failing to decode at runtime.
+pub fun users_with_a_post_title_query : Unit
+  -> Query.Prepared { id: Int, a_title: Maybe String }
+users_with_a_post_title_query () = Query.query (fun () -> {
+  let u = from! users
+  select! ({
+    id: u.id,
+    a_title: Query.scalar_subquery_maybe (fun () -> {
+      let p = from! posts
+      where_! (Db.eq_col p.author_id u.id)
+      limit! 1
+      p.title
+    }),
+  })
+})
+
 # Scalar subquery in a comparison: here `gt_sql` against `u.age` pins the subquery's
 # type, so no annotation is needed.
 pub fun users_over_post_count_query : Unit
