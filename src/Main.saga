@@ -44,6 +44,11 @@ main () = {
   println "-- derived table (subquery in FROM, rendered SQL) --"
   println (Read.prolific_authors_query ()).sql
 
+  println "-- SQL functions: string/arithmetic, CASE/CONCAT/NOT, COALESCE --"
+  println (Read.user_report_query ()).sql
+  println (Read.user_tier_query ()).sql
+  println (Read.user_post_title_query ()).sql
+
   println "-- DML: insert / update / update_all / delete (rendered SQL) --"
   println (Write.insert_user_query ()).sql
   println (Write.insert_users_query ()).sql

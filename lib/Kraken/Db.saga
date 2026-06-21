@@ -1,6 +1,7 @@
 module Kraken.Db
 
 import Std.Base (Proxy, KnownSymbol)
+import Std.DateTime (Date, Time, NaiveDateTime)
 import Std.Dynamic (
   Dynamic,
   DecodeError,
@@ -16,7 +17,6 @@ import Std.Dynamic (
   from_erlang
 )
 import Std.Generic (Generic, Leaf, Labeled, And, Record)
-import Std.DateTime (Date, Time, NaiveDateTime)
 import SagaJson as Json
 import SagaJson.Codec as JsonCodec (ToJson, FromJson)
 import SagaPgo (Connection, Postgres, QueryError, Returned)
@@ -629,7 +629,8 @@ frag_of input = value_frag input
 pub fun cast : input -> Sql b where {input: ToSql a, b: PgType + PgTypeName}
 cast input = {
   let name = pg_type_name (TypeTag : TypeTag b)
-  let inner = append_frag (raw_frag "(") (append_frag (value_frag input) (raw_frag ")"))
+  let inner =
+    append_frag (raw_frag "(") (append_frag (value_frag input) (raw_frag ")"))
   make_sql (append_frag inner (raw_frag ("::" <> name)))
 }
 
@@ -660,6 +661,186 @@ as_date input = cast input
 #@ `<input>::time`.
 pub fun as_time : input -> Sql Time where {input: ToSql a}
 as_time input = cast input
+
+# --- SQL functions and expressions ---
+#
+# These all produce a first-class `Sql a` (or `Expr`), so they stay decoder-aware
+# and remain usable in `select!` / `where_!` / `having!`. Result types that aren't
+# pinned by the inputs (e.g. `sql_fn`, `case_when`) are fixed by annotation or the
+# selection site, exactly like `cast`.
+
+# Comma-join a list of call arguments into one fragment.
+fun join_args : List SqlArg -> SqlFrag
+join_args args = case args {
+  [] -> raw_frag ""
+  [arg] -> sql_arg_frag arg
+  arg :: rest -> append_frags [sql_arg_frag arg, raw_frag ", ", join_args rest]
+}
+
+# Space-join a list of fragments (used to glue CASE branches).
+fun frags_spaced : List SqlFrag -> SqlFrag
+frags_spaced frags = case frags {
+  [] -> raw_frag ""
+  [frag] -> frag
+  frag :: rest -> append_frags [frag, raw_frag " ", frags_spaced rest]
+}
+
+#@ A generic SQL function call: `name(arg1, arg2, …)`. Arguments are `SqlArg`s, so
+#@ pass columns/expressions with `Db.sql` and literals with `Db.value`. The result
+#@ type isn't inferable from the arguments, so annotate it or let the selection fix
+#@ it: `Db.sql_fn "lower" [Db.sql u.name] : Db.Sql String`.
+pub fun sql_fn : String -> List SqlArg -> Sql a where {a: PgType}
+sql_fn name args =
+  make_sql (append_frags [raw_frag (name <> "("), join_args args, raw_frag ")"])
+
+#@ `COALESCE(<input>, <fallback>)` — the first non-NULL of the two. The principled
+#@ way to recover a non-null scalar from a left join: after `Db.unwrap_cols`, a
+#@ left-joined column reads as `Col a`, and `coalesce` pairs it with a default of
+#@ the same type, yielding a non-null `Sql a` you *can* put in `select!`
+#@ (`Db.coalesce (Db.unwrap_cols p).count 0` → `COALESCE(t1.count, $1)`).
+pub fun coalesce : input -> a -> Sql a where {input: ToSql a, a: PgType}
+coalesce input fallback =
+  make_sql (append_frags [
+    raw_frag "COALESCE(",
+    value_frag input,
+    raw_frag ", ",
+    param (encode_pg fallback),
+    raw_frag ")",
+  ])
+
+#@ `COALESCE(<left>, <right>)` over two SQL values of the same type (e.g. two
+#@ columns) rather than a literal fallback.
+pub fun coalesce_sql : left -> right -> Sql a
+  where {left: ToSql a, right: ToSql a, a: PgType}
+coalesce_sql left right =
+  make_sql (append_frags [
+    raw_frag "COALESCE(",
+    value_frag left,
+    raw_frag ", ",
+    value_frag right,
+    raw_frag ")",
+  ])
+
+#@ Boolean negation: `NOT (<expr>)`. Complements `and_` / `or_` / `is_null`.
+pub fun not_ : Expr -> Expr
+not_ predicate =
+  make_expr (append_frags [raw_frag "NOT (", expr_frag predicate, raw_frag ")"])
+
+# A one-argument string function: `FN(<input>)` over a text value.
+fun string_fn : String -> input -> Sql String where {input: ToSql String}
+string_fn name input =
+  make_sql (append_frags [
+    raw_frag (name <> "("),
+    value_frag input,
+    raw_frag ")",
+  ])
+
+#@ `LOWER(<input>)`.
+pub fun lower : input -> Sql String where {input: ToSql String}
+lower input = string_fn "LOWER" input
+
+#@ `UPPER(<input>)`.
+pub fun upper : input -> Sql String where {input: ToSql String}
+upper input = string_fn "UPPER" input
+
+#@ `TRIM(<input>)`.
+pub fun trim : input -> Sql String where {input: ToSql String}
+trim input = string_fn "TRIM" input
+
+#@ `CONCAT(arg1, arg2, …)` — NULL arguments are treated as empty (unlike `||`).
+#@ Arguments are `SqlArg`s (`Db.sql` for columns, `Db.value` for literals).
+pub fun concat : List SqlArg -> Sql String
+concat args =
+  make_sql (append_frags [raw_frag "CONCAT(", join_args args, raw_frag ")"])
+
+# `(<input> OP <literal>)` arithmetic against a same-typed literal.
+fun arith_lit : String -> input -> a -> Sql a where {input: ToSql a, a: PgType}
+arith_lit op input operand =
+  make_sql (append_frags [
+    raw_frag "(",
+    value_frag input,
+    raw_frag (" " <> op <> " "),
+    param (encode_pg operand),
+    raw_frag ")",
+  ])
+
+# `(<left> OP <right>)` arithmetic between two same-typed SQL values.
+fun arith_sql : String -> left -> right -> Sql a
+  where {left: ToSql a, right: ToSql a, a: PgType}
+arith_sql op left right =
+  make_sql (append_frags [
+    raw_frag "(",
+    value_frag left,
+    raw_frag (" " <> op <> " "),
+    value_frag right,
+    raw_frag ")",
+  ])
+
+#@ `(<input> + <literal>)` — e.g. the upsert idiom `count = users.count + 1`.
+pub fun add : input -> a -> Sql a where {input: ToSql a, a: PgType}
+add input operand = arith_lit "+" input operand
+
+#@ `(<input> - <literal>)`.
+pub fun sub : input -> a -> Sql a where {input: ToSql a, a: PgType}
+sub input operand = arith_lit "-" input operand
+
+#@ `(<input> * <literal>)`.
+pub fun mul : input -> a -> Sql a where {input: ToSql a, a: PgType}
+mul input operand = arith_lit "*" input operand
+
+#@ `(<input> / <literal>)`.
+pub fun div : input -> a -> Sql a where {input: ToSql a, a: PgType}
+div input operand = arith_lit "/" input operand
+
+#@ `(<left> + <right>)` between two SQL values (e.g. `price + tax`).
+pub fun add_sql : left -> right -> Sql a
+  where {left: ToSql a, right: ToSql a, a: PgType}
+add_sql left right = arith_sql "+" left right
+
+#@ `(<left> - <right>)`.
+pub fun sub_sql : left -> right -> Sql a
+  where {left: ToSql a, right: ToSql a, a: PgType}
+sub_sql left right = arith_sql "-" left right
+
+#@ `(<left> * <right>)` — e.g. `price * quantity`.
+pub fun mul_sql : left -> right -> Sql a
+  where {left: ToSql a, right: ToSql a, a: PgType}
+mul_sql left right = arith_sql "*" left right
+
+#@ `(<left> / <right>)`.
+pub fun div_sql : left -> right -> Sql a
+  where {left: ToSql a, right: ToSql a, a: PgType}
+div_sql left right = arith_sql "/" left right
+
+#@ `CASE WHEN <cond> THEN <val> … ELSE <else> END`. Each branch pairs a predicate
+#@ with a `SqlArg` result; the `else` is the fallback `SqlArg`. Branch and else
+#@ values use `Db.sql` (columns/expressions) or `Db.value` (literals). The result
+#@ type is fixed by annotation or the selection. Panics with no branches.
+pub fun case_when : List (Expr, SqlArg) -> SqlArg -> Sql a where {a: PgType}
+case_when branches else_value = case branches {
+  [] -> panic "Db.case_when: needs at least one WHEN branch"
+  _ -> {
+    let branch_frag =
+      fun pair ->
+        {
+          let (cond, then_value) = pair
+          append_frags [
+            raw_frag "WHEN ",
+            expr_frag cond,
+            raw_frag " THEN ",
+            sql_arg_frag then_value,
+          ]
+        }
+    let whens = frags_spaced (List.map branch_frag branches)
+    make_sql (append_frags [
+      raw_frag "CASE ",
+      whens,
+      raw_frag " ELSE ",
+      sql_arg_frag else_value,
+      raw_frag " END",
+    ])
+  }
+}
 
 fun array_frag : input -> SqlFrag where {input: ToArraySql a}
 array_frag input = sql_frag (to_array_sql input)
@@ -1096,19 +1277,16 @@ impl DerivedScope (Record out) for Record fields where {fields: DerivedScope out
   }
 }
 
-impl DerivedScope (And lo ro) for And li ri
-  where {li: DerivedScope lo, ri: DerivedScope ro}
-{
+impl DerivedScope (And lo ro) for And li ri where {li: DerivedScope lo, ri: DerivedScope ro} {
   build_scope rep alias = case rep {
     And l r -> And (build_scope l alias) (build_scope r alias)
   }
 }
 
-impl DerivedScope (Labeled n out) for Labeled n field
-  where {n: KnownSymbol, field: DerivedLeaf out}
-{
+impl DerivedScope (Labeled n out) for Labeled n field where {n: KnownSymbol, field: DerivedLeaf out} {
   build_scope rep alias = case rep {
-    Labeled inner -> Labeled (derived_leaf inner alias (symbol_name (Proxy : Proxy n)))
+    Labeled inner ->
+      Labeled (derived_leaf inner alias (symbol_name (Proxy : Proxy n)))
   }
 }
 
@@ -1116,11 +1294,7 @@ impl DerivedScope (Labeled n out) for Labeled n field
 #@ alias assigned to the derived table. Each labeled selection becomes a `Col`
 #@ named by its label and qualified by `alias`.
 pub fun derived_columns : selection -> String -> scope
-  where {
-    selection: Generic sel_rep,
-    sel_rep: DerivedScope scope_rep,
-    scope: Generic scope_rep,
-  }
+  where {selection: Generic sel_rep, sel_rep: DerivedScope scope_rep, scope: Generic scope_rep}
 derived_columns selection alias = from (build_scope (to selection) alias)
 
 #@ Encode one insert column value: `Just param` to bind it, `Nothing` to omit the
@@ -1292,7 +1466,8 @@ impl ColumnNameMap for Record a where {a: ColumnNameFields} {
 #@ field-labelled output of `insert_row` to real SQL column names. Attach
 #@ `deriving (Db.ColumnNameMap)` to the column record (like `Db.InsertRow` on the
 #@ domain record) to make the bridge available.
-pub fun column_name_map : cols -> List (String, String) where {cols: ColumnNameMap}
+pub fun column_name_map : cols -> List (String, String)
+  where {cols: ColumnNameMap}
 column_name_map cols = column_name_map_rep cols
 
 pub fun asc : input -> Order where {input: ToSql a, a: PgType}

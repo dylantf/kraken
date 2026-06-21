@@ -200,6 +200,40 @@ prolific_authors_query () = Query.query (fun () -> {
   select! ({ author_id: t.author_id, posts: t.posts })
 })
 
+# Tier 5 SQL functions: string fn + arithmetic in a select.
+pub fun user_report_query : Unit
+  -> Query.Prepared { id: Int, upper_name: String, age_next: Int }
+user_report_query () = Query.query (fun () -> {
+  let u = from! users
+  select! ({ id: u.id, upper_name: Db.upper u.name, age_next: Db.add u.age 1 })
+})
+
+# CASE WHEN + CONCAT + NOT: bucket users by age, label with a prefix.
+pub fun user_tier_query : Unit
+  -> Query.Prepared { id: Int, label: String, tier: String }
+user_tier_query () = Query.query (fun () -> {
+  let u = from! users
+  where_! (Db.not_ (Db.eq u.age 0))
+  select! ({
+    id: u.id,
+    label: Db.concat [Db.value "user:", Db.sql u.name],
+    tier: (Db.case_when [
+      (Db.gte u.age 65, Db.value "senior"),
+      (Db.gte u.age 18, Db.value "adult"),
+    ] (Db.value "minor") : Db.Sql String),
+  })
+})
+
+# COALESCE off a left join: recover a non-null scalar the Nullable scope won't let
+# you select directly — unwrap to the plain column, default it.
+pub fun user_post_title_query : Unit
+  -> Query.Prepared { id: Int, title: String }
+user_post_title_query () = Query.query (fun () -> {
+  let u = from! users
+  let p = left_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
+  select! ({ id: u.id, title: Db.coalesce (Db.unwrap_cols p).title "(none)" })
+})
+
 # Loaders
 
 pub fun load_users : Connection

@@ -702,30 +702,39 @@ needed both codec halves in saga_pgo. saga_pgo now ships both encode (`pg_date` 
 so these are real Kraken column types as well as cast targets — no Erlang work left
 on the Kraken side.
 
-### SQL functions — still todo
+### SQL functions — done (2026-06-21)
 
-Generic SQL functions can use raw fragments initially:
+All flow through `Sql a` / `Expr`, so they stay decoder-aware and remain usable in
+`select!` / `where_!` / `having!`. Built on the same `make_sql` (decoder from the
+result's `PgType`) / `make_expr` / `append_frags` plumbing as `cast` and the
+predicate family, and they follow the existing `eq` vs `eq_sql` convention for
+"literal operand" vs "two SQL values".
 
-```saga
-Db.sql_fn "lower" [Db.sql_column u.name]
-```
+- **`sql_fn name args`** — the generic escape hatch: `name(arg1, …)` over `SqlArg`s
+  (`Db.sql` for columns/expressions, `Db.value` for literals). Result type fixed by
+  annotation or the selection site (like `cast`).
+- **`coalesce input fallback`** / **`coalesce_sql left right`** — `COALESCE(…)`. The
+  principled non-null recovery from a left join: after `Db.unwrap_cols`, a
+  left-joined column reads as `Col a`, and `coalesce` pairs it with a same-typed
+  default to yield a non-null `Sql a` you *can* put in `select!`
+  (`COALESCE(t1.title, $1)`), which the Nullable scope otherwise forbids.
+- **`not_ : Expr -> Expr`** — `NOT (…)`, completing `and_` / `or_` / `is_null`.
+- **String fns** — `lower` / `upper` / `trim` (one `ToSql String` arg) and
+  `concat : List SqlArg -> Sql String` (`CONCAT(…)`, NULL-as-empty, unlike `||`).
+- **Arithmetic** — `add` / `sub` / `mul` / `div` (value `OP` literal, e.g. the
+  upsert idiom `count = users.count + 1`) and `add_sql` / `sub_sql` / `mul_sql` /
+  `div_sql` (two same-typed SQL values, e.g. `price * quantity`).
+- **`case_when branches else`** — `CASE WHEN <cond> THEN <val> … ELSE <else> END`;
+  branches are `(Expr, SqlArg)` pairs, else is a `SqlArg`. Panics with no branches.
 
-A small typed `sql_fn` plus a handful of blessed helpers would cover most of the
-expression gaps at once, instead of accreting one-off APIs:
-
-- **`coalesce`** — especially relevant to the Nullable-scope model: it's the
-  principled way to turn a left-joined `Maybe a` back into a non-null scalar
-  (`COALESCE(p.count, 0)`), which the type system otherwise won't let you select
-  off a left join.
-- **`not_`** — general boolean negation. We have `and_` / `or_` / `is_null` /
-  `is_not_null` but no negation combinator.
-- **`CASE WHEN`** — conditional expressions.
-- **String functions** — `lower` / `upper` / `concat` / `trim`.
-- **Arithmetic** — `+` / `-` / `*` / `/` over `Sql a`, for things like
-  `price * quantity`.
-
-These all flow through `Sql a` and stay decoder-aware, so they remain selectable
-and usable in `where_!` / `having!`.
+Inference note: `sql_fn` and `case_when` produce a `Sql a` whose `a` isn't pinned by
+their arguments (`SqlArg` erases the element type), so — exactly like `cast` — they
+need either a selection that fixes the type or an explicit annotation. `cast` ships
+type-fixing `as_*` helpers; `case_when`/`sql_fn` are open-ended, so annotation is the
+escape — a call site writes `(Db.case_when [...] (Db.value "minor") : Db.Sql String)`.
+`Sql a` stays `opaque`: the name is exportable for annotations, but the constructor is
+hidden, so callers still can't build a `Sql` by hand (same as `Col` / `Expr`). Helpers
+with a concrete return (`lower`, `concat`, the arithmetic family) need no annotation.
 
 ## Raw SQL Escape Hatches
 
