@@ -339,110 +339,48 @@ print_optional_posts result = case result {
 
 # --- Executed examples for the Tier 5/6 features (run against the live DB) ---
 #
-# Each has a concrete-typed loader + printer. A single generic printer
-# (`Result (List a) -> (a -> String) -> Unit`) would be tidier, but passing an
-# anonymous-record row through that polymorphic boundary currently trips a codegen
-# bug (could not resolve record type for field access on `__anon_*`), so the row
-# type is named per printer instead.
+# One generic printer shared across every row shape: the loaders are concretely
+# typed, and `print_rows` takes the result first so its row type pins `a` before the
+# `fmt` lambda is checked (otherwise a bare `row.id` is an "ambiguous field"). Keep
+# the `print_rows result (fun r -> …)` call on one line — a line break before the
+# lambda would leave `print_rows` partially applied.
+pub fun print_rows : Result (List a) Query.DbError
+  -> (a -> String)
+  -> Unit
+  needs {Stdio}
+print_rows result fmt = case result {
+  Ok rows -> {
+    println ("rows: " <> show (List.length rows))
+    List.iter (fun row -> println (fmt row)) rows
+  }
+  Err err -> println ("query failed: " <> debug err)
+}
 
 pub fun load_user_report : Connection
   -> Result (List { id: Int, upper_name: String, age_next: Int }) Query.DbError
   needs {Repo}
 load_user_report conn = Query.all conn (user_report_query ())
 
-pub fun print_user_report : Result (List {
-  id: Int,
-  upper_name: String,
-  age_next: Int,
-}) Query.DbError
-  -> Unit
-  needs {Stdio}
-print_user_report result = case result {
-  Ok rows -> {
-    println ("rows: " <> show (List.length rows))
-    List.iter (fun r -> println $"{show r.id}: {r.upper_name} (age+1={show r.age_next})") rows
-  }
-  Err err -> println ("query failed: " <> debug err)
-}
-
 pub fun load_user_tiers : Connection
   -> Result (List { id: Int, label: String, tier: String }) Query.DbError
   needs {Repo}
 load_user_tiers conn = Query.all conn (user_tier_query ())
-
-pub fun print_user_tiers : Result (List {
-  id: Int,
-  label: String,
-  tier: String,
-}) Query.DbError
-  -> Unit
-  needs {Stdio}
-print_user_tiers result = case result {
-  Ok rows -> {
-    println ("rows: " <> show (List.length rows))
-    List.iter (fun r -> println $"{show r.id}: {r.label} [{r.tier}]") rows
-  }
-  Err err -> println ("query failed: " <> debug err)
-}
 
 pub fun load_user_post_titles : Connection
   -> Result (List { id: Int, title: String }) Query.DbError
   needs {Repo}
 load_user_post_titles conn = Query.all conn (user_post_title_query ())
 
-pub fun print_user_post_titles : Result (List {
-  id: Int,
-  title: String,
-}) Query.DbError
-  -> Unit
-  needs {Stdio}
-print_user_post_titles result = case result {
-  Ok rows -> {
-    println ("rows: " <> show (List.length rows))
-    List.iter (fun r -> println $"{show r.id}: {r.title}") rows
-  }
-  Err err -> println ("query failed: " <> debug err)
-}
-
 pub fun load_prolific_authors_cte : Connection
   -> Result (List { author_id: Int, posts: Int }) Query.DbError
   needs {Repo}
 load_prolific_authors_cte conn = Query.all conn (prolific_authors_cte_query ())
-
-pub fun print_prolific_authors : Result (List {
-  author_id: Int,
-  posts: Int,
-}) Query.DbError
-  -> Unit
-  needs {Stdio}
-print_prolific_authors result = case result {
-  Ok rows -> {
-    println ("rows: " <> show (List.length rows))
-    List.iter (fun r -> println $"author {show r.author_id}: {show r.posts} posts") rows
-  }
-  Err err -> println ("query failed: " <> debug err)
-}
 
 pub fun load_users_with_total_posts : Connection
   -> Result (List { id: Int, total_posts: Int }) Query.DbError
   needs {Repo}
 load_users_with_total_posts conn = Query.all conn (users_with_total_posts_query ())
 
-pub fun print_users_with_total_posts : Result (List {
-  id: Int,
-  total_posts: Int,
-}) Query.DbError
-  -> Unit
-  needs {Stdio}
-print_users_with_total_posts result = case result {
-  Ok rows -> {
-    println ("rows: " <> show (List.length rows))
-    List.iter (fun r -> println $"{show r.id}: {show r.total_posts} total posts") rows
-  }
-  Err err -> println ("query failed: " <> debug err)
-}
-
-# Reuses the { id, name } shape; printed with `print_users_without_posts`.
 pub fun load_users_over_post_count : Connection
   -> Result (List { id: Int, name: String }) Query.DbError
   needs {Repo}

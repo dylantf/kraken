@@ -45,24 +45,28 @@ main () = {
   println (Read.prolific_authors_query ()).sql
 
   println "-- SQL fn: UPPER + age+1 --"
-  Read.print_user_report (Read.load_user_report conn with Query.pg_repo)
+  let report = Read.load_user_report conn with Query.pg_repo
+  Read.print_rows report (fun r -> $"{show r.id}: {r.upper_name} (age+1={show r.age_next})")
 
   println "-- SQL fn: CASE/CONCAT/NOT age tiers --"
-  Read.print_user_tiers (Read.load_user_tiers conn with Query.pg_repo)
+  let tiers = Read.load_user_tiers conn with Query.pg_repo
+  Read.print_rows tiers (fun r -> $"{show r.id}: {r.label} [{r.tier}]")
 
   println "-- SQL fn: COALESCE post title off a left join --"
-  Read.print_user_post_titles (Read.load_user_post_titles conn with Query.pg_repo)
+  let titles = Read.load_user_post_titles conn with Query.pg_repo
+  Read.print_rows titles (fun r -> $"{show r.id}: {r.title}")
 
   println "-- CTE (WITH): authors with > 5 posts --"
-  Read.print_prolific_authors (Read.load_prolific_authors_cte conn with Query.pg_repo)
+  let prolific = Read.load_prolific_authors_cte conn with Query.pg_repo
+  Read.print_rows prolific (fun r -> $"author {show r.author_id}: {show r.posts} posts")
 
   println "-- scalar subquery in SELECT: total post count per row --"
-  Read.print_users_with_total_posts (Read.load_users_with_total_posts conn
-    with Query.pg_repo)
+  let totals = Read.load_users_with_total_posts conn with Query.pg_repo
+  Read.print_rows totals (fun r -> $"{show r.id}: {show r.total_posts} total posts")
 
   println "-- scalar subquery in comparison: age > total posts --"
-  Read.print_users_without_posts (Read.load_users_over_post_count conn
-    with Query.pg_repo)
+  let over = Read.load_users_over_post_count conn with Query.pg_repo
+  Read.print_rows over (fun r -> $"{show r.id}: {r.name}")
 
   println "-- DML: insert / update / update_all / delete (rendered SQL) --"
   println (Write.insert_user_query ()).sql
