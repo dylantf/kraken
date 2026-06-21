@@ -281,6 +281,47 @@ users_over_post_count_query () = Query.query (fun () -> {
   select! ({ id: u.id, name: u.name })
 })
 
+# FULL JOIN: the joined table is a Nullable scope (post: Maybe Post). The prior
+# scope (user) stays non-null in the types — the documented right/full-join caveat —
+# so this is shown as rendered SQL rather than executed.
+pub fun users_full_join_posts_query : Unit
+  -> Query.Prepared { user: User, post: Maybe Post }
+users_full_join_posts_query () = Query.query (fun () -> {
+  let u = from! users
+  let p = full_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
+  order_by! [Db.asc u.id]
+  select! ({ user: u, post: p })
+})
+
+# RIGHT JOIN: the newly joined table (posts) is preserved as non-null cols.
+pub fun posts_right_join_query : Unit
+  -> Query.Prepared { post_id: Int, title: String }
+posts_right_join_query () = Query.query (fun () -> {
+  let u = from! users
+  let p = right_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
+  order_by! [Db.asc p.id]
+  select! ({ post_id: p.id, title: p.title })
+})
+
+# Window functions: rank by age (ROW_NUMBER over ORDER BY), and a partitioned
+# windowed count (peers = users sharing the same age).
+pub fun ranked_users_query : Unit
+  -> Query.Prepared { id: Int, age: Int, age_rank: Int, peers: Int }
+ranked_users_query () = Query.query (fun () -> {
+  let u = from! users
+  select! ({
+    id: u.id,
+    age: u.age,
+    age_rank: Db.row_number (Db.order_window [Db.desc u.age] Db.window),
+    peers: Db.over Db.count_star (Db.partition_by [Db.group u.age] Db.window),
+  })
+})
+
+pub fun load_ranked_users : Connection
+  -> Result (List { id: Int, age: Int, age_rank: Int, peers: Int }) Query.DbError
+  needs {Repo}
+load_ranked_users conn = Query.all conn (ranked_users_query ())
+
 # Loaders
 
 pub fun load_users : Connection

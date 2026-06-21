@@ -1628,3 +1628,118 @@ min input =
 pub fun max : input -> Sql (Maybe a) where {input: ToSql a, a: PgType}
 max input =
   make_sql (append_frags [raw_frag "MAX(", value_frag input, raw_frag ")"])
+
+# --- Window functions (Tier 3) ---
+
+record WindowDef {
+  partition: List Group,
+  order: List Order,
+}
+
+#@ A window specification — the `OVER (…)` frame. Build with `window`, then add
+#@ `partition_by` / `order_window`. Reuses `Db.group` for PARTITION BY and
+#@ `Db.asc`/`Db.desc` for the window's ORDER BY.
+opaque type Window = Window WindowDef
+
+#@ An empty window (`OVER ()`). Refine it with `partition_by` / `order_window`.
+pub fun window : Window
+window = Window (WindowDef { partition: [], order: [] })
+
+#@ Set the window's `PARTITION BY` keys.
+pub fun partition_by : List Group -> Window -> Window
+partition_by groups win = case win {
+  Window def -> Window ({ def | partition: groups })
+}
+
+#@ Set the window's `ORDER BY` terms (needed for ranking / running aggregates).
+pub fun order_window : List Order -> Window -> Window
+order_window orders win = case win {
+  Window def -> Window ({ def | order: orders })
+}
+
+fun comma_join_frags : List SqlFrag -> SqlFrag
+comma_join_frags frags = case frags {
+  [] -> raw_frag ""
+  [frag] -> frag
+  frag :: rest -> append_frags [frag, raw_frag ", ", comma_join_frags rest]
+}
+
+fun partition_clause : List Group -> SqlFrag
+partition_clause groups = {
+  let frags = List.map group_frag groups
+  append_frag (raw_frag "PARTITION BY ") (comma_join_frags frags)
+}
+
+fun one_window_order : Order -> SqlFrag
+one_window_order ord =
+  append_frag (order_expr ord) (raw_frag (" " <> order_direction ord))
+
+fun order_clause : List Order -> SqlFrag
+order_clause orders = {
+  let frags = List.map one_window_order orders
+  append_frag (raw_frag "ORDER BY ") (comma_join_frags frags)
+}
+
+# Render ` OVER (PARTITION BY … ORDER BY …)`, omitting whichever clause is empty.
+fun window_clause : Window -> SqlFrag
+window_clause win = case win {
+  Window def -> {
+    let inner = case (def.partition, def.order) {
+      ([], []) -> raw_frag ""
+      (ps, []) -> partition_clause ps
+      ([], os) -> order_clause os
+      (ps, os) -> append_frags [partition_clause ps, raw_frag " ", order_clause os]
+    }
+    append_frags [raw_frag " OVER (", inner, raw_frag ")"]
+  }
+}
+
+# Replace a `Sql`'s fragment while keeping its decoder (so `over` preserves an
+# aggregate's result type, e.g. `sum`'s `Maybe a`).
+fun with_frag : Sql a -> SqlFrag -> Sql a
+with_frag sql_value new_frag = case sql_value {
+  Sql def -> Sql (SqlDef { frag: new_frag, decoder: def.decoder })
+}
+
+#@ Turn any `Sql a` into its windowed form: `<expr> OVER (<window>)`. Most useful on
+#@ an aggregate for a running / partitioned total —
+#@ `Db.over (Db.sum u.amount) (Db.partition_by [Db.group u.dept] Db.window)` →
+#@ `SUM(u.amount) OVER (PARTITION BY u.dept)`. The decoder is preserved, so a
+#@ windowed `sum` is still `Sql (Maybe a)`.
+pub fun over : Sql a -> Window -> Sql a
+over sql_value win =
+  with_frag sql_value (append_frag (sql_frag sql_value) (window_clause win))
+
+#@ `ROW_NUMBER() OVER (<window>)` — sequential row number within each partition.
+pub fun row_number : Window -> Sql Int
+row_number win = make_sql (append_frag (raw_frag "ROW_NUMBER()") (window_clause win))
+
+#@ `RANK() OVER (<window>)` — rank with gaps after ties.
+pub fun rank : Window -> Sql Int
+rank win = make_sql (append_frag (raw_frag "RANK()") (window_clause win))
+
+#@ `DENSE_RANK() OVER (<window>)` — rank without gaps after ties.
+pub fun dense_rank : Window -> Sql Int
+dense_rank win = make_sql (append_frag (raw_frag "DENSE_RANK()") (window_clause win))
+
+#@ `LAG(<input>) OVER (<window>)` — the value from the previous row in the window
+#@ (NULL on the first row, hence `Maybe a`).
+pub fun lag : input -> Window -> Sql (Maybe a) where {input: ToSql a, a: PgType}
+lag input win =
+  make_sql (append_frags [
+    raw_frag "LAG(",
+    value_frag input,
+    raw_frag ")",
+    window_clause win,
+  ])
+
+#@ `LEAD(<input>) OVER (<window>)` — the value from the next row in the window
+#@ (NULL on the last row, hence `Maybe a`).
+pub fun lead : input -> Window -> Sql (Maybe a) where {input: ToSql a, a: PgType}
+lead input win =
+  make_sql (append_frags [
+    raw_frag "LEAD(",
+    value_frag input,
+    raw_frag ")",
+    window_clause win,
+  ])

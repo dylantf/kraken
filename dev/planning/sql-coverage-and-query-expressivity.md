@@ -1389,14 +1389,30 @@ Kraken.
   See [Tier 5: Casts And SQL Functions](#tier-5-casts-and-sql-functions).
 - **Casts** through `PgTypeName a`.
 
-**Tier 3 — polish.**
+**Tier 3 — polish** (mostly done 2026-06-21).
 
-- `right_join!` / `full_join!` (left covers ~90% of cases).
-- Window functions.
-- An exactly-one query variant alongside `one` (which returns `Maybe`) that
-  errors on 0 or >1 rows.
-- Make the `ColumnSet` impl derivable (field label → SQL column name) — the last
-  piece of per-table boilerplate; needs compiler-side derive support.
+- `right_join!` / `full_join!` *(done)* — new `RightJoin`/`FullJoin` kinds + handler
+  arms mirroring `left_join!`. `right_join!` returns plain `cols` (the newly joined
+  table is preserved); `full_join!` returns a `Nullable` scope. Known limitation,
+  documented on the ops: the **prior** scope's nullability isn't tracked — earlier
+  `let`-bound tables stay non-null in the types even though a right/full join can
+  make them NULL (the incremental DSL can't retroactively re-type earlier bindings).
+  For full soundness express it as a `left_join!` (`A RIGHT JOIN B` ≡ `B LEFT JOIN A`).
+- Window functions *(done)* — `Db.over : Sql a -> Window -> Sql a` (preserves the
+  input's decoder, so a windowed `sum` stays `Sql (Maybe a)`), plus `row_number` /
+  `rank` / `dense_rank` / `lag` / `lead`. `Window` built with `window` +
+  `partition_by [group …]` + `order_window [asc/desc …]`, reusing `Group`/`Order`.
+- `exactly_one` *(done)* — alongside `one` (`Maybe`); fails with a new
+  `ExpectedOneRow Int` `DbError` when the count isn't exactly 1.
+- Derivable `ColumnSet` *(still needs compiler support — confirmed 2026-06-21)*. A
+  Generic "build the column record from the source string" can't be written in
+  user-land: a named record's rep is the compiler-synthesized nominal `Rep__T`, and
+  while *consuming* derives route through it (`to`/match), there's no way to write an
+  instance for `Rep__T` or construct one in the *producing* direction — a probe
+  failed with `no impl of BuildRec for Rep__Users`. It needs a real
+  `deriving (ColumnSet)` strategy in the compiler (generate the `columns` body), like
+  the routed bridges already do for `Selectable`. Remains the last hand-written
+  per-table boilerplate.
 
 Done since this plan was written: `SelectExpr` removed in favor of `Sql a`;
 aggregate nullability for `sum`/`avg`/`min`/`max`; the `like`/`ilike`/`between`/

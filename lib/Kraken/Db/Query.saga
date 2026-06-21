@@ -67,6 +67,8 @@ type QueryStep a = QueryStep (QueryState -> (a, QueryState))
 type JoinKind =
   | InnerJoin
   | LeftJoin
+  | RightJoin
+  | FullJoin
 
 record Join {
   kind: JoinKind,
@@ -105,6 +107,8 @@ pub record Prepared a {
 pub type DbError =
   | QueryFailed QueryError
   | DecodeFailed DecodeError
+  #@ `exactly_one` got a row count other than 1 (the `Int` is the actual count).
+  | ExpectedOneRow Int
   deriving (Debug)
 
 #@ The capability to execute a prepared query against a connection. Provide a
@@ -140,6 +144,17 @@ pub effect QueryBuild {
   #@ plain columns; the bound result is a `Nullable` scope, so selecting it yields
   #@ `Maybe row`.
   fun left_join : Table cols -> (cols -> Expr) -> Nullable cols
+  #@ Right join a table: the *newly joined* table is preserved (non-null cols), while
+  #@ rows from the already-joined tables may be absent. NOTE: that prior-scope
+  #@ nullability is NOT reflected in the types — earlier bindings stay non-null — so
+  #@ for full type safety prefer expressing it as a `left_join!` (which Kraken tracks
+  #@ soundly): `A RIGHT JOIN B` ≡ `B LEFT JOIN A`.
+  fun right_join : Table cols -> (cols -> Expr) -> cols
+  #@ Full outer join: rows from either side may be absent. The newly joined table is
+  #@ bound as a `Nullable` scope (selecting it yields `Maybe row`); the same
+  #@ prior-scope caveat as `right_join!` applies — earlier bindings stay non-null in
+  #@ the types even though they can now be NULL.
+  fun full_join : Table cols -> (cols -> Expr) -> Nullable cols
   #@ Add a `WHERE` predicate. Repeated calls are combined with `AND`.
   fun where_ : Expr -> Unit
   #@ Add `GROUP BY` keys.
@@ -241,6 +256,26 @@ handler collect_query for QueryBuild {
       let (source, state2) = bind_table_source table_value state
       let cols = Core.table_cols source.alias table_value
       let join = Join { kind: LeftJoin, source: source, on: on_fn cols }
+      let QueryStep run_rest = resume Core.as_nullable cols
+      run_rest ({ state2 | joins: List.append state2.joins [join] })
+    })
+  }
+
+  right_join table_value on_fn = {
+    QueryStep (fun state -> {
+      let (source, state2) = bind_table_source table_value state
+      let cols = Core.table_cols source.alias table_value
+      let join = Join { kind: RightJoin, source: source, on: on_fn cols }
+      let QueryStep run_rest = resume cols
+      run_rest ({ state2 | joins: List.append state2.joins [join] })
+    })
+  }
+
+  full_join table_value on_fn = {
+    QueryStep (fun state -> {
+      let (source, state2) = bind_table_source table_value state
+      let cols = Core.table_cols source.alias table_value
+      let join = Join { kind: FullJoin, source: source, on: on_fn cols }
       let QueryStep run_rest = resume Core.as_nullable cols
       run_rest ({ state2 | joins: List.append state2.joins [join] })
     })
@@ -423,6 +458,8 @@ fun render_join_kind : JoinKind -> String
 render_join_kind kind = case kind {
   InnerJoin -> "INNER JOIN"
   LeftJoin -> "LEFT JOIN"
+  RightJoin -> "RIGHT JOIN"
+  FullJoin -> "FULL JOIN"
 }
 
 fun render_expr : Expr -> RenderState -> RenderState
@@ -771,6 +808,19 @@ one conn prepared = case all conn prepared {
   Err err -> Err err
 }
 
+#@ Execute a prepared query expecting *exactly one* row. Unlike `one` (which yields
+#@ `Maybe`), this fails with `ExpectedOneRow n` when the result set is empty or has
+#@ more than one row — for queries where any other count is a real error (a lookup
+#@ by primary key, an aggregate, a `RETURNING` from a single-row write).
+pub fun exactly_one : Connection -> Prepared a -> Result a DbError needs {Repo}
+exactly_one conn prepared = case all conn prepared {
+  Ok rows -> case rows {
+    [row] -> Ok row
+    _ -> Err (ExpectedOneRow (List.length rows))
+  }
+  Err err -> Err err
+}
+
 #@ How a failed transaction body's `DbError` is carried across saga_pgo's
 #@ `QueryError`-typed rollback channel. A `QueryFailed` round-trips losslessly; a
 #@ `DecodeFailed` (a row that came back but did not match the expected shape) is
@@ -779,6 +829,7 @@ fun rollback_error : DbError -> QueryError
 rollback_error err = case err {
   QueryFailed query_error -> query_error
   DecodeFailed decode_error -> UnexpectedResultType (show decode_error)
+  ExpectedOneRow count -> UnexpectedResultType ("expected exactly one row, got " <> show count)
 }
 
 #@ Run `body` inside a database transaction. Every Kraken operation the body

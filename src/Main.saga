@@ -68,6 +68,14 @@ main () = {
   let over = Read.load_users_over_post_count conn with Query.pg_repo
   Read.print_rows over (fun r -> $"{show r.id}: {r.name}")
 
+  println "-- FULL JOIN / RIGHT JOIN (rendered SQL) --"
+  println (Read.users_full_join_posts_query ()).sql
+  println (Read.posts_right_join_query ()).sql
+
+  println "-- window functions: ROW_NUMBER + COUNT(*) OVER (PARTITION BY age) --"
+  let ranked = Read.load_ranked_users conn with Query.pg_repo
+  Read.print_rows ranked (fun r -> $"#{show r.age_rank} id={show r.id} age={show r.age} peers={show r.peers}")
+
   println "-- DML: insert / update / update_all / delete (rendered SQL) --"
   println (Write.insert_user_query ()).sql
   println (Write.insert_users_query ()).sql
