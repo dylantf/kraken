@@ -927,10 +927,41 @@ targets named with `Db.ref` (not raw strings):
 `insert_on_conflict_do_nothing_returning` mirror the plain returning ops (a skipped
 DO-NOTHING row returns nothing, so `Query.one` gives `Ok Nothing` on conflict).
 
-Tier 7 is complete. Not yet built (smaller follow-ups): `DO UPDATE` to a chosen
-*subset* of columns or to arbitrary expressions (e.g. `count = users.count + 1`);
-`ON CONSTRAINT <name>` conflict targets. (Transactions — Tier 8 — are now done,
-built as a thin wrapper over saga_pgo's `Transaction` effect.)
+**Bulk / multi-row insert** (done 2026-06-21): `insert_all table rows` and
+`insert_all_returning table rows project` render a single
+`INSERT … VALUES (…), (…), …` — one round trip instead of one statement per row,
+which matters over a network (a per-row loop, even inside a transaction, still
+pays N round trips; the transaction only collapses the per-row fsync). Reuses the
+whole single-insert machinery: `insert_pairs` (so `ColumnSet` renames are honored),
+the synthesized insert record (column names + value order), and the projection
+decode path for `RETURNING`. Surfaced by the sesh-importer port (`Gap 1`), whose
+three bulk inserts this now covers. Scope/known limits:
+- **Empty list panics** at build time — there is no valid zero-row `VALUES` SQL,
+  and a true no-op would need an execution-layer short-circuit (a flag on
+  `Prepared`) that breaks the clean build-vs-execute split. Empty batches are
+  *common* (sesh-importer guards `[]` on 2 of 3 inserts), so the idiomatic pattern
+  is to guard at the call site: `case rows { [] -> Ok 0; _ -> exec (insert_all …) }`.
+- **One shared column list**, enforced. Every row must set the same columns; the
+  only way to get a ragged batch is mixing `Db.auto` (omits a `Writable` column)
+  and `Db.provide` (binds it) across rows, which now panics with a clear message
+  rather than emitting broken SQL. (Nullable `Maybe` columns always bind — NULL or
+  value — so they're never ragged.)
+- **No auto-chunking** for Postgres' 65535 bind-param ceiling (~`floor(65535 /
+  columns)` rows per statement) — document and chunk caller-side; add later if a
+  caller hits it.
+- **No bulk upsert** — `ON CONFLICT DO UPDATE` can't touch the same target row
+  twice in one statement, so multi-row upsert is deliberately out of v1.
+- `RETURNING` rows come back in `VALUES` order in practice (Postgres preserves it
+  for a single multi-row insert), which is what makes `List.zip ids inputs` work —
+  but it isn't standard-guaranteed.
+
+Tier 7 is complete, including the read path's `Gap 1` (bulk insert) and `Gap 2`
+(insert column-name resolution through `ColumnSet`, done 2026-06-21 — names come
+from the column record's `ColumnSet`, not Saga field labels). Not yet built
+(smaller follow-ups): `DO UPDATE` to a chosen *subset* of columns or to arbitrary
+expressions (e.g. `count = users.count + 1`); `ON CONSTRAINT <name>` conflict
+targets. (Transactions — Tier 8 — are now done, built as a thin wrapper over
+saga_pgo's `Transaction` effect.)
 
 Inference note worth remembering: a DML op taking *two* column-record callbacks
 (e.g. `*_returning` conflict ops: a conflict-target `(cols -> List ColRef)` and a

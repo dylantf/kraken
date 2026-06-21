@@ -1,5 +1,7 @@
 module Kraken.Db.Dml
 
+import Std.Generic (Generic)
+
 import Kraken.Db (
   Table,
   Col,
@@ -30,7 +32,6 @@ import Kraken.Db (
   and_
 )
 import Kraken.Db.Query (Prepared, DbError, QueryFailed, Repo)
-import Std.Generic (Generic)
 import SagaPgo (Connection)
 import SagaPgo.Types (Value)
 
@@ -64,7 +65,10 @@ pub effect Update {
 handler collect_update for Update {
   set col val = {
     UpdateStep (fun state -> {
-      let assignment = Assignment { column: col_name col, value: encode_value val }
+      let assignment = Assignment {
+        column: col_name col,
+        value: encode_value val,
+      }
       let UpdateStep run_rest = resume ()
       run_rest ({ state |
         assignments: List.append state.assignments [assignment],
@@ -78,7 +82,6 @@ handler collect_update for Update {
       run_rest ({ state | wheres: List.append state.wheres [expr] })
     })
   }
-
   return value = UpdateStep (fun state -> (value, state))
 }
 
@@ -118,7 +121,10 @@ finish parts = {
 fun returning_parts : List SelectItem -> List SqlPart
 returning_parts items = case items {
   [] -> [Text "*"]
-  [item] -> { let frag = item.expr; frag.parts }
+  [item] -> {
+    let frag = item.expr
+    frag.parts
+  }
   item :: rest -> {
     let frag = item.expr
     let head = List.append frag.parts [Text ", "]
@@ -210,9 +216,21 @@ value_groups_parts rows = case rows {
 
 fun insert_parts : Table cols -> List (String, Value) -> List SqlPart
 insert_parts table_value pairs = {
-  let names = List.map (fun pair -> { let (name, _v) = pair; name }) pairs
-  let vals = List.map (fun pair -> { let (_n, v) = pair; v }) pairs
-  let header = "INSERT INTO " <> table_name table_value <> " (" <> comma_join names <> ") VALUES ("
+  let names =
+    List.map (fun pair -> {
+      let (name, _v) = pair
+      name
+    }) pairs
+  let vals =
+    List.map (fun pair -> {
+      let (_n, v) = pair
+      v
+    }) pairs
+  let header = "INSERT INTO "
+    <> table_name table_value
+    <> " ("
+    <> comma_join names
+    <> ") VALUES ("
   let prefix = [Text header]
   let mid = value_placeholder_parts vals
   let tail = List.append mid [Text ")"]
@@ -222,9 +240,16 @@ insert_parts table_value pairs = {
 # `INSERT INTO t (cols) VALUES (…), (…), …` — one VALUES group per row. The column
 # list is shared, so every row's values must be in the same order; `insert_pairs`
 # guarantees this since it walks the same synthesized insert record each time.
-fun insert_all_parts : Table cols -> List String -> List (List Value) -> List SqlPart
+fun insert_all_parts : Table cols
+  -> List String
+  -> List (List Value)
+  -> List SqlPart
 insert_all_parts table_value names rows = {
-  let header = "INSERT INTO " <> table_name table_value <> " (" <> comma_join names <> ") VALUES "
+  let header = "INSERT INTO "
+    <> table_name table_value
+    <> " ("
+    <> comma_join names
+    <> ") VALUES "
   let prefix = [Text header]
   List.append prefix (value_groups_parts rows)
 }
@@ -246,11 +271,38 @@ lookup_name name_map label = case name_map {
 fun insert_pairs : Table cols -> ins -> List (String, Value)
   where {ins: InsertRow, cols: ColumnNameMap}
 insert_pairs table_value value = {
-  let name_map = column_name_map (table_cols (table_name table_value) table_value)
+  let name_map =
+    column_name_map (table_cols (table_name table_value) table_value)
   List.map (fun pair -> {
     let (label, v) = pair
     (lookup_name name_map label, v)
   }) (insert_row value)
+}
+
+fun pair_names : List (String, Value) -> List String
+pair_names pairs =
+  List.map (fun pair -> {
+    let (name, _v) = pair
+    name
+  }) pairs
+
+fun names_equal : List String -> List String -> Bool
+names_equal a b = case (a, b) {
+  ([], []) -> True
+  (x :: xs, y :: ys) -> if x == y then names_equal xs ys else False
+  _ -> False
+}
+
+# Every row in a multi-row INSERT shares one column list, so each row must set the
+# same columns. They can differ only via a `Writable` column omitted on `Db.auto`
+# but bound on `Db.provide` — mixing those across rows is the one way to get a
+# ragged batch, so we reject it with a clear message rather than emit broken SQL.
+fun all_names_match : List String -> List (List (String, Value)) -> Bool
+all_names_match names rows_pairs = case rows_pairs {
+  [] -> True
+  pairs :: rest ->
+    if names_equal names (pair_names pairs) then all_names_match names rest
+    else False
 }
 
 # Build the parts for a multi-row insert from a list of insert values. Resolves
@@ -263,10 +315,18 @@ fun insert_all_parts_of : Table cols -> List ins -> List SqlPart
 insert_all_parts_of table_value values = {
   let rows_pairs = List.map (fun v -> insert_pairs table_value v) values
   case rows_pairs {
-    [] -> panic "Dml.insert_all: empty row list (guard the call and insert nothing when the batch is empty)"
+    [] ->
+      panic "Dml.insert_all: empty row list (guard the call and insert nothing when the batch is empty)"
     first_pairs :: _ -> {
-      let names = List.map (fun pair -> { let (name, _v) = pair; name }) first_pairs
-      let row_values = fun pairs -> List.map (fun pair -> { let (_n, v) = pair; v }) pairs
+      let names = pair_names first_pairs
+      if all_names_match names rows_pairs then ()
+      else panic "Dml.insert_all: rows set different columns (a generated column is Db.auto in some rows and Db.provide in others); a multi-row INSERT needs one shared column list — make the auto/provide choice consistent across the batch"
+      let row_values =
+        fun pairs ->
+          List.map (fun pair -> {
+            let (_n, v) = pair
+            v
+          }) pairs
       let rows_vals = List.map row_values rows_pairs
       insert_all_parts table_value names rows_vals
     }
@@ -280,19 +340,17 @@ insert_all_parts_of table_value values = {
 #@ rest (e.g. DB-generated ones).
 pub fun insert : Table cols -> ins -> Prepared Unit
   where {cols: Insertable ins + ColumnNameMap, ins: InsertRow}
-insert table_value value = finish (insert_parts table_value (insert_pairs table_value value))
+insert table_value value =
+  finish (insert_parts table_value (insert_pairs table_value value))
 
 #@ Like `insert`, but appends a `RETURNING` clause built from the projection
 #@ callback (the table's columns are passed in, exactly like `select!`). The result
 #@ is a `Prepared row`; run it with `Query.one` (single insert) or `Query.all`.
-pub fun insert_returning : Table cols -> ins -> (cols -> selection) -> Prepared row
-  where {
-    cols: Insertable ins + ColumnNameMap,
-    ins: InsertRow,
-    selection: Generic selection_rep,
-    selection_rep: Selectable row_rep,
-    row: Generic row_rep,
-  }
+pub fun insert_returning : Table cols
+  -> ins
+  -> (cols -> selection)
+  -> Prepared row
+  where {cols: Insertable ins + ColumnNameMap, ins: InsertRow, selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 insert_returning table_value value project = {
   let body = insert_parts table_value (insert_pairs table_value value)
   let alias = table_name table_value
@@ -305,7 +363,12 @@ insert_returning table_value value project = {
 #@ A single round trip instead of one per row — meaningful over a network, where
 #@ a per-row loop (even inside a transaction) pays N round trips. Column names and
 #@ value order come from the synthesized insert record, exactly like `insert`.
-#@ Panics on an empty list (no valid zero-row VALUES SQL); guard empty batches.
+#@
+#@ Panics on an empty list (there is no valid zero-row VALUES SQL). Empty batches
+#@ are common, so guard at the call site rather than relying on this:
+#@
+#@     case rows { [] -> Ok 0; _ -> Dml.exec conn (Dml.insert_all t rows) }
+#@
 #@ Note Postgres caps a statement at 65535 bind parameters, so a single call is
 #@ limited to ~`floor(65535 / columns)` rows — chunk larger batches caller-side.
 pub fun insert_all : Table cols -> List ins -> Prepared Unit
@@ -319,13 +382,7 @@ pub fun insert_all_returning : Table cols
   -> List ins
   -> (cols -> selection)
   -> Prepared row
-  where {
-    cols: Insertable ins + ColumnNameMap,
-    ins: InsertRow,
-    selection: Generic selection_rep,
-    selection_rep: Selectable row_rep,
-    row: Generic row_rep,
-  }
+  where {cols: Insertable ins + ColumnNameMap, ins: InsertRow, selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 insert_all_returning table_value values project = {
   let body = insert_all_parts_of table_value values
   let alias = table_name table_value
@@ -337,8 +394,9 @@ insert_all_returning table_value values project = {
 # --- ON CONFLICT (upsert) ---
 
 fun conflict_target_parts : List String -> List SqlPart
-conflict_target_parts names =
-  [Text (" ON CONFLICT (" <> comma_join names <> ")")]
+conflict_target_parts names = [
+  Text (" ON CONFLICT (" <> comma_join names <> ")"),
+]
 
 # `name = EXCLUDED.name` for each column, comma-joined — the standard upsert SET
 # that overwrites the conflicting row with the values from this insert.
@@ -363,7 +421,8 @@ drop_names remove names = case names {
 
 fun conflict_update_parts : List String -> List String -> List SqlPart
 conflict_update_parts target_names set_names = case set_names {
-  [] -> panic "Dml.upsert: conflict target covers every inserted column; nothing to update (use insert_on_conflict_do_nothing)"
+  [] ->
+    panic "Dml.upsert: conflict target covers every inserted column; nothing to update (use insert_on_conflict_do_nothing)"
   _ -> {
     let target = conflict_target_parts target_names
     let head = List.append target [Text " DO UPDATE SET "]
@@ -372,18 +431,29 @@ conflict_update_parts target_names set_names = case set_names {
 }
 
 # Full `INSERT ... ON CONFLICT (<target>) DO NOTHING` statement parts.
-fun do_nothing_parts : Table cols -> List (String, Value) -> List String -> List SqlPart
+fun do_nothing_parts : Table cols
+  -> List (String, Value)
+  -> List String
+  -> List SqlPart
 do_nothing_parts table_value pairs target_names = {
   let body = insert_parts table_value pairs
-  let conflict = List.append (conflict_target_parts target_names) [Text " DO NOTHING"]
+  let conflict =
+    List.append (conflict_target_parts target_names) [Text " DO NOTHING"]
   List.append body conflict
 }
 
 # Full `INSERT ... ON CONFLICT (<target>) DO UPDATE SET <rest> = EXCLUDED.<rest>`.
-fun upsert_parts : Table cols -> List (String, Value) -> List String -> List SqlPart
+fun upsert_parts : Table cols
+  -> List (String, Value)
+  -> List String
+  -> List SqlPart
 upsert_parts table_value pairs target_names = {
   let body = insert_parts table_value pairs
-  let inserted_names = List.map (fun pair -> { let (name, _v) = pair; name }) pairs
+  let inserted_names =
+    List.map (fun pair -> {
+      let (name, _v) = pair
+      name
+    }) pairs
   let set_names = drop_names target_names inserted_names
   let conflict = conflict_update_parts target_names set_names
   List.append body conflict
@@ -429,18 +499,13 @@ pub fun insert_on_conflict_do_nothing_returning : Table cols
   -> (cols -> List ColRef)
   -> (cols -> selection)
   -> Prepared row
-  where {
-    cols: Insertable ins + ColumnNameMap,
-    ins: InsertRow,
-    selection: Generic selection_rep,
-    selection_rep: Selectable row_rep,
-    row: Generic row_rep,
-  }
+  where {cols: Insertable ins + ColumnNameMap, ins: InsertRow, selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 insert_on_conflict_do_nothing_returning table_value value target project = {
   let alias = table_name table_value
   let cols = table_cols alias table_value
   let target_names = List.map ref_name (target cols)
-  let body = do_nothing_parts table_value (insert_pairs table_value value) target_names
+  let body =
+    do_nothing_parts table_value (insert_pairs table_value value) target_names
   finish_returning body (select (project cols))
 }
 
@@ -452,18 +517,13 @@ pub fun upsert_returning : Table cols
   -> (cols -> List ColRef)
   -> (cols -> selection)
   -> Prepared row
-  where {
-    cols: Insertable ins + ColumnNameMap,
-    ins: InsertRow,
-    selection: Generic selection_rep,
-    selection_rep: Selectable row_rep,
-    row: Generic row_rep,
-  }
+  where {cols: Insertable ins + ColumnNameMap, ins: InsertRow, selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 upsert_returning table_value value target project = {
   let alias = table_name table_value
   let cols = table_cols alias table_value
   let target_names = List.map ref_name (target cols)
-  let body = upsert_parts table_value (insert_pairs table_value value) target_names
+  let body =
+    upsert_parts table_value (insert_pairs table_value value) target_names
   finish_returning body (select (project cols))
 }
 
@@ -474,11 +534,13 @@ update_body table_value state = {
   List.append head (where_parts state.wheres)
 }
 
-fun run_update : Table cols -> (cols -> Unit needs {Update}) -> (cols, UpdateState)
+fun run_update : Table cols
+  -> (cols -> Unit needs {Update})
+  -> (cols, UpdateState)
 run_update table_value build = {
   let alias = table_name table_value
   let cols = table_cols alias table_value
-  let UpdateStep run = (build cols) with collect_update
+  let UpdateStep run = build cols with collect_update
   let (_result, state) = run empty_update_state
   (cols, state)
 }
@@ -497,11 +559,7 @@ pub fun update_returning : Table cols
   -> (cols -> Unit needs {Update})
   -> (cols -> selection)
   -> Prepared row
-  where {
-    selection: Generic selection_rep,
-    selection_rep: Selectable row_rep,
-    row: Generic row_rep,
-  }
+  where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 update_returning table_value build project = {
   let (cols, state) = run_update table_value build
   let projection = select (project cols)
@@ -551,7 +609,8 @@ key_conditions pairs = case pairs {
 
 fun key_where_parts : List (String, Value) -> List SqlPart
 key_where_parts pairs = case pairs {
-  [] -> panic "Dml.update_all: table has no primary_key (declare one in its ColumnSet impl)"
+  [] ->
+    panic "Dml.update_all: table has no primary_key (declare one in its ColumnSet impl)"
   _ -> {
     let conds = key_conditions pairs
     List.append [Text " WHERE "] conds
@@ -600,11 +659,7 @@ pub fun delete_returning : Table cols
   -> (cols -> Expr)
   -> (cols -> selection)
   -> Prepared row
-  where {
-    selection: Generic selection_rep,
-    selection_rep: Selectable row_rep,
-    row: Generic row_rep,
-  }
+  where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 delete_returning table_value predicate project = {
   let alias = table_name table_value
   let cols = table_cols alias table_value
