@@ -458,11 +458,15 @@ record RenderState {
   parts: List SqlPart,
 }
 
+# Parts accumulate *reversed* (prepend is O(1); a snoc onto the growing list would
+# make rendering O(n²)). The extraction sites reverse once at the end. This mirrors
+# saga_json's reversed-iolist renderer.
 fun render_text : String -> RenderState -> RenderState
-render_text text state = { state | parts: List.append state.parts [Text text] }
+render_text text state = { state | parts: Text text :: state.parts }
 
 fun render_frag : SqlFrag -> RenderState -> RenderState
-render_frag frag state = { state | parts: List.append state.parts frag.parts }
+render_frag frag state =
+  { state | parts: List.append (List.reverse frag.parts) state.parts }
 
 # Render a source as parts. A named table is `name` (or `name AS alias`); a derived
 # table is `(<subquery fragment>) AS alias`, with the fragment's params left for the
@@ -628,17 +632,23 @@ render_from_onward source state st =
 # Final pass: turn the flat parts into SQL text with `$1`, `$2`, … and the ordered
 # parameter list. Numbering follows part order, so embedded subquery params fall
 # into the right positions automatically.
-fun number_parts : List SqlPart -> Int -> (String, List Value)
-number_parts parts idx = case parts {
-  [] -> ("", [])
-  Text text :: rest -> {
-    let (sql, params) = number_parts rest idx
-    (text <> sql, params)
-  }
-  Param value :: rest -> {
-    let (sql, params) = number_parts rest (idx + 1)
-    ("$" <> show idx <> sql, value :: params)
-  }
+#
+# A single left-to-right fold builds the text pieces and params *reversed*, then
+# joins/reverses once — O(total length). The old right-recursive `text <> sql`
+# re-copied the growing suffix at every step (O(n²)). Exposed (`pub`) so the DML
+# layer renders through the same numbering pass instead of duplicating it.
+pub fun number_parts : List SqlPart -> (String, List Value)
+number_parts parts = {
+  let step =
+    fun acc part -> {
+      let (pieces, params, idx) = acc
+      case part {
+        Text text -> (text :: pieces, params, idx)
+        Param value -> (("$" <> show idx) :: pieces, value :: params, idx + 1)
+      }
+    }
+  let (rev_pieces, rev_params, _idx) = List.foldl step ([], [], 1) parts
+  (String.join "" (List.reverse rev_pieces), List.reverse rev_params)
 }
 
 # Render the CTE definitions of a `WITH name AS (body), …` clause (no leading
@@ -677,14 +687,14 @@ select_frag items state = case state.from_source {
       |> render_text "SELECT "
       |> render_selects items
       |> render_from_onward source state
-    SqlFrag { parts: built.parts }
+    SqlFrag { parts: List.reverse built.parts }
   }
 }
 
 fun prepare : Projection a -> QueryState -> Prepared a
 prepare projection state = {
   let frag = select_frag (Core.projection_selections projection) state
-  let (sql, params) = number_parts frag.parts 1
+  let (sql, params) = number_parts frag.parts
   Prepared {
     sql: sql,
     params: params,
@@ -703,7 +713,7 @@ subquery_frag state = case state.from_source {
       RenderState { parts: [] }
       |> render_text "SELECT 1"
       |> render_from_onward source state
-    SqlFrag { parts: built.parts }
+    SqlFrag { parts: List.reverse built.parts }
   }
 }
 
@@ -751,7 +761,7 @@ scalar_select_frag col_frag state = case state.from_source {
       |> render_text "SELECT "
       |> render_frag col_frag
       |> render_from_onward source state
-    SqlFrag { parts: built.parts }
+    SqlFrag { parts: List.reverse built.parts }
   }
 }
 

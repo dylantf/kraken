@@ -53,21 +53,58 @@ priority, because they undercut the whole value proposition of a typed builder.
 
 ---
 
-## 2. Fix the O(n²) append patterns
+## 2. Fix the O(n²) append patterns — DONE (2026-06-21)
 
 Pervasive and cheap to fix now while the surface is small; annoying to retrofit
 once large `IN` lists / wide bulk inserts appear.
 
 - **Problem:** rendering snocs onto a growing list per part, and the DML renderer
   does `acc.sql <> text` per part; `QueryState` snocs each clause too.
-- **Fix:** accumulate reversed (cons onto the front) and reverse once at the end,
-  or build an iolist and let BEAM flatten it.
-- **Where:**
-  - `lib/Kraken/Db/Query.saga:442` (`render_text` — `List.append state.parts [...]`)
-  - `lib/Kraken/Db/Dml.saga:105` (`render_parts` — `acc.sql <> text`)
-  - `lib/Kraken/Db/Query.saga:255` (`where_` op — `List.append state.wheres [expr]`,
-    and the sibling accumulating ops)
-  - `lib/Kraken/Db.saga` `append_frag` / `append_frags` chains
+- **What was actually O(n²) (scales with *data* — big `IN` lists, bulk inserts):**
+  - `render_text`/`render_frag` — `List.append state.parts [...]` snoc onto the
+    growing accumulator.
+  - DML `render_parts` — `acc.sql <> text` per part.
+  - `number_parts` — right-recursive `text <> sql` re-copied the growing suffix.
+- **What only *looked* it (left as-is):** `append_frag`/`append_frags` in `Db.saga`
+  are right-nested with small left operands, and `lists:append(Xs,Ys)` is O(|Xs|),
+  so they're linear. The effect-op clause accumulators (`List.append state.wheres
+  [expr]`) are O(clauses²) but clauses are hand-written and always tiny — not a
+  data-scaling risk. Noted, not changed.
+- **Fix (chosen):** accumulate the parts list reversed (O(1) cons) and reverse once
+  at extraction (mirrors saga_json's reversed-iolist renderer). `number_parts`
+  became a single left fold building reversed text pieces + params, then
+  `String.join "" (reverse …)` once — O(n). Made `number_parts` `pub` and routed the
+  DML layer through it, deleting DML's duplicated `Rendered`/`render_parts`.
+- **Verified:** golden diff of 17 representative rendered queries (selects, joins,
+  subqueries, CTE, full join, window, CASE/CONCAT, arithmetic, INSERT) — byte
+  identical before/after via a clean worktree at the prior commit.
+
+---
+
+## BUG (discovered during #2 verification) — `insert_all` crashes at runtime
+
+**Pre-existing, not from this review's work.** Surfaced when the golden-diff harness
+ran the demo's bulk insert.
+
+- **Symptom:** `saga run` of the demo crashes at the bulk-insert line:
+  ```
+  Runtime error: bad argument
+    read:__dict_Kraken_Db_InsertRow_read_Read_UsersInsert
+    kraken_db_dml:insert_pairs/4
+    kraken_db_dml:insert_all_parts_of
+    write:insert_users_query
+  ```
+- **Diagnosis:** single-row `Dml.insert` works (calls `insert_pairs` directly), but
+  `insert_all_parts_of` calls it through `List.map (fun v -> insert_pairs table_value
+  v) values` and the `InsertRow` / `ColumnNameMap` dictionary isn't threaded into the
+  mapped closure → undefined `__dict_…` → "bad argument". Looks like a **compiler
+  dictionary-passing bug** for a constrained function invoked inside a mapped lambda
+  (relevant to the saga compiler repo, not Kraken source).
+- **Impact:** `insert_all` / `insert_all_returning` are unusable at runtime for the
+  demo's synthesized insert types, despite typechecking and being marked "done".
+- **Next:** build a minimal repro (constrained fn called inside `List.map`), fix in
+  the compiler, or work around in Kraken by hoisting the dict (e.g. a recursive
+  helper that takes the value explicitly rather than a closure over `List.map`).
 
 ---
 

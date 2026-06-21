@@ -37,7 +37,7 @@ import Kraken.Db (
   set_expr_column,
   set_expr_frag
 )
-import Kraken.Db.Query (Prepared, DbError, QueryFailed, Repo, noop_prepared)
+import Kraken.Db.Query (Prepared, DbError, QueryFailed, Repo, noop_prepared, number_parts)
 import SagaPgo (Connection)
 import SagaPgo.Types (Value)
 
@@ -92,31 +92,17 @@ handler collect_update for Update {
 }
 
 # --- Rendering ---
-
-record Rendered {
-  sql: String,
-  params: List Value,
-  next: Int,
-}
-
-fun render_parts : List SqlPart -> Rendered -> Rendered
-render_parts parts acc = case parts {
-  [] -> acc
-  Text text :: rest -> render_parts rest ({ acc | sql: acc.sql <> text })
-  Param value :: rest ->
-    render_parts rest ({ acc |
-      sql: acc.sql <> "$" <> show acc.next,
-      params: List.append acc.params [value],
-      next: acc.next + 1,
-    })
-}
+#
+# DML statements render to a flat `List SqlPart` and number `$1`, `$2`, … through
+# the query layer's shared `number_parts` (one O(n) fold), so the two modules can't
+# drift in how params are numbered.
 
 fun finish : List SqlPart -> Prepared Unit
 finish parts = {
-  let rendered = render_parts parts (Rendered { sql: "", params: [], next: 1 })
+  let (sql, params) = number_parts parts
   Prepared {
-    sql: rendered.sql,
-    params: rendered.params,
+    sql: sql,
+    params: params,
     decode: fun _ -> Ok (),
     noop: False,
   }
@@ -147,10 +133,10 @@ finish_returning body projection = {
   let returning = returning_parts (projection_selections projection)
   let clause = List.append [Text " RETURNING "] returning
   let parts = List.append body clause
-  let rendered = render_parts parts (Rendered { sql: "", params: [], next: 1 })
+  let (sql, params) = number_parts parts
   Prepared {
-    sql: rendered.sql,
-    params: rendered.params,
+    sql: sql,
+    params: params,
     decode: decode_projection projection,
     noop: False,
   }
