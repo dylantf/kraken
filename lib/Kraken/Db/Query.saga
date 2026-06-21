@@ -143,11 +143,6 @@ pub effect QueryBuild {
   #@ plain columns; the bound result is a `Nullable` scope, so selecting it yields
   #@ `Maybe row`.
   fun left_join : Table cols -> (cols -> Expr) -> Nullable cols
-  #@ Full outer join: rows from either side may be absent. The newly joined table is
-  #@ bound as a `Nullable` scope (selecting it yields `Maybe row`); the same
-  #@ prior-scope caveat as `right_join!` applies — earlier bindings stay non-null in
-  #@ the types even though they can now be NULL.
-  fun full_join : Table cols -> (cols -> Expr) -> Nullable cols
   #@ Add a `WHERE` predicate. Repeated calls are combined with `AND`.
   fun where_ : Expr -> Unit
   #@ Add `GROUP BY` keys.
@@ -254,16 +249,6 @@ handler collect_query for QueryBuild {
     })
   }
 
-  full_join table_value on_fn = {
-    QueryStep (fun state -> {
-      let (source, state2) = bind_table_source table_value state
-      let cols = Core.table_cols source.alias table_value
-      let join = Join { kind: FullJoin, source: source, on: on_fn cols }
-      let QueryStep run_rest = resume Core.as_nullable cols
-      run_rest ({ state2 | joins: List.append state2.joins [join] })
-    })
-  }
-
   where_ expr = {
     QueryStep (fun state -> {
       let QueryStep run_rest = resume ()
@@ -323,6 +308,43 @@ pub fun query : (Unit -> selection needs {QueryBuild}) -> Prepared row
 query make = {
   let QueryStep run_query = make () with collect_query
   let (selection, state) = run_query empty_state
+  let projection: Projection row = Core.select selection
+  prepare projection state
+}
+
+#@ Build a FULL OUTER JOIN query between two tables. A full join is symmetric (no
+#@ "primary" table), so it's its own constructor rather than a chained join: it takes
+#@ both tables, the join `ON` (over their plain columns), and a body that receives
+#@ both as `Nullable` scopes — because either side can be absent. Selecting those
+#@ scopes therefore yields `Maybe row` on both, which is the honest type for a full
+#@ join (a row can be left-only, right-only, or matched).
+#@
+#@ This is sound by construction: the body never gets a non-null binder for these
+#@ tables, so there's no way to bind one non-null and have the full join silently
+#@ NULL it. The body is the ordinary `QueryBuild` DSL (add `where_!`, `order_by!`,
+#@ etc., then `select!`); `from!` would panic (the FROM is already set). Reference a
+#@ scope's columns in further predicates via `Db.unwrap_cols`.
+#@
+#@     full_join_query employees departments
+#@       (fun e d -> Db.eq_col e.dept_id d.id)
+#@       (fun emp dept -> { select! ({ employee: emp, department: dept }) })
+pub fun full_join_query : Table colsA
+  -> Table colsB
+  -> (colsA -> colsB -> Expr)
+  -> ((Nullable colsA, Nullable colsB) -> selection needs {QueryBuild})
+  -> Prepared row
+  where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
+full_join_query table_a table_b on_fn body = {
+  let (source_a, state1) = bind_table_source table_a empty_state
+  let (source_b, state2) = bind_table_source table_b state1
+  let cols_a = Core.table_cols source_a.alias table_a
+  let cols_b = Core.table_cols source_b.alias table_b
+  let join = Join { kind: FullJoin, source: source_b, on: on_fn cols_a cols_b }
+  let state3 = set_from_source state2 source_a
+  let state4 = { state3 | joins: List.append state3.joins [join] }
+  let scopes = (Core.as_nullable cols_a, Core.as_nullable cols_b)
+  let QueryStep run = (body scopes) with collect_query
+  let (selection, state) = run state4
   let projection: Projection row = Core.select selection
   prepare projection state
 }

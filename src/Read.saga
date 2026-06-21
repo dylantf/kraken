@@ -281,16 +281,13 @@ users_over_post_count_query () = Query.query (fun () -> {
   select! ({ id: u.id, name: u.name })
 })
 
-# FULL JOIN: the joined table is a Nullable scope (post: Maybe Post). The prior
-# scope (user) stays non-null in the types — the documented right/full-join caveat —
-# so this is shown as rendered SQL rather than executed.
+# FULL JOIN via the dedicated full-join constructor: both tables are bound nullable,
+# so the row is all-Maybe (user-only rows, post-only rows, and matched rows all
+# appear). The ON sees both tables' plain columns; the body gets both as Nullable.
 pub fun users_full_join_posts_query : Unit
-  -> Query.Prepared { user: User, post: Maybe Post }
-users_full_join_posts_query () = Query.query (fun () -> {
-  let u = from! users
-  let p = full_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
-  order_by! [Db.asc u.id]
-  select! ({ user: u, post: p })
+  -> Query.Prepared { user: Maybe User, post: Maybe Post }
+users_full_join_posts_query () = Query.full_join_query users posts (fun u p -> Db.eq_col p.author_id u.id) (fun (user_scope, post_scope) -> {
+  select! ({ user: user_scope, post: post_scope })
 })
 
 # Window functions: rank by age (ROW_NUMBER over ORDER BY), and a partitioned
@@ -308,9 +305,19 @@ ranked_users_query () = Query.query (fun () -> {
 })
 
 pub fun load_ranked_users : Connection
-  -> Result (List { id: Int, age: Int, age_rank: Int, peers: Int }) Query.DbError
+  -> Result (List {
+    id: Int,
+    age: Int,
+    age_rank: Int,
+    peers: Int,
+  }) Query.DbError
   needs {Repo}
 load_ranked_users conn = Query.all conn (ranked_users_query ())
+
+pub fun load_full_join : Connection
+  -> Result (List { user: Maybe User, post: Maybe Post }) Query.DbError
+  needs {Repo}
+load_full_join conn = Query.all conn (users_full_join_posts_query ())
 
 # Loaders
 
@@ -375,9 +382,7 @@ print_optional_posts result = case result {
 # `fmt` lambda is checked (otherwise a bare `row.id` is an "ambiguous field"). Keep
 # the `print_rows result (fun r -> …)` call on one line — a line break before the
 # lambda would leave `print_rows` partially applied.
-pub fun print_rows : Result (List a) Query.DbError
-  -> (a -> String)
-  -> Unit
+pub fun print_rows : Result (List a) Query.DbError -> (a -> String) -> Unit
   needs {Stdio}
 print_rows result fmt = case result {
   Ok rows -> {
@@ -410,9 +415,11 @@ load_prolific_authors_cte conn = Query.all conn (prolific_authors_cte_query ())
 pub fun load_users_with_total_posts : Connection
   -> Result (List { id: Int, total_posts: Int }) Query.DbError
   needs {Repo}
-load_users_with_total_posts conn = Query.all conn (users_with_total_posts_query ())
+load_users_with_total_posts conn =
+  Query.all conn (users_with_total_posts_query ())
 
 pub fun load_users_over_post_count : Connection
   -> Result (List { id: Int, name: String }) Query.DbError
   needs {Repo}
-load_users_over_post_count conn = Query.all conn (users_over_post_count_query ())
+load_users_over_post_count conn =
+  Query.all conn (users_over_post_count_query ())

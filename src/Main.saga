@@ -68,8 +68,14 @@ main () = {
   let over = Read.load_users_over_post_count conn with Query.pg_repo
   Read.print_rows over (fun r -> $"{show r.id}: {r.name}")
 
-  println "-- FULL JOIN (rendered SQL) --"
+  println "-- FULL JOIN: both sides Maybe (matched / user-only / post-only) --"
   println (Read.users_full_join_posts_query ()).sql
+  let fj = Read.load_full_join conn with Query.pg_repo
+  Read.print_rows fj (fun r -> {
+    let u = case r.user { Just usr -> usr.name; Nothing -> "<none>" }
+    let p = case r.post { Just pst -> pst.title; Nothing -> "<none>" }
+    $"user={u} post={p}"
+  })
 
   println "-- window functions: ROW_NUMBER + COUNT(*) OVER (PARTITION BY age) --"
   let ranked = Read.load_ranked_users conn with Query.pg_repo

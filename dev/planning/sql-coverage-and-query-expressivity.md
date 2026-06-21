@@ -1391,13 +1391,36 @@ Kraken.
 
 **Tier 3 — polish** (mostly done 2026-06-21).
 
-- `right_join!` / `full_join!` *(done)* — new `RightJoin`/`FullJoin` kinds + handler
-  arms mirroring `left_join!`. `right_join!` returns plain `cols` (the newly joined
-  table is preserved); `full_join!` returns a `Nullable` scope. Known limitation,
-  documented on the ops: the **prior** scope's nullability isn't tracked — earlier
-  `let`-bound tables stay non-null in the types even though a right/full join can
-  make them NULL (the incremental DSL can't retroactively re-type earlier bindings).
-  For full soundness express it as a `left_join!` (`A RIGHT JOIN B` ≡ `B LEFT JOIN A`).
+- `right_join!` *(deliberately omitted)* — `A RIGHT JOIN B` ≡ `B LEFT JOIN A`, so it
+  adds no expressive power over `left_join!`, and the incremental DSL can't track its
+  prior-scope nullability soundly. Reorder to a `left_join!` instead.
+- **Full outer join** *(done — sound, via its own constructor)*. A chained `full_join!`
+  in the `from!`/`join!` DSL is unsound: the prior `let`-bound scopes are committed
+  non-null and a later full join can't retroactively re-type them. The fix is to make
+  the full join its *own* construct that owns both tables and binds **both** as
+  `Nullable` from the start — matching how you'd hand-type a full-join row in e.g.
+  postgresql-simple (a product of `Maybe` per table). So:
+  `full_join_query tableA tableB (a b -> Expr) ((Nullable a, Nullable b) -> selection)`
+  — a function (not an effect op) that seeds the `QueryState` with `A FULL JOIN B`,
+  then runs an ordinary `QueryBuild` body with both scopes pre-bound nullable. A
+  function (rather than a chained `!`-op) is the *right* shape because a full join is
+  **non-compositional** — you don't incrementally chain more joins onto it the way you
+  build an inner/left query — so a self-contained constructor fits the operation, and
+  the body still uses the normal `where_!`/`order_by!`/`select!` DSL on the two
+  nullable scopes. Sound
+  **by construction**: the body never receives a non-null binder for these tables, so
+  nothing can be bound non-null and then silently NULLed; selecting either side yields
+  `Maybe row`, reusing the existing `Nullable` + `slice_all_null` decode. Verified
+  end-to-end (matched / left-only / right-only rows all decode). Covers the 2-table
+  reconciliation case (≈all real full-join use); 3+ way → raw SQL.
+  - Design aside: a dedicated `FullQuery` *effect* (so `full_root!`/`full_join!` read
+    like the chained DSL) also works, but re-declaring `where_`/`select`/… in a second
+    effect makes the bare `!` calls ambiguous wherever both effects are imported —
+    Saga doesn't disambiguate by ambient effect, so the shared ops must be qualified
+    `FullQuery.where_!` / `FullQuery.select!`. The function-based constructor was
+    chosen because it needs *no* qualification: its body reuses the one `QueryBuild`,
+    so `where_!` / `select!` stay bare. (The unique binders `full_root!`/`full_join!`
+    wouldn't need qualifying either way; it's only the clause ops that collide.)
 - Window functions *(done)* — `Db.over : Sql a -> Window -> Sql a` (preserves the
   input's decoder, so a windowed `sum` stays `Sql (Maybe a)`), plus `row_number` /
   `rank` / `dense_rank` / `lag` / `lead`. `Window` built with `window` +
