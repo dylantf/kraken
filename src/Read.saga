@@ -293,16 +293,6 @@ users_full_join_posts_query () = Query.query (fun () -> {
   select! ({ user: u, post: p })
 })
 
-# RIGHT JOIN: the newly joined table (posts) is preserved as non-null cols.
-pub fun posts_right_join_query : Unit
-  -> Query.Prepared { post_id: Int, title: String }
-posts_right_join_query () = Query.query (fun () -> {
-  let u = from! users
-  let p = right_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
-  order_by! [Db.asc p.id]
-  select! ({ post_id: p.id, title: p.title })
-})
-
 # Window functions: rank by age (ROW_NUMBER over ORDER BY), and a partitioned
 # windowed count (peers = users sharing the same age).
 pub fun ranked_users_query : Unit

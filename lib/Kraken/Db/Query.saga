@@ -67,7 +67,6 @@ type QueryStep a = QueryStep (QueryState -> (a, QueryState))
 type JoinKind =
   | InnerJoin
   | LeftJoin
-  | RightJoin
   | FullJoin
 
 record Join {
@@ -144,12 +143,6 @@ pub effect QueryBuild {
   #@ plain columns; the bound result is a `Nullable` scope, so selecting it yields
   #@ `Maybe row`.
   fun left_join : Table cols -> (cols -> Expr) -> Nullable cols
-  #@ Right join a table: the *newly joined* table is preserved (non-null cols), while
-  #@ rows from the already-joined tables may be absent. NOTE: that prior-scope
-  #@ nullability is NOT reflected in the types — earlier bindings stay non-null — so
-  #@ for full type safety prefer expressing it as a `left_join!` (which Kraken tracks
-  #@ soundly): `A RIGHT JOIN B` ≡ `B LEFT JOIN A`.
-  fun right_join : Table cols -> (cols -> Expr) -> cols
   #@ Full outer join: rows from either side may be absent. The newly joined table is
   #@ bound as a `Nullable` scope (selecting it yields `Maybe row`); the same
   #@ prior-scope caveat as `right_join!` applies — earlier bindings stay non-null in
@@ -257,16 +250,6 @@ handler collect_query for QueryBuild {
       let cols = Core.table_cols source.alias table_value
       let join = Join { kind: LeftJoin, source: source, on: on_fn cols }
       let QueryStep run_rest = resume Core.as_nullable cols
-      run_rest ({ state2 | joins: List.append state2.joins [join] })
-    })
-  }
-
-  right_join table_value on_fn = {
-    QueryStep (fun state -> {
-      let (source, state2) = bind_table_source table_value state
-      let cols = Core.table_cols source.alias table_value
-      let join = Join { kind: RightJoin, source: source, on: on_fn cols }
-      let QueryStep run_rest = resume cols
       run_rest ({ state2 | joins: List.append state2.joins [join] })
     })
   }
@@ -458,7 +441,6 @@ fun render_join_kind : JoinKind -> String
 render_join_kind kind = case kind {
   InnerJoin -> "INNER JOIN"
   LeftJoin -> "LEFT JOIN"
-  RightJoin -> "RIGHT JOIN"
   FullJoin -> "FULL JOIN"
 }
 

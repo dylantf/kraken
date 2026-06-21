@@ -68,9 +68,8 @@ main () = {
   let over = Read.load_users_over_post_count conn with Query.pg_repo
   Read.print_rows over (fun r -> $"{show r.id}: {r.name}")
 
-  println "-- FULL JOIN / RIGHT JOIN (rendered SQL) --"
+  println "-- FULL JOIN (rendered SQL) --"
   println (Read.users_full_join_posts_query ()).sql
-  println (Read.posts_right_join_query ()).sql
 
   println "-- window functions: ROW_NUMBER + COUNT(*) OVER (PARTITION BY age) --"
   let ranked = Read.load_ranked_users conn with Query.pg_repo
