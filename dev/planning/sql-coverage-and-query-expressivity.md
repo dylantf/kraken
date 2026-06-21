@@ -668,23 +668,41 @@ Still open for JSONB:
 
 ## Tier 5: Casts And SQL Functions
 
-Casts are a good forcing function for `Sql a`:
+### Casts — done (2026-06-21)
+
+`Db.cast : input -> Sql b where {input: ToSql a, b: PgType + PgTypeName}` renders
+`(<input>)::<target>` and decodes as the target. It's a *typed assertion*, not a
+checked conversion — same trust boundary as `raw` (Postgres validates at runtime),
+but the result is a first-class `Sql b`, so it's selectable and usable in
+`where_!` / `having!`. The target isn't inferable from the input, so it's either
+annotated or fixed by an `as_*` helper:
 
 ```saga
-Db.cast u.id Db.pg_text
+select! ({ id: u.id, age_text: Db.as_text u.age })   -- (t0.age)::text AS age_text
+select! ({ id: p.id, created: Db.as_text p.created_at })  -- timestamp -> text
+where_! (Db.eq (Db.as_date u.name) some_date)         -- text -> date
 ```
 
-Possible type representation:
+Mechanism:
 
-```saga
-pub opaque type PgTypeName a
+- `PgTypeName a` trait (method `pg_type_name : TypeTag a -> String`) supplies the
+  `::name`. `TypeTag a` is a Star-kinded phantom (`Std.Base.Proxy` is Symbol-kinded
+  only, so it can't carry a Star type argument).
+- Instances cover the scalar `PgType`s: Int→`integer`, Float→`double precision`,
+  String→`text`, Bool→`boolean`, Uuid→`uuid`, **and the date/time types** —
+  NaiveDateTime→`timestamp`, Date→`date`, Time→`time`.
+- Helpers fix the target so no annotation is needed: `as_int` / `as_float` /
+  `as_text` / `as_bool` / `as_timestamp` / `as_date` / `as_time`. A field pipes
+  straight in: `u.created_at |> Db.as_text`.
 
-pub fun pg_text : PgTypeName String
-pub fun pg_int : PgTypeName Int
-pub fun pg_bool : PgTypeName Bool
+Date/time was the motivating case ("casting timestamp ↔ string all the time"). It
+needed `PgType` instances for `Date` / `NaiveDateTime` / `Time`, which in turn
+needed both codec halves in saga_pgo. saga_pgo now ships both encode (`pg_date` /
+`pg_naive_datetime` / `pg_time`) and decode (`date` / `naive_datetime` / `time`),
+so these are real Kraken column types as well as cast targets — no Erlang work left
+on the Kraken side.
 
-pub fun cast : Sql a -> PgTypeName b -> Sql b
-```
+### SQL functions — still todo
 
 Generic SQL functions can use raw fragments initially:
 

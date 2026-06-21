@@ -16,6 +16,7 @@ import Std.Dynamic (
   from_erlang
 )
 import Std.Generic (Generic, Leaf, Labeled, And, Record)
+import Std.DateTime (Date, Time, NaiveDateTime)
 import SagaJson as Json
 import SagaJson.Codec as JsonCodec (ToJson, FromJson)
 import SagaPgo (Connection, Postgres, QueryError, Returned)
@@ -82,6 +83,21 @@ impl PgType for T.Uuid {
   decode_pg = T.uuid
 }
 
+impl PgType for Date {
+  encode_pg value = T.pg_date value
+  decode_pg = T.date
+}
+
+impl PgType for NaiveDateTime {
+  encode_pg value = T.pg_naive_datetime value
+  decode_pg = T.naive_datetime
+}
+
+impl PgType for Time {
+  encode_pg value = T.pg_time value
+  decode_pg = T.time
+}
+
 impl PgType for Array a where {a: PgType} {
   encode_pg array_value = case array_value {
     Array values -> coerce_value values
@@ -136,6 +152,15 @@ impl PgTypeName for Bool {
 }
 impl PgTypeName for T.Uuid {
   pg_type_name _ = "uuid"
+}
+impl PgTypeName for Date {
+  pg_type_name _ = "date"
+}
+impl PgTypeName for NaiveDateTime {
+  pg_type_name _ = "timestamp"
+}
+impl PgTypeName for Time {
+  pg_type_name _ = "time"
 }
 
 @external("erlang", "kraken_unsafe", "from_dynamic")
@@ -623,6 +648,18 @@ as_text input = cast input
 #@ `<input>::boolean`.
 pub fun as_bool : input -> Sql Bool where {input: ToSql a}
 as_bool input = cast input
+
+#@ `<input>::timestamp` — e.g. parse a string column as a timestamp.
+pub fun as_timestamp : input -> Sql NaiveDateTime where {input: ToSql a}
+as_timestamp input = cast input
+
+#@ `<input>::date`.
+pub fun as_date : input -> Sql Date where {input: ToSql a}
+as_date input = cast input
+
+#@ `<input>::time`.
+pub fun as_time : input -> Sql Time where {input: ToSql a}
+as_time input = cast input
 
 fun array_frag : input -> SqlFrag where {input: ToArraySql a}
 array_frag input = sql_frag (to_array_sql input)
