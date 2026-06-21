@@ -94,7 +94,9 @@ users_age_text_query () = Query.query (fun () -> {
 
 # SPIKE: dynamic query — optional filters chosen at runtime. The closure is
 # ordinary code, so `if`/`else` and `List.iter` over effect ops just compose.
-pub fun search_users_query : Maybe Int -> Maybe String -> Bool
+pub fun search_users_query : Maybe Int
+  -> Maybe String
+  -> Bool
   -> Query.Prepared { id: Int, name: String, age: Int }
 search_users_query min_age name_like newest_first = Query.query (fun () -> {
   let u = from! users
@@ -216,11 +218,11 @@ user_tier_query () = Query.query (fun () -> {
   where_! (Db.not_ (Db.eq u.age 0))
   select! ({
     id: u.id,
-    label: Db.concat [Db.value "user:", Db.sql u.name],
+    label: Db.concat [Db.sql (Db.lit "user:"), Db.sql u.name],
     tier: (Db.case_when [
-      (Db.gte u.age 65, Db.value "senior"),
-      (Db.gte u.age 18, Db.value "adult"),
-    ] (Db.value "minor") : Db.Sql String),
+      (Db.gte u.age 65, Db.sql (Db.lit "senior")),
+      (Db.gte u.age 18, Db.sql (Db.lit "adult")),
+    ] (Db.sql (Db.lit "minor")) : Db.Sql String),
   })
 })
 
@@ -232,6 +234,51 @@ user_post_title_query () = Query.query (fun () -> {
   let u = from! users
   let p = left_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
   select! ({ id: u.id, title: Db.coalesce (Db.unwrap_cols p).title "(none)" })
+})
+
+# CTE: factor the per-author post counts into a named WITH, then select from it.
+pub fun prolific_authors_cte_query : Unit
+  -> Query.Prepared { author_id: Int, posts: Int }
+prolific_authors_cte_query () = Query.query (fun () -> {
+  let counts = Query.cte "post_counts" (fun () -> {
+    let p = from! posts
+    group_by! [Db.group p.author_id]
+    select! ({ author_id: p.author_id, posts: Db.count_star })
+  })
+  let c = from! counts
+  where_! (Db.gt c.posts 5)
+  order_by! [Db.desc c.posts]
+  select! ({ author_id: c.author_id, posts: c.posts })
+})
+
+# Scalar subquery in SELECT: each user plus the total post count as a value. The
+# closure's returned column (`count_star : Sql Int`) pins the type via the `ToSql`
+# fundep, so no annotation is needed.
+pub fun users_with_total_posts_query : Unit
+  -> Query.Prepared { id: Int, total_posts: Int }
+users_with_total_posts_query () = Query.query (fun () -> {
+  let u = from! users
+  select! ({
+    id: u.id,
+    total_posts: Query.scalar_subquery (fun () -> {
+      let _ = from! posts
+      Db.count_star
+    }),
+  })
+})
+
+# Scalar subquery in a comparison: here `gt_sql` against `u.age` pins the subquery's
+# type, so no annotation is needed.
+pub fun users_over_post_count_query : Unit
+  -> Query.Prepared { id: Int, name: String }
+users_over_post_count_query () = Query.query (fun () -> {
+  let u = from! users
+  where_! (Db.gt_sql u.age (Query.scalar_subquery (fun () -> {
+    let _ = from! posts
+    Db.count_star
+  })))
+  order_by! [Db.asc u.id]
+  select! ({ id: u.id, name: u.name })
 })
 
 # Loaders
@@ -289,3 +336,114 @@ print_optional_posts result = case result {
   }
   Err err -> println ("query failed: " <> debug err)
 }
+
+# --- Executed examples for the Tier 5/6 features (run against the live DB) ---
+#
+# Each has a concrete-typed loader + printer. A single generic printer
+# (`Result (List a) -> (a -> String) -> Unit`) would be tidier, but passing an
+# anonymous-record row through that polymorphic boundary currently trips a codegen
+# bug (could not resolve record type for field access on `__anon_*`), so the row
+# type is named per printer instead.
+
+pub fun load_user_report : Connection
+  -> Result (List { id: Int, upper_name: String, age_next: Int }) Query.DbError
+  needs {Repo}
+load_user_report conn = Query.all conn (user_report_query ())
+
+pub fun print_user_report : Result (List {
+  id: Int,
+  upper_name: String,
+  age_next: Int,
+}) Query.DbError
+  -> Unit
+  needs {Stdio}
+print_user_report result = case result {
+  Ok rows -> {
+    println ("rows: " <> show (List.length rows))
+    List.iter (fun r -> println $"{show r.id}: {r.upper_name} (age+1={show r.age_next})") rows
+  }
+  Err err -> println ("query failed: " <> debug err)
+}
+
+pub fun load_user_tiers : Connection
+  -> Result (List { id: Int, label: String, tier: String }) Query.DbError
+  needs {Repo}
+load_user_tiers conn = Query.all conn (user_tier_query ())
+
+pub fun print_user_tiers : Result (List {
+  id: Int,
+  label: String,
+  tier: String,
+}) Query.DbError
+  -> Unit
+  needs {Stdio}
+print_user_tiers result = case result {
+  Ok rows -> {
+    println ("rows: " <> show (List.length rows))
+    List.iter (fun r -> println $"{show r.id}: {r.label} [{r.tier}]") rows
+  }
+  Err err -> println ("query failed: " <> debug err)
+}
+
+pub fun load_user_post_titles : Connection
+  -> Result (List { id: Int, title: String }) Query.DbError
+  needs {Repo}
+load_user_post_titles conn = Query.all conn (user_post_title_query ())
+
+pub fun print_user_post_titles : Result (List {
+  id: Int,
+  title: String,
+}) Query.DbError
+  -> Unit
+  needs {Stdio}
+print_user_post_titles result = case result {
+  Ok rows -> {
+    println ("rows: " <> show (List.length rows))
+    List.iter (fun r -> println $"{show r.id}: {r.title}") rows
+  }
+  Err err -> println ("query failed: " <> debug err)
+}
+
+pub fun load_prolific_authors_cte : Connection
+  -> Result (List { author_id: Int, posts: Int }) Query.DbError
+  needs {Repo}
+load_prolific_authors_cte conn = Query.all conn (prolific_authors_cte_query ())
+
+pub fun print_prolific_authors : Result (List {
+  author_id: Int,
+  posts: Int,
+}) Query.DbError
+  -> Unit
+  needs {Stdio}
+print_prolific_authors result = case result {
+  Ok rows -> {
+    println ("rows: " <> show (List.length rows))
+    List.iter (fun r -> println $"author {show r.author_id}: {show r.posts} posts") rows
+  }
+  Err err -> println ("query failed: " <> debug err)
+}
+
+pub fun load_users_with_total_posts : Connection
+  -> Result (List { id: Int, total_posts: Int }) Query.DbError
+  needs {Repo}
+load_users_with_total_posts conn = Query.all conn (users_with_total_posts_query ())
+
+pub fun print_users_with_total_posts : Result (List {
+  id: Int,
+  total_posts: Int,
+}) Query.DbError
+  -> Unit
+  needs {Stdio}
+print_users_with_total_posts result = case result {
+  Ok rows -> {
+    println ("rows: " <> show (List.length rows))
+    List.iter (fun r -> println $"{show r.id}: {show r.total_posts} total posts") rows
+  }
+  Err err -> println ("query failed: " <> debug err)
+}
+
+# Reuses the { id, name } shape; printed with `print_users_without_posts`.
+pub fun load_users_over_post_count : Connection
+  -> Result (List { id: Int, name: String }) Query.DbError
+  needs {Repo}
+load_users_over_post_count conn = Query.all conn (users_over_post_count_query ())

@@ -331,6 +331,18 @@ table name =
       },
   })
 
+#@ Build a `Table` whose columns come from a supplied scope-builder rather than a
+#@ `ColumnSet` — for CTEs and other derived sources, where the columns are whatever
+#@ the subquery selected (named by `make_scope` at the reference alias). The result
+#@ is referencable by `from!` / `inner_join!` / `left_join!` like any table.
+pub fun cte_table : String -> (String -> cols) -> Table cols
+cte_table name make_scope =
+  Table (TableDef {
+    name: name,
+    alias: Nothing,
+    make_cols: fun alias -> from_erlang (make_scope alias),
+  })
+
 pub fun table_as : String -> Table cols -> Table cols
 table_as alias table_value = {
   let Table def = table_value
@@ -532,11 +544,29 @@ sql_frag sql_value = case sql_value {
 fun make_sql : SqlFrag -> Sql a where {a: PgType}
 make_sql frag = Sql (SqlDef { frag: frag, decoder: decode_pg })
 
+#@ Wrap a raw fragment as a typed `Sql a`, decoding the result with `a`'s default
+#@ `PgType` decoder. Exposed so the query layer can present a rendered scalar
+#@ subquery `(SELECT … )` as a first-class `Sql a`.
+pub fun sql_from_frag : SqlFrag -> Sql a where {a: PgType}
+sql_from_frag frag = make_sql frag
+
 pub fun sql : input -> SqlArg where {input: ToSql a}
 sql input = SqlArg (value_frag input)
 
 pub fun value : a -> SqlArg where {a: PgType}
 value input = SqlArg (param (encode_pg input))
+
+#@ A typed literal as a first-class `Sql a`: a bound parameter with an explicit
+#@ `::type` cast (`$1::text`). Use it for literals in positions where Postgres can't
+#@ infer the parameter type from context — `concat`, `case_when` branches, a bare
+#@ `select!` of a constant — which otherwise fail with "could not determine data type
+#@ of parameter". In a comparison the other operand supplies the type, so `Db.value`
+#@ / the `eq` family don't need this.
+pub fun lit : a -> Sql a where {a: PgType + PgTypeName}
+lit literal = {
+  let name = pg_type_name (TypeTag : TypeTag a)
+  make_sql (append_frag (param (encode_pg literal)) (raw_frag ("::" <> name)))
+}
 
 fun sql_arg_frag : SqlArg -> SqlFrag
 sql_arg_frag arg = case arg {
@@ -879,6 +909,30 @@ eq_sql left right = make_expr (spaced (value_frag left) "=" (value_frag right))
 pub fun eq_col : left -> right -> Expr
   where {left: ToSql a, right: ToSql a, a: PgType}
 eq_col left right = eq_sql left right
+
+#@ Comparisons between two SQL values (columns, expressions, scalar subqueries)
+#@ rather than against a literal. The `eq` family compares against a literal RHS;
+#@ these compare two `ToSql` operands of the same element type — e.g.
+#@ `Db.gt_sql u.age (Query.scalar_subquery …)`.
+pub fun not_eq_sql : left -> right -> Expr
+  where {left: ToSql a, right: ToSql a, a: PgType}
+not_eq_sql left right = make_expr (spaced (value_frag left) "<>" (value_frag right))
+
+pub fun gt_sql : left -> right -> Expr
+  where {left: ToSql a, right: ToSql a, a: PgType}
+gt_sql left right = make_expr (spaced (value_frag left) ">" (value_frag right))
+
+pub fun gte_sql : left -> right -> Expr
+  where {left: ToSql a, right: ToSql a, a: PgType}
+gte_sql left right = make_expr (spaced (value_frag left) ">=" (value_frag right))
+
+pub fun lt_sql : left -> right -> Expr
+  where {left: ToSql a, right: ToSql a, a: PgType}
+lt_sql left right = make_expr (spaced (value_frag left) "<" (value_frag right))
+
+pub fun lte_sql : left -> right -> Expr
+  where {left: ToSql a, right: ToSql a, a: PgType}
+lte_sql left right = make_expr (spaced (value_frag left) "<=" (value_frag right))
 
 fun true_expr : Unit -> Expr
 true_expr () = make_expr (raw_frag "TRUE")

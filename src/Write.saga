@@ -91,9 +91,11 @@ run_upsert_returning conn = Query.one conn (upsert_user_returning ())
 
 # Atomic multi-statement write: insert a user and bump another's age in one
 # transaction. Both commit together, or — if either op fails — both roll back.
-# Returns the total number of affected rows. Only Postgres + Transaction need
-# handlers; the body's Repo capability is provided by `transaction` itself.
-pub fun atomic_writes : Connection -> Result Int DbError needs {Postgres, Transaction}
+# Returns the total number of affected rows. The function itself only needs
+# {Transaction}; the body's Repo capability is provided by `transaction`, and the
+# Postgres handler is pulled in at the boundary because `pg_transaction needs
+# {Postgres}` (wire `with {pg_transaction, pg, …}`).
+pub fun atomic_writes : Connection -> Result Int DbError needs {Transaction}
 atomic_writes conn = Query.transaction conn (fun () -> {
   let new_row = UsersInsert { id: Db.auto, name: "Dave", age: 40 }
   case Dml.exec conn (Dml.insert users new_row) {
@@ -110,7 +112,7 @@ atomic_writes conn = Query.transaction conn (fun () -> {
 pub fun rolled_back_write : Connection
   -> QueryError
   -> Result Unit DbError
-  needs {Postgres, Transaction}
+  needs {Transaction}
 rolled_back_write conn abort = Query.transaction conn (fun () -> {
   let new_row = UsersInsert { id: Db.auto, name: "Ghost", age: 99 }
   case Dml.exec conn (Dml.insert users new_row) {

@@ -726,6 +726,14 @@ predicate family, and they follow the existing `eq` vs `eq_sql` convention for
   `div_sql` (two same-typed SQL values, e.g. `price * quantity`).
 - **`case_when branches else`** — `CASE WHEN <cond> THEN <val> … ELSE <else> END`;
   branches are `(Expr, SqlArg)` pairs, else is a `SqlArg`. Panics with no branches.
+- **`lit value`** — a *typed* literal `Sql a`: a bound parameter with an explicit
+  `::type` cast (`$1::text`). Needed because `Db.value` emits a bare `$1`, and in a
+  position with no surrounding type context — a `concat` argument, a `case_when`
+  branch, a constant in `select!` — Postgres rejects it with `42P18 "could not
+  determine data type of parameter"`. `Db.lit "user:"` renders `$1::text` and is
+  fine there. In a comparison the other operand supplies the type, so `Db.value` /
+  the `eq` family don't need this. (Surfaced by the executed Tier-5 examples: the
+  CASE/CONCAT demo failed at runtime until its literals became `lit`s.)
 
 Inference note: `sql_fn` and `case_when` produce a `Sql a` whose `a` isn't pinned by
 their arguments (`SqlArg` erases the element type), so — exactly like `cast` — they
@@ -783,10 +791,28 @@ Status:
   element types must agree (`id IN (subquery of names)` won't compile). Renders
   `<left> IN (SELECT <col> FROM …)`. (Literal-list `in_` still exists for the
   in-memory case.)
-- **scalar subquery as `Sql a`** (todo) — the same "closure returns the column"
-  pattern, but wrapping the rendered `SELECT` as a `Sql a` (with the column's
-  decoder) so it can be used in `select!` / comparisons; needs single-row semantics.
-- **CTEs (`WITH`)** (todo).
+- **scalar subquery as `Sql a`** (done 2026-06-21) — `Query.scalar_subquery` uses
+  the same "closure returns the column" pattern as `in_subquery`, but wraps the
+  rendered `(SELECT <col> FROM …)` as a first-class `Sql a` (via the new pub
+  `Db.sql_from_frag`, decoding with `a`'s `PgType`), so it's selectable and usable
+  in comparisons. Single-row is the caller's responsibility (aggregate or `limit! 1`);
+  an empty result is SQL NULL, so select a nullable column or `Db.coalesce` if that's
+  possible. No annotation needed (unlike `case_when`): the `col -> a` `ToSql` fundep
+  means the closure's returned column pins the result type — `count_star : Sql Int`
+  fixes `a = Int` whether the call sits in a `select!` or a comparison. (Only a
+  genuinely polymorphic returned column would force a hint.) This also added the
+  `*_sql` comparison family (`gt_sql` / `gte_sql` / `lt_sql` / `lte_sql` /
+  `not_eq_sql`) alongside the existing `eq_sql`, so a subquery value can be compared,
+  not just equated.
+- **CTEs (`WITH`)** (done 2026-06-21) — `Query.cte name closure` registers a CTE
+  (hoisted into a leading `WITH <name> AS (…)`, rendered before `SELECT` so its
+  params number first) and returns a `Table` handle, built by the new
+  `Db.cte_table` (a `Table` whose columns come from the subquery's `DerivedScope`
+  walk rather than a `ColumnSet`). The handle is an ordinary `Table`, so it works
+  with `from!` / `inner_join!` / `left_join!` and can be referenced in several
+  places (each use gets a fresh alias). `QueryState` grew a `ctes` list threaded by
+  a new `define_cte` op. Not yet: recursive CTEs (`WITH RECURSIVE`), and a
+  CTE-from-`INSERT`/`UPDATE … RETURNING` (data-modifying CTEs).
 
 Design decisions:
 
