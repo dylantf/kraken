@@ -81,55 +81,257 @@ once large `IN` lists / wide bulk inserts appear.
 
 ---
 
-## BUG (discovered during #2 verification) — `insert_all` crashes at runtime
+## BUG (discovered during #2 verification) — `insert_all` crashes at runtime — FIXED (compiler-side, 2026-06-21)
 
 **Pre-existing, not from this review's work.** Surfaced when the golden-diff harness
-ran the demo's bulk insert.
+ran the demo's bulk insert. Confirmed on current `main` (clean build). Root cause and
+fix are at the end of this section.
 
 - **Symptom:** `saga run` of the demo crashes at the bulk-insert line:
   ```
   Runtime error: bad argument
     read:__dict_Kraken_Db_InsertRow_read_Read_UsersInsert
     kraken_db_dml:insert_pairs/4
-    kraken_db_dml:insert_all_parts_of
+    kraken_db_dml:insert_all_parts_of (lib/Kraken/Db/Dml.saga:310)
     write:insert_users_query
   ```
-- **Diagnosis:** single-row `Dml.insert` works (calls `insert_pairs` directly), but
-  `insert_all_parts_of` calls it through `List.map (fun v -> insert_pairs table_value
-  v) values` and the `InsertRow` / `ColumnNameMap` dictionary isn't threaded into the
-  mapped closure → undefined `__dict_…` → "bad argument". Looks like a **compiler
-  dictionary-passing bug** for a constrained function invoked inside a mapped lambda
-  (relevant to the saga compiler repo, not Kraken source).
+  The top frame is the *derived `InsertRow` dict for the synthesized `UsersInsert`*
+  being invoked with a bad argument.
 - **Impact:** `insert_all` / `insert_all_returning` are unusable at runtime for the
-  demo's synthesized insert types, despite typechecking and being marked "done".
-- **Next:** build a minimal repro (constrained fn called inside `List.map`), fix in
-  the compiler, or work around in Kraken by hoisting the dict (e.g. a recursive
-  helper that takes the value explicitly rather than a closure over `List.map`).
+  synthesized insert types, despite typechecking and being marked "done". Single-row
+  `Dml.insert` works.
+
+### Investigation (2026-06-21) — narrowed, not yet root-caused
+
+What the bug is **NOT** (each ruled out empirically):
+
+- **Not the `List.map` closure.** Replacing
+  `List.map (fun v -> insert_pairs table_value v) values` with a plain recursive
+  helper (`insert_pairs_each`) crashes *identically* (`insert_pairs_each/4 →
+  insert_pairs/4 → __dict_…UsersInsert`). So it is not a closure-capture issue.
+- **The difference is hop count to a fundep-determined synthesized type.** Single
+  `insert` is 1 hop (`insert → insert_pairs`) and works; bulk is a chain
+  (`insert_all → insert_all_parts_of → insert_pairs`) where `ins` is fixed by the
+  `Insertable cols ins | cols -> ins` fundep and its `InsertRow` dict is threaded
+  through several constrained functions before `insert_row` is finally called.
+
+**Could not reproduce in a fresh cross-module project** (`/tmp/dicttest`) despite
+faithfully mirroring, in combination:
+custom routed `Generic` derive (trait + `Record`/`And`/`Labeled`/`Leaf` rep
+instances + inner per-type leaf trait), `synthesizes via <FieldMap> deriving (…)`
+with a `cols -> ins` fundep, a phantom-`cols` `Table`-like handle, **two** actively
+used dicts in the helper (a `ColumnSet`/`ColumnNameMap` analog on `cols` + the
+routed trait on `ins`), the exact multi-hop constrained chain (with *and* without
+`List.map`), and a coexisting hand-derived instance of the same trait in the module.
+Every combination ran correctly. So the trigger depends on something specific to
+Kraken's real types that doesn't survive extraction — prime suspects: the `Writable
+a` ADT as the `Generated a → Writable a` field-map result (vs a plain `Maybe`), the
+trio of derives on `Users` (`Selectable User` + `Insertable UsersInsert` +
+`ColumnNameMap`), or the empty-bodied `Insertable` synthesize interacting with the
+`Selectable` fundep that shares the same `cols`.
+
+### ROOT CAUSE — FIXED (2026-06-21, compiler-side)
+
+**It was never a dict-passing bug.** The `InsertRow` dict was threaded correctly. The
+crash was a **codegen bug that dropped the record literals' fields**: the three
+`UsersInsert { id: Db.auto, name: …, age: … }` rows in the bulk-insert list were
+lowered to bare `{'read_UsersInsert'}` tuples with *no fields* (vs the single-insert
+path's correct `{'read_UsersInsert', auto, "Carol", 31}`). The `InsertRow` method then
+did `element(2, row)` on a fieldless tuple → `bad argument`. That `element` lives
+lexically inside the synthesized dict builder `__dict_…InsertRow_…UsersInsert/1`, which
+is why the crash *frame* pointed at the dict — a red herring that sent the whole
+investigation down the dict-passing path.
+
+Why the fields were dropped:
+
+- A `RecordCreate` lowers to a tagged tuple. The **tag** is resolved by name
+  (`mangle_ctor_atom` via `constructor_atoms`) — robust. The **field order** (which
+  value goes in which tuple slot) was resolved by **NodeId / current-module name**
+  (`resolved_record_fields` → `current_record_type_name`) — fragile.
+- `Dml.insert_all` gets **inlined** into `Write` (single `insert` stays a remote call).
+  Inlining a function with a non-duplicable argument freshens that argument's NodeIds
+  (`bind_subpats` → `freshen_expr_ids`). The list arg is non-duplicable because the
+  `id: Db.auto` field lowers to a call, not a constant. Freshening orphaned each
+  record node from `Write`'s front-resolution `record_type(node)` map.
+- The synthesized layout *was* registered — under `Read.UsersInsert` — but the records
+  are lowered in module `Write`, so the only name fallbacks tried were `UsersInsert`
+  and `Write.UsersInsert`; both miss. `resolved_record_fields` then returned `None` and
+  the lowering's `unwrap_or_default()` silently produced an **empty field order** →
+  fieldless tuple → runtime crash.
+
+This is exactly why `/tmp/dicttest` never reproduced: the trigger isn't the dict chain
+at all — it's a cross-module record literal whose type is defined in *another* module
+(`Read.UsersInsert`), lowered inside a *third* module (`Write`), through an *inlined*
+generic function. The fundep/synthesize/derive machinery was a coincidence of the setup.
+
+**Fix (in the saga compiler, `~/projects/saga`):**
+1. `src/codegen/lower/semantic.rs` — `resolved_record_fields` now has a final,
+   name-based fallback (`record_fields_by_unique_suffix`): resolve the field layout by
+   the constructor's bare surface name when it uniquely matches one `<module>.<Name>`
+   across all registered records. Mirrors how the constructor *tag* already resolves by
+   name, so layout resolution survives NodeId freshening and cross-module inlining.
+   Ambiguous names fall through (no wrong-layout guess).
+2. `src/codegen/lower/exprs/dispatch.rs` — replaced the silent `unwrap_or_default()` in
+   `RecordCreate` lowering with a hard compile-time panic. A field layout that can't be
+   resolved is a compiler bug; emitting a fieldless tuple turned it into a latent
+   runtime `bad argument`. Now it fails loudly at build time (the "no silent footguns"
+   property, applied to the compiler itself).
+
+**Verified:** `cargo test` green (1111 + 160 + 115 + 70 …); `cargo clippy` clean.
+`saga run` of this repo now prints
+`INSERT INTO users (name, age) VALUES ($1, $2), ($3, $4), ($5, $6)` and
+`insert_all_returning` renders `… RETURNING users.id`. Item **1b** is genuinely done
+now (rendering verified; still not exercised against a live DB).
 
 ---
 
-## 3. Ship `DISTINCT` / `DISTINCT ON`
+## 3. Ship `DISTINCT` / `DISTINCT ON` — DONE (2026-06-21)
 
 - **Problem:** still listed as near-term Tier 1 and not done; one of the genuinely
   common missing things. `count_distinct` doesn't cover row-level distinct.
 - **Fix:** `distinct!` (`SELECT DISTINCT`) and `DISTINCT ON (...)`; thread through
   `QueryState` and render after `SELECT`.
+- **Done:** added a `DistinctKind` (`NoDistinct | DistinctAll | DistinctOn (List
+  Group)`) field on `QueryState`; two new `QueryBuild` ops — `distinct! ()` (plain)
+  and `distinct_on! [Db.group …]` (keys reuse the `Group` vocabulary, pair with
+  `order_by!` to pick the surviving row). Mutually exclusive (last set wins).
+  `render_distinct` emits the modifier between `SELECT ` and the select list (reuses
+  `render_more_groups` for the keys); empty `distinct_on!` panics at build time with
+  a pointer to `distinct! ()`. DISTINCT applies to `select_frag` (main query, derived
+  tables, CTEs); not the `SELECT 1` EXISTS / scalar-subquery forms (use raw if ever
+  needed). Demos: `distinct_ages_query` / `newest_user_per_age_query` in
+  `src/Read.saga`, wired into `src/Main.saga`. Rendered SQL verified:
+  - `SELECT DISTINCT t0.age AS age FROM users AS t0 ORDER BY t0.age ASC`
+  - `SELECT DISTINCT ON (t0.age) … FROM users AS t0 ORDER BY t0.age ASC, t0.id DESC`
 
 ---
 
-## 4. Nested correlated subquery alias collision
+## 4. Nested correlated subquery alias collision — DONE (2026-06-21)
+
+**Resolved.** Two compiler codegen bugs (effectful call as op arg; then effectful
+call nested as a sub-expression of an op arg) were found via minimal repros and
+fixed compiler-side. With those in, the effect-based fix works: a single monotonic
+alias counter is threaded across the whole query tree via the internal
+`peek_aliases`/`commit_aliases` ops, so every table gets a unique alias. Verified —
+the nested correlated case now renders distinct aliases:
+
+```sql
+... WHERE EXISTS (SELECT 1 FROM posts AS s1 WHERE (s1.author_id = t0.id)
+      AND EXISTS (SELECT 1 FROM posts AS s2 WHERE (s2.author_id = t0.id) AND s2.id <> s1.id))
+```
+
+(`s1` middle, `s2` inner — the inner correctly references `s1.id`, no shadowing.)
+Demo: `users_with_two_posts_query` in `src/Read.saga`. All other subquery forms
+re-verified green. The investigation trail below is kept as history.
+
+### (history) originally BLOCKED on a compiler bug
 
 - **Problem:** nested correlated subqueries collide on the fixed `s` alias prefix —
   silently produces wrong SQL rather than a type error, violating the
   "no silent footguns" property held everywhere else.
-- **Fix:** thread a monotonic alias counter through `QueryState` instead of a fixed
-  `t`/`s` prefix. At minimum add a build-time guard if the full fix is deferred.
-- **Where:** `lib/Kraken/Db/Query.saga:181` (`empty_state_sub`), alias generation in
-  `bind_table_source` / the subquery handlers.
+- **Intended fix (effect-based, clean):** thread a single monotonic alias counter
+  across the whole query tree. Two internal `QueryBuild` ops (`peek_aliases` /
+  `commit_aliases`) let each subquery builder seed numbering from the enclosing
+  scope's counter and commit back the aliases it consumed, so every table anywhere
+  gets a unique alias (prefix stays `t`/`s` for readability). Implemented and
+  typechecks — but **crashes at runtime** due to a compiler bug (below), so it was
+  reverted.
+
+### Compiler bug found (2026-06-21) — effectful fn in argument position
+
+Making the subquery builders effectful means `where_! (Query.exists (…))` calls an
+effectful function (`exists` now performs `peek_aliases!`) in the **argument
+position** of an op. That miscompiles: the effect lowering produces a malformed
+value instead of sequencing the inner effect, so the collected `Expr` is garbage and
+`Db.join_exprs` hits a `case_clause` at render time. `join_exprs` is pure saga over
+plain ADTs (no FFI in the path) — **not a bridge mismatch**.
+
+Minimal repro at `/tmp/efftest` (CPS-style handler + an effectful function returning
+an ADT). Characterization (each case isolated):
+
+- `add! (make_frag ())` — effectful fn in **arg position** of an op → **`case_clause`
+  crash**.
+- `let f = make_frag (); add! f` — same call in **statement position** → works.
+- `add! (pure_frag ())` — **non-effectful** fn in arg position → works.
+
+So the trigger is precisely: an effectful function call whose result is consumed by
+an enclosing call (argument position). Workaround in user code is to bind to a `let`
+first — but that doesn't help here, since the effectful call is at the *user's* DSL
+call site (`where_! (exists …)`), which we don't control.
+
+### Compiler fix #1 (landed) + remaining bug (2026-06-21)
+
+First fix handled an effectful call that **is** the whole op argument
+(`add! (make_frag ())`) — so post-fix, `where_! (exists …)`, `in_subquery`, derived
+tables, and CTEs all work (with correct global `s1` aliases).
+
+**Remaining bug:** a nested effectful call that is a **strict sub-expression** of an
+op's argument is still miscompiled — its result comes back malformed. Two library
+forms still crash, both confirmed to be this:
+
+- `select! ({ …, total_posts: Query.scalar_subquery (…) })` — effectful call in an
+  **anon-record field** of the op arg → crash in `Core.select`/`sql_projection`.
+  (Regression: worked at #3; let-binding it to a statement fixes it.)
+- `where_! (Db.and_ [Db.eq_col …, Query.exists (…)])` — effectful call in a **list
+  element** passed to pure `and_`, whose result is the op arg → crash in
+  `join_exprs`.
+
+Boundary (all isolated in `/tmp/efftest/src/Main.saga`):
+- `add! (make_frag ())` — effectful call IS the whole op arg → works (fix #1).
+- `let c = combine [make_frag ()]; add! c` — statement position → works.
+- `add! (combine [make_frag ()])` and `choose! ({ x: make_frag () })` — effectful
+  call nested as a sub-expression of the op arg → **crash**.
+
+So the fix must sequence effectful calls at arbitrary depth within an op argument,
+not just at the top.
+
+### Next
+
+- Fix the remaining compiler bug (hand off `/tmp/efftest`), then the effect-based #4
+  changes (still in the tree) work as-is — re-verify the two queries above.
+- Fallback if ever needed: a non-effectful process-dict alias gensym reset per
+  `query` — sidesteps the whole class but adds impure global state.
 
 ---
 
-## 5. Nested / aggregated relation loading (the big one)
+## 5. Nested / aggregated relation loading (the big one) — DONE (2026-06-22)
+
+**Decision: separate-query loading (not JSON), declared *in the query*.** One query per
+relation level (Ecto/`selectinload` model), stitched in memory — fits Kraken's
+explicit/no-magic ethos and avoids the JSON type-fidelity boundary (no `FromJson` on
+domain types).
+
+First cut shipped `Query.associate`/`preload conn parents …` (a 6-positional call
+outside the query, with two interchangeable `_ -> k` key lambdas — awkward and a silent
+footgun). **Reworked** so relations are part of the query DSL:
+
+```saga
+authored_posts = Query.has_many posts (fun u -> u.id) (fun p -> p.author_id)
+let posts = Query.preload authored_posts u   -- inside the query closure
+select! ({ user: u, posts: posts })          -- row: { user: User, posts: List Post }
+Query.all conn (users_with_posts_query ())   -- one call, nested result
+```
+
+`has_many` takes two *column* accessors (FK named once) and generates the batched child
+query. `preload` injects the parent-key column and returns a `Db.Preloaded child` that
+slots into `select!`. Execution is a two-pass decode (`decode_at` now threads `RelData`
+and returns `(value, keys)`): pass 1 collects parent keys, the executor batch-loads +
+groups each relation (`Dict`, O(n+m)), pass 2 resolves each slot — one query per level,
+not N+1; nesting composes. New surface in `lib/Kraken/Db.saga` (`Relation`/`Preloaded`/
+`RelData`/`RelKey`, `make_projection`, `project_pair`, `col_projection`, `as_sql`) +
+`lib/Kraken/Db/Query.saga` (`has_many`/`preload`); demo `authored_posts` /
+`users_with_posts_query` / `load_users_with_posts` in `src/Read.saga`, wired into Main.
+
+Verified offline (typecheck + rendered SQL + full stitch with canned rows through a stub
+`Repo`). Surfaced + got fixed a compiler bug (effectful closure stored in a record field;
+repro `/tmp/efftest2/run.saga`). Full design, the type-system constraints hit, and
+follow-ups (`belongs_to`/1:1, `IN`-key dedup) in `nested-relation-loading.md`.
+
+Compiler footgun found along the way: qualifying the builtin `Dict` type as
+`Dicts.Dict` (through a module alias) silently misresolves to a phantom type →
+`expected Dict Int Int, got Dict Int Int`. Use bare `Dict`. Repro: `/tmp/dicttest2`.
+
+### (original framing)
 
 - **Problem:** "load each user with their posts as a nested list" has no path beyond
   N+1 or manual reshaping. This is the main expressivity frontier for building a

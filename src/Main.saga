@@ -89,6 +89,7 @@ main () = {
   Read.print_rows ranked (fun r -> $"#{show r.age_rank} id={show r.id} age={show r.age} peers={show r.peers}")
 
   println "-- relation preload: each user with their posts (2 queries, not N+1) --"
+  println (Read.users_with_posts_query ()).sql
   let uwp = Read.load_users_with_posts conn with Query.pg_repo
   Read.print_rows uwp (fun r -> $"{r.user.name}: {show (List.length r.posts)} posts")
 

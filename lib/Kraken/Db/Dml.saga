@@ -103,7 +103,8 @@ finish parts = {
   Prepared {
     sql: sql,
     params: params,
-    decode: fun _ -> Ok (),
+    decode: fun _data _row -> Ok ((), []),
+    relations: [],
     noop: False,
   }
 }
@@ -138,6 +139,7 @@ finish_returning body projection = {
     sql: sql,
     params: params,
     decode: decode_projection projection,
+    relations: [],
     noop: False,
   }
 }

@@ -1,7 +1,13 @@
 -module(kraken_unsafe).
--export([from_dynamic/1, slice_all_null/3]).
+-export([from_dynamic/1, to_dynamic/1, slice_all_null/3]).
 
 from_dynamic(Value) ->
+    Value.
+
+%% Erase a value to `Dynamic`. On the BEAM everything is already dynamic, so this
+%% is identity; it exists only to satisfy the Saga type checker at the relation
+%% type-erasure boundary (parent keys and grouped children stored opaquely).
+to_dynamic(Value) ->
     Value.
 
 %% True when every column in [Offset, Offset + Width) of a result row is SQL

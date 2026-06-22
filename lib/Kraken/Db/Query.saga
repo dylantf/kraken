@@ -21,7 +21,11 @@ import Kraken.Db (
   SqlPart,
   Text,
   Param,
-  and_
+  and_,
+  Col,
+  RelData,
+  RelKey,
+  Preloaded
 )
 import Kraken.Db as Core
 import SagaPgo (
@@ -34,6 +38,16 @@ import SagaPgo (
 )
 import SagaPgo as Pgo
 import SagaPgo.Types (Value)
+
+# Type-erasure boundary for relation loading: parent keys and grouped children are
+# stored as `Dynamic` (the relation's `k` / `child` types differ per relation, so a
+# `Prepared`'s relation specs can't be statically typed in them). Both are identity
+# on the BEAM; the casts only move types past the checker at the erase/unerase points.
+@external("erlang", "kraken_unsafe", "from_dynamic")
+fun unsafe_from_dynamic : Dynamic -> a
+
+@external("erlang", "kraken_unsafe", "to_dynamic")
+fun unsafe_to_dynamic : a -> Dynamic
 
 # A FROM / JOIN source: either a named table or a derived table (a subquery
 # fragment), each bound to an alias.
@@ -101,6 +115,8 @@ record QueryState {
   ctes: List (String, SqlFrag),
   # SELECT distinctness (plain / DISTINCT / DISTINCT ON keys).
   distinct: DistinctKind,
+  # Relations registered by `preload`, in registration order (index == position).
+  relations: List RelSpec,
 }
 
 #@ A compiled query: rendered SQL, its bound parameters, and a decoder that turns
@@ -113,7 +129,12 @@ record QueryState {
 pub record Prepared a {
   sql: String,
   params: List Value,
-  decode: Dynamic -> Result a DecodeError,
+  #@ Decode one result row, threading relation data and collecting the relation
+  #@ keys the row's `Preloaded` slots emit. With no relations, `relations` is empty,
+  #@ the emitted key list is empty, and `decode` is called once with `empty_rel_data`.
+  decode: RelData -> Dynamic -> Result (a, List RelKey) DecodeError,
+  #@ Relations to batch-load and stitch after the main query runs (see `preload`).
+  relations: List RelSpec,
   noop: Bool,
 }
 
@@ -125,7 +146,8 @@ pub fun noop_prepared : Prepared a
 noop_prepared = Prepared {
   sql: "",
   params: [],
-  decode: fun _ -> Err (DecodeError "noop" "no rows" []),
+  decode: fun _data _row -> Err (DecodeError "noop" "no rows" []),
+  relations: [],
   noop: True,
 }
 
@@ -150,6 +172,17 @@ pub handler pg_repo for Repo needs {Postgres} {
     let result = run conn prepared
     resume result
   }
+}
+
+# A relation registered by `preload` while building a query. `index` is its slot
+# (0-based, in registration order), matching the `RelKey`s its `Preloaded` field
+# emits during decode. `load` takes the parent keys collected in the first decode
+# pass (erased to `Dynamic`), runs the batched child query, and returns the grouped
+# children (`Dict parent_key (List child)`, also erased). Defined after `Repo` because
+# its `load` field's type mentions that effect.
+record RelSpec {
+  index: Int,
+  load: Connection -> List Dynamic -> Result Dynamic DbError needs {Repo},
 }
 
 #@ The query-building DSL. Its operations are performed with `!` inside the
@@ -201,6 +234,12 @@ pub effect QueryBuild {
   #@ Internal plumbing: commit the alias counter a nested subquery advanced to, back
   #@ into the enclosing scope. Pair with `peek_aliases`.
   fun commit_aliases : Int -> Unit
+  #@ Internal plumbing: the number of relations registered so far, used by `preload`
+  #@ to assign the next relation its slot index. Not for direct use.
+  fun relation_count : Unit -> Int
+  #@ Internal plumbing: register a relation's load spec so the executor can batch
+  #@ its children after the main query runs. Use `preload`, not this directly.
+  fun push_relation : RelSpec -> Unit
 }
 
 fun empty_state : QueryState
@@ -217,6 +256,7 @@ empty_state = QueryState {
   alias_prefix: "t",
   ctes: [],
   distinct: NoDistinct,
+  relations: [],
 }
 
 # A subquery's initial state: a distinct alias prefix so its tables don't collide
@@ -304,6 +344,20 @@ handler collect_query for QueryBuild {
     QueryStep (fun state -> {
       let QueryStep run_rest = resume ()
       run_rest ({ state | next_alias: n })
+    })
+  }
+
+  relation_count _unit = {
+    QueryStep (fun state -> {
+      let QueryStep run_rest = resume (List.length state.relations)
+      run_rest state
+    })
+  }
+
+  push_relation spec = {
+    QueryStep (fun state -> {
+      let QueryStep run_rest = resume ()
+      run_rest ({ state | relations: List.append state.relations [spec] })
     })
   }
 
@@ -494,11 +548,12 @@ pub fun into : (row -> out) -> Prepared row -> Prepared out
 into transform prepared = Prepared {
   sql: prepared.sql,
   params: prepared.params,
-  decode: fun dynamic ->
-    case prepared.decode dynamic {
+  decode: fun data row ->
+    case prepared.decode data row {
       Err err -> Err err
-      Ok row -> Ok (transform row)
+      Ok (value, reqs) -> Ok (transform value, reqs)
     },
+  relations: prepared.relations,
   noop: prepared.noop,
 }
 
@@ -769,6 +824,7 @@ prepare projection state = {
     sql: sql,
     params: params,
     decode: Core.decode_projection projection,
+    relations: state.relations,
     noop: False,
   }
 }
@@ -945,11 +1001,26 @@ run conn prepared =
 
 #@ Execute a prepared query and decode every row into an `a`. Returns `DbError` if
 #@ the query fails or any row fails to decode.
+#@
+#@ When the query has `preload`ed relations, decoding runs in two passes: the first
+#@ collects each row's parent keys, then every relation's children are batch-loaded
+#@ (one extra query per relation) and grouped, and the second pass resolves each
+#@ relation slot to its matching children. This is the classic preload — one query
+#@ per relation level, never N+1.
 pub fun all : Connection -> Prepared a -> Result (List a) DbError needs {Repo}
 all conn prepared = if prepared.noop then Ok []
   else case execute! conn prepared {
-    Ok returned -> decode_rows prepared.decode returned.rows
     Err err -> Err (QueryFailed err)
+    Ok returned -> case prepared.relations {
+      [] -> decode_rows prepared.decode Core.empty_rel_data returned.rows
+      _ -> case collect_rel_keys prepared.decode returned.rows {
+        Err err -> Err err
+        Ok keys -> case load_rel_entries conn prepared.relations keys {
+          Err err -> Err err
+          Ok entries -> decode_rows prepared.decode (Core.rel_data_of entries) returned.rows
+        }
+      }
+    }
   }
 
 #@ Execute a prepared query and decode the first row, if any. Returns `Ok Nothing`
@@ -976,74 +1047,169 @@ exactly_one conn prepared = case all conn prepared {
   Err err -> Err err
 }
 
-# --- Relation loading (separate query per relation, stitched in memory) ---
+# --- Relation loading (declared in the query, loaded as a separate query each) ---
 
-# Group children into a Dict keyed by `child_key`, preserving each child's order
-# within its group (foldr + prepend puts the first child first). NB: the value type
-# is the bare builtin `Dict` — `Dicts.Dict` (qualifying the builtin through the module
-# alias) misresolves to a phantom type that won't unify with the real one.
-fun group_by_key : (child -> k) -> List child -> Dict k (List child)
-  where {k: Eq}
-group_by_key child_key children =
-  List.foldr (fun c dict -> {
-    let k = child_key c
-    let existing = case Dicts.get k dict {
-      Just xs -> xs
-      Nothing -> []
-    }
-    Dicts.put k (c :: existing) dict
-  }) (Dicts.new ()) children
-
-#@ Stitch already-loaded children onto already-loaded parents by a shared key — the
-#@ in-memory half of separate-query relation loading. Children are grouped by
-#@ `child_key` (O(n+m) via a Dict), then each parent is combined with its matching
-#@ children (in query order); a parent with no children gets `[]`. Pure — no DB.
+#@ A has-many relation: a parent column joined to a child column. Define one near
+#@ the schema, then pull it into a query with `preload`. Both arguments are *column*
+#@ accessors (over the parent's and child's column records), so the foreign key is
+#@ named exactly once and the batched child query (`WHERE child_fk IN (keys)`) is
+#@ generated for you — no separate decode-side key extractor to keep in sync.
 #@
-#@     Query.associate (fun u -> u.id) (fun p -> p.author_id)
-#@       (fun u ps -> { user: u, posts: ps }) users posts
-#@     -- List { user: User, posts: List Post }
-pub fun associate : (parent -> k)
-  -> (child -> k)
-  -> (parent -> List child -> r)
-  -> List parent
-  -> List child
-  -> List r
-  where {k: Eq}
-associate parent_key child_key combine parents children = {
-  let grouped = group_by_key child_key children
-  List.map (fun p -> {
-    let kids = case Dicts.get (parent_key p) grouped {
-      Just xs -> xs
-      Nothing -> []
-    }
-    combine p kids
-  }) parents
+#@     authored_posts = Query.has_many posts (fun u -> u.id) (fun p -> p.author_id)
+opaque type Relation pcols child k = Relation (RelationDef pcols child k)
+
+record RelationDef pcols child k {
+  # The parent's key column as a `Sql k` (injected into the parent SELECT and read
+  # back to group); coerced from the accessor so `Col`/`Generated` keys both work.
+  parent_key: pcols -> Core.Sql k,
+  # Run the batched child query for these parent keys and group the rows by their
+  # foreign key into `Dict parent_key (List child)`.
+  load_children: Connection -> List k -> Result (Dict k (List child)) DbError needs {Repo},
 }
 
-#@ Load and attach a has-many relation in one extra query (the classic `preload`):
-#@ extract the parents' keys, run the single `child_query` over them (its
-#@ `WHERE … IN (keys)` lives in the builder you pass), and `associate` the results.
-#@ One query per relation level — not N+1. Empty parents short-circuit to `Ok []`.
-#@
-#@     Query.preload conn users (fun u -> u.id)
-#@       posts_for_authors (fun p -> p.author_id)
-#@       (fun u ps -> { user: u, posts: ps })
-pub fun preload : Connection
-  -> List parent
-  -> (parent -> k)
-  -> (List k -> Prepared child)
-  -> (child -> k)
-  -> (parent -> List child -> r)
-  -> Result (List r) DbError
-  needs {Repo}
+# Group `(fk, child)` pairs by FK, preserving each child's order within its group
+# (foldr + prepend keeps the first child first). The value type is the bare builtin
+# `Dict` — qualifying it (`Dicts.Dict`) misresolves to a phantom type that won't unify.
+fun group_pairs : List (k, child) -> Dict k (List child)
   where {k: Eq}
-preload conn parents parent_key child_query child_key combine = case parents {
-  [] -> Ok []
-  _ -> {
-    let keys = List.map parent_key parents
-    case all conn (child_query keys) {
+group_pairs pairs =
+  List.foldr (fun pair dict -> {
+    let (fk, child) = pair
+    let existing = case Dicts.get fk dict {
+      Just xs -> xs
+      Nothing -> []
+    }
+    Dicts.put fk (child :: existing) dict
+  }) (Dicts.new ()) pairs
+
+#@ Define a has-many relation from a child table, a parent-key column, and the
+#@ child's foreign-key column. The generated child query selects each child paired
+#@ with its FK (`SELECT child_fk, <child cols> FROM child WHERE child_fk IN (keys)`)
+#@ and groups the result; nested relations on the child are loaded too, since the
+#@ child query runs through the ordinary `all`.
+pub fun has_many : Table ccols
+  -> (pcols -> pk)
+  -> (ccols -> ck)
+  -> Relation pcols child k
+  where {
+    k: Core.PgType + Eq,
+    pk: ToSql k,
+    ck: ToSql k,
+    ccols: Generic ccols_rep,
+    ccols_rep: Selectable child_rep,
+    child: Generic child_rep,
+  }
+has_many child_table parent_key child_fk = Relation (RelationDef {
+  parent_key: fun pc -> Core.as_sql (parent_key pc),
+  load_children: fun conn keys -> {
+    # Build the child query selecting (foreign key, child row): the row is a generic
+    # select over `cols` alone (a single type variable, so its `Generic`/`Selectable`
+    # constraints can be surfaced on this signature), paired manually with the FK
+    # column's projection. Selecting a `(Col k, cols)` value directly is impossible —
+    # a `fun` can't carry a `Generic` constraint over an applied/anonymous type.
+    let QueryStep run = (fun () -> {
+      let cols = from! child_table
+      where_! (Core.in_ (child_fk cols) keys)
+      cols
+    }) () with collect_query
+    let (cols, state) = run empty_state
+    let pair_projection = Core.project_pair (Core.col_projection (Core.as_sql (child_fk cols))) (Core.select cols)
+    case all conn (prepare pair_projection state) {
       Err err -> Err err
-      Ok children -> Ok (associate parent_key child_key combine parents children)
+      Ok pairs -> Ok (group_pairs pairs)
+    }
+  },
+})
+
+#@ Pull a `has_many` relation into the current query as a `select!` field. Returns a
+#@ `Preloaded child`; drop it into the selection (`select! ({ user: u, posts: posts })`)
+#@ and the row field infers to `List child`. The parent-key column is added to the
+#@ SELECT automatically, and the children are batch-loaded by `all`/`one` after the
+#@ main query — one extra query per relation, not N+1.
+#@
+#@     let u = from! users
+#@     let posts = preload authored_posts u
+#@     select! ({ user: u, posts: posts })
+pub fun preload : Relation pcols child k -> pcols -> Preloaded child
+  needs {QueryBuild}
+  where {k: Core.PgType + Eq}
+preload relation pcols = case relation {
+  Relation def -> {
+    let index = relation_count! ()
+    let alias = "__rel" <> show index
+    let key_col = def.parent_key pcols
+    let key_item = Core.col_select_item alias key_col
+    let read_key = Core.col_decoder key_col
+    push_relation! (RelSpec {
+      index: index,
+      # Un-erase the parent keys, run the typed child loader, and re-erase the grouped
+      # `Dict` so the executor can carry it without knowing `k` / `child`.
+      load: fun conn dyn_keys -> {
+        let keys = List.map unsafe_from_dynamic dyn_keys
+        case def.load_children conn keys {
+          Err err -> Err err
+          Ok grouped -> Ok (unsafe_to_dynamic grouped)
+        }
+      },
+    })
+    Core.make_preloaded key_item (fun data offset row ->
+      case read_key offset row {
+        Err err -> Err err
+        Ok key -> {
+          let req = Core.RelKey index (unsafe_to_dynamic key)
+          case Core.rel_data_get index data {
+            Nothing -> Ok ([], [req])
+            Just grouped_dyn -> {
+              let grouped = unsafe_from_dynamic grouped_dyn
+              let kids = case Dicts.get key grouped {
+                Just xs -> xs
+                Nothing -> []
+              }
+              Ok (kids, [req])
+            }
+          }
+        }
+      })
+  }
+}
+
+# Collect every relation key emitted across all rows (first decode pass, run with
+# empty `RelData`). The decoded values are discarded; only the keys matter here.
+fun collect_rel_keys : (RelData -> Dynamic -> Result (a, List RelKey) DecodeError)
+  -> List Dynamic
+  -> Result (List RelKey) DbError
+collect_rel_keys decode rows = case rows {
+  [] -> Ok []
+  row :: rest -> case decode Core.empty_rel_data row {
+    Err err -> Err (DecodeFailed err)
+    Ok (_value, keys) -> case collect_rel_keys decode rest {
+      Err err -> Err err
+      Ok more -> Ok (List.append keys more)
+    }
+  }
+}
+
+# The parent keys (still erased) requested for one relation index.
+fun keys_for : Int -> List RelKey -> List Dynamic
+keys_for index keys = List.foldr (fun req acc -> case req {
+  RelKey i value -> if i == index then value :: acc else acc
+}) [] keys
+
+# For each relation, load + group its children (one batched query via `load`) and pair
+# the erased `Dict` with the relation's index — the entries that populate the second
+# decode pass's `RelData`.
+fun load_rel_entries : Connection
+  -> List RelSpec
+  -> List RelKey
+  -> Result (List (Int, Dynamic)) DbError
+  needs {Repo}
+load_rel_entries conn specs keys = case specs {
+  [] -> Ok []
+  spec :: rest -> case spec.load conn (keys_for spec.index keys) {
+    Err err -> Err err
+    Ok grouped -> case load_rel_entries conn rest keys {
+      Err err -> Err err
+      Ok more -> Ok ((spec.index, grouped) :: more)
     }
   }
 }
@@ -1087,14 +1253,18 @@ transaction conn body = {
   }
 }
 
-fun decode_rows : (Dynamic -> Result a DecodeError)
+# Decode every row with the given relation data (the second pass when relations are
+# present, or the only pass with `empty_rel_data` when there are none). The relation
+# keys each row emits are not needed here — they were gathered in `collect_rel_keys`.
+fun decode_rows : (RelData -> Dynamic -> Result (a, List RelKey) DecodeError)
+  -> RelData
   -> List Dynamic
   -> Result (List a) DbError
-decode_rows decoder rows = case rows {
+decode_rows decoder data rows = case rows {
   [] -> Ok []
-  row :: rest -> case decoder row {
+  row :: rest -> case decoder data row {
     Err err -> Err (DecodeFailed err)
-    Ok value -> case decode_rows decoder rest {
+    Ok (value, _keys) -> case decode_rows decoder data rest {
       Err err -> Err err
       Ok values -> Ok (value :: values)
     }

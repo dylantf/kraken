@@ -17,6 +17,7 @@ import Std.Dynamic (
   from_erlang
 )
 import Std.Generic (Generic, Leaf, Labeled, And, Record)
+import Std.Dict as Dicts
 import SagaJson as Json
 import SagaJson.Codec as JsonCodec (ToJson, FromJson)
 import SagaPgo (Connection, Postgres, QueryError, Returned)
@@ -491,13 +492,74 @@ record FieldDef a {
 
 opaque type Field a = Field (FieldDef a)
 
+# --- Relation loading plumbing (used by the query layer's `preload`) ---
+#
+# A relation field (`Db.Preloaded`) does not decode from its own columns alone: it
+# decodes from children fetched by a *separate* query. Decoding therefore runs in
+# two passes. Pass one decodes every row with empty `RelData`, and each relation
+# slot emits a `RelKey` (its parent-key value, tagged with the relation's index).
+# The executor batches those keys, loads + groups each relation's children, and
+# packs the grouped results into a populated `RelData`. Pass two re-decodes the
+# rows with that `RelData`, so each slot resolves to its matching `List child`.
+
+#@ A parent-key value emitted by a relation slot during decode, tagged with the
+#@ index of the relation that needs it. Collected in the first decode pass so the
+#@ executor can batch-load that relation's children.
+pub type RelKey = RelKey Int Dynamic
+
+#@ Loaded children for each relation, keyed by relation index, type-erased (each
+#@ value is a `Dict parent_key (List child)`). Empty during the key-collection
+#@ pass; populated for the final decode pass.
+opaque type RelData = RelData (Dict Int Dynamic)
+
+#@ The empty relation data used during the key-collection pass (and by callers
+#@ with no relations at all).
+pub fun empty_rel_data : RelData
+empty_rel_data = RelData (Dicts.new ())
+
+#@ Build relation data from `(relation index, grouped-children-as-Dynamic)` pairs.
+pub fun rel_data_of : List (Int, Dynamic) -> RelData
+rel_data_of entries = RelData (Dicts.from_list entries)
+
+#@ Look up a relation's grouped children (still type-erased) by its index.
+pub fun rel_data_get : Int -> RelData -> Maybe Dynamic
+rel_data_get index data = case data {
+  RelData dict -> Dicts.get index dict
+}
+
 record ProjectionDef a {
   selections: List SelectItem,
   width: Int,
-  decode_at: Int -> Dynamic -> Result a DecodeError,
+  decode_at: RelData -> Int -> Dynamic -> Result (a, List RelKey) DecodeError,
 }
 
 opaque type Projection a = Projection (ProjectionDef a)
+
+#@ A relation field in a `select!`: it occupies one selected column (its parent
+#@ key) but decodes to the `List child` loaded by a separate query. Built by the
+#@ query layer's `preload`; selecting it contributes the parent-key column to the
+#@ SELECT and a deferred decode that resolves children from the executor-supplied
+#@ `RelData`. See `make_preloaded` and the `Selectable (List child)` instance.
+opaque type Preloaded child = Preloaded (PreloadedDef child)
+
+record PreloadedDef child {
+  # The parent-key column injected into the SELECT (so it's available to group on).
+  key_item: SelectItem,
+  # Decode this slot: read the parent key at `offset`, emit it as a `RelKey`, and
+  # (once `RelData` is populated) resolve to the matching children.
+  resolve: RelData -> Int -> Dynamic -> Result (List child, List RelKey) DecodeError,
+}
+
+#@ Build a `Preloaded` field from its injected parent-key column and a resolver.
+#@ The query layer's `preload` supplies both (the resolver closes over the child
+#@ types, so `Preloaded` itself stays parameterized only by `child`).
+pub fun make_preloaded : SelectItem
+  -> (RelData -> Int -> Dynamic -> Result (List child, List RelKey) DecodeError)
+  -> Preloaded child
+make_preloaded key_item resolve = Preloaded (PreloadedDef {
+  key_item: key_item,
+  resolve: resolve,
+})
 
 pub trait Selectable selection row | selection -> row {
   fun to_projection : selection -> Projection row
@@ -541,10 +603,10 @@ map transform projection = {
   Projection (ProjectionDef {
     selections: def.selections,
     width: def.width,
-    decode_at: fun offset row ->
-      case def.decode_at offset row {
+    decode_at: fun data offset row ->
+      case def.decode_at data offset row {
         Err err -> Err err
-        Ok value -> Ok (transform value)
+        Ok (value, reqs) -> Ok (transform value, reqs)
       },
   })
 }
@@ -1151,12 +1213,24 @@ field_auto column = {
   field_as info.name column
 }
 
+# Lift a plain positional decoder into the relation-aware shape: it ignores the
+# `RelData` and emits no relation keys.
+fun lift_decode : (Int -> Dynamic -> Result a DecodeError)
+  -> RelData
+  -> Int
+  -> Dynamic
+  -> Result (a, List RelKey) DecodeError
+lift_decode decoder = fun _data offset row -> case decoder offset row {
+  Err err -> Err err
+  Ok value -> Ok (value, [])
+}
+
 fun field_def_projection : FieldDef a -> Projection a
 field_def_projection def =
   Projection (ProjectionDef {
     selections: [def.selection],
     width: 1,
-    decode_at: fun offset row -> decode_element offset def.decoder row,
+    decode_at: lift_decode (fun offset row -> decode_element offset def.decoder row),
   })
 
 fun field_projection : Col a -> Projection a where {a: PgType}
@@ -1177,11 +1251,11 @@ nullable_row projection = {
   Projection (ProjectionDef {
     selections: def.selections,
     width: def.width,
-    decode_at: fun offset row ->
-      if slice_all_null offset def.width row then Ok Nothing
-      else case def.decode_at offset row {
+    decode_at: fun data offset row ->
+      if slice_all_null offset def.width row then Ok (Nothing, [])
+      else case def.decode_at data offset row {
         Err err -> Err err
-        Ok value -> Ok (Just value)
+        Ok (value, reqs) -> Ok (Just value, reqs)
       },
   })
 }
@@ -1225,22 +1299,17 @@ zip_projection left right = {
   Projection (ProjectionDef {
     selections: List.append left_def.selections right_def.selections,
     width: left_def.width + right_def.width,
-    decode_at: fun offset row ->
-      case left_def.decode_at offset row {
+    decode_at: fun data offset row ->
+      case left_def.decode_at data offset row {
         Err err -> Err err
-        Ok left_value -> case right_def.decode_at (offset
+        Ok (left_value, left_reqs) -> case right_def.decode_at data (offset
           + left_def.width) row {
           Err err -> Err err
-          Ok right_value -> Ok (left_value, right_value)
+          Ok (right_value, right_reqs) ->
+            Ok ((left_value, right_value), List.append left_reqs right_reqs)
         }
       },
   })
-}
-
-fun projection_decode : Projection a -> Dynamic -> Result a DecodeError
-projection_decode projection row = {
-  let Projection def = projection
-  def.decode_at 0 row
 }
 
 pub fun projection_selections : Projection a -> List SelectItem
@@ -1249,8 +1318,61 @@ projection_selections projection = {
   def.selections
 }
 
-pub fun decode_projection : Projection a -> Dynamic -> Result a DecodeError
-decode_projection projection row = projection_decode projection row
+#@ Build a `Projection` from explicit selections, width, and a relation-aware
+#@ decoder. Exposed so the query layer can construct a `Preloaded` field's
+#@ projection (its single parent-key column plus a deferred child-resolving decode).
+pub fun make_projection : List SelectItem
+  -> Int
+  -> (RelData -> Int -> Dynamic -> Result (a, List RelKey) DecodeError)
+  -> Projection a
+make_projection selections width decoder =
+  Projection (ProjectionDef {
+    selections: selections,
+    width: width,
+    decode_at: decoder,
+  })
+
+#@ Coerce any column-like value (`Col` / `Generated` / `Sql`) to a `Sql a`. Exposed
+#@ so the query layer can accept a relation key as a column accessor regardless of
+#@ whether the schema field is a plain or generated column.
+pub fun as_sql : input -> Sql a where {input: ToSql a}
+as_sql input = to_sql input
+
+#@ A `SelectItem` selecting a single `Sql` value under the given alias. Exposed so
+#@ the query layer can inject a relation's parent-key column into the SELECT.
+pub fun col_select_item : String -> Sql a -> SelectItem
+col_select_item alias sql_value = SelectItem { expr: sql_frag sql_value, alias: alias }
+
+#@ A positional decoder for a single `Sql` value, using its own decoder. Exposed so
+#@ the query layer can read a relation's parent-key value at decode time.
+pub fun col_decoder : Sql a -> Int -> Dynamic -> Result a DecodeError
+col_decoder sql_value = case sql_value {
+  Sql def -> fun offset row -> decode_element offset def.decoder row
+}
+
+#@ A single-column `Projection` for a `Sql` value. Exposed so the query layer can
+#@ pair a relation's foreign-key column alongside the child row without a generic
+#@ select over an anonymous pair (whose `Generic` constraint can't be surfaced on a
+#@ `fun`).
+pub fun col_projection : Sql a -> Projection a
+col_projection sql_value = sql_projection sql_value
+
+#@ Pair two projections into one yielding a tuple (selections concatenated, widths
+#@ summed, decodes threaded). Exposed for relation loading's `(fk, child)` rows.
+pub fun project_pair : Projection a -> Projection b -> Projection (a, b)
+project_pair left right = zip_projection left right
+
+#@ Decode a result row through a projection, threading relation data and collecting
+#@ any relation keys the row's `Preloaded` slots emit. Callers with no relations
+#@ pass `empty_rel_data` and ignore the (empty) key list.
+pub fun decode_projection : Projection a
+  -> RelData
+  -> Dynamic
+  -> Result (a, List RelKey) DecodeError
+decode_projection projection data row = {
+  let Projection def = projection
+  def.decode_at data 0 row
+}
 
 impl Selectable a for Col a where {a: PgType} {
   to_projection column = field_projection column
@@ -1272,6 +1394,16 @@ impl Selectable (Maybe out) for Nullable s where {s: Selectable out} {
 
 impl Selectable a for Sql a {
   to_projection sql_value = sql_projection sql_value
+}
+
+# A preloaded relation contributes exactly one selected column (its parent key,
+# width 1) and decodes to the `List child` resolved from the executor-loaded
+# `RelData`. The functional dep `Preloaded child -> List child` is what lets a
+# `select!` field of `Preloaded Post` infer a row field of `List Post`.
+impl Selectable (List child) for Preloaded child {
+  to_projection preloaded = case preloaded {
+    Preloaded def -> make_projection [def.key_item] 1 def.resolve
+  }
 }
 
 impl ToSql a for Col a where {a: PgType} {

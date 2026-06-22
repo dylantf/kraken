@@ -345,35 +345,30 @@ users_over_post_count_query () = Query.query (fun () -> {
   select! ({ id: u.id, name: u.name })
 })
 
-# --- Separate-query relation loading (preload + associate) ---
+# --- Relation loading: declare the relation in the query, get nested results ---
 
-# Parent query: whole users as the domain type.
-pub fun all_users_query : Unit -> Query.Prepared User
-all_users_query () = Query.query (fun () -> {
+# A has-many relation, defined once next to the schema: users have many posts, joined
+# parent `users.id` -> child `posts.author_id`. Both are column accessors, so the FK is
+# named once and the batched child query is generated.
+pub fun authored_posts : Query.Relation Users Post Int
+authored_posts = Query.has_many posts (fun u -> u.id) (fun p -> p.author_id)
+
+# Load each user with their posts as one query expression: `preload` pulls the
+# relation into the `select!`, and `Query.all` runs the parent query plus one batched
+# child query (not N+1), stitching the nested `{ user, posts }` rows.
+pub fun users_with_posts_query : Unit
+  -> Query.Prepared { user: User, posts: List Post }
+users_with_posts_query () = Query.query (fun () -> {
   let u = from! users
+  let posts = Query.preload authored_posts u
   order_by! [Db.asc u.id]
-  select! (u)
+  select! ({ user: u, posts: posts })
 })
 
-# Child query: every post whose author is in the given id set — one batched query
-# (not N+1). `Db.in_` renders `author_id IN ($1, $2, …)`.
-pub fun posts_for_authors : List Int -> Query.Prepared Post
-posts_for_authors ids = Query.query (fun () -> {
-  let p = from! posts
-  where_! (Db.in_ p.author_id ids)
-  select! (p)
-})
-
-# Load users, then their posts in one extra query, stitched into a nested shape via
-# `preload`. Two queries total, regardless of how many users — the classic preload.
 pub fun load_users_with_posts : Connection
   -> Result (List { user: User, posts: List Post }) Query.DbError
   needs {Repo}
-load_users_with_posts conn = case Query.all conn (all_users_query ()) {
-  Err err -> Err err
-  Ok users ->
-    Query.preload conn users (fun u -> u.id) posts_for_authors (fun p -> p.author_id) (fun u ps -> { user: u, posts: ps })
-}
+load_users_with_posts conn = Query.all conn (users_with_posts_query ())
 
 # FULL JOIN via the dedicated full-join constructor: both tables are bound nullable,
 # so the row is all-Maybe (user-only rows, post-only rows, and matched rows all
