@@ -75,6 +75,13 @@ record Join {
   on: Expr,
 }
 
+# Whether the SELECT is plain, `DISTINCT`, or `DISTINCT ON (<keys>)`. Set by the
+# `distinct!` / `distinct_on!` ops; the two are mutually exclusive (last one wins).
+type DistinctKind =
+  | NoDistinct
+  | DistinctAll
+  | DistinctOn (List Group)
+
 record QueryState {
   from_source: Maybe Source,
   joins: List Join,
@@ -91,6 +98,8 @@ record QueryState {
   # CTE definitions (name, rendered body) hoisted into a leading `WITH` clause, in
   # declaration order.
   ctes: List (String, SqlFrag),
+  # SELECT distinctness (plain / DISTINCT / DISTINCT ON keys).
+  distinct: DistinctKind,
 }
 
 #@ A compiled query: rendered SQL, its bound parameters, and a decoder that turns
@@ -161,6 +170,13 @@ pub effect QueryBuild {
   #@ plain columns; the bound result is a `Nullable` scope, so selecting it yields
   #@ `Maybe row`.
   fun left_join : Table cols -> (cols -> Expr) -> Nullable cols
+  #@ Emit `SELECT DISTINCT` (whole-row distinct). Invoke as `distinct! ()`.
+  fun distinct : Unit -> Unit
+  #@ Emit `SELECT DISTINCT ON (<keys>)` — keep one row per distinct combination of
+  #@ the key expressions (build keys with `Db.group`; pair with `order_by!` to choose
+  #@ which row of each group wins). `distinct!` / `distinct_on!` are mutually
+  #@ exclusive — the last one set takes effect.
+  fun distinct_on : List Group -> Unit
   #@ Add a `WHERE` predicate. Repeated calls are combined with `AND`.
   fun where_ : Expr -> Unit
   #@ Add `GROUP BY` keys.
@@ -191,6 +207,7 @@ empty_state = QueryState {
   next_alias: 0,
   alias_prefix: "t",
   ctes: [],
+  distinct: NoDistinct,
 }
 
 # A subquery's initial state: a distinct alias prefix so its tables don't collide
@@ -264,6 +281,20 @@ handler collect_query for QueryBuild {
       let join = Join { kind: LeftJoin, source: source, on: on_fn cols }
       let QueryStep run_rest = resume Core.as_nullable cols
       run_rest ({ state2 | joins: List.append state2.joins [join] })
+    })
+  }
+
+  distinct _unit = {
+    QueryStep (fun state -> {
+      let QueryStep run_rest = resume ()
+      run_rest ({ state | distinct: DistinctAll })
+    })
+  }
+
+  distinct_on keys = {
+    QueryStep (fun state -> {
+      let QueryStep run_rest = resume ()
+      run_rest ({ state | distinct: DistinctOn keys })
     })
   }
 
@@ -602,6 +633,23 @@ render_havings havings state = case havings {
     |> render_expr (and_ havings)
 }
 
+# Render the distinctness modifier that follows `SELECT ` and precedes the select
+# list: nothing, `DISTINCT `, or `DISTINCT ON (<keys>) `.
+fun render_distinct : DistinctKind -> RenderState -> RenderState
+render_distinct kind state = case kind {
+  NoDistinct -> state
+  DistinctAll -> render_text "DISTINCT " state
+  DistinctOn keys -> case keys {
+    [] ->
+      panic "Kraken.Query.distinct_on: needs at least one key (use distinct! () for plain SELECT DISTINCT)"
+    _ ->
+      state
+      |> render_text "DISTINCT ON ("
+      |> render_more_groups keys
+      |> render_text ") "
+  }
+}
+
 fun render_limit : Maybe Int -> RenderState -> RenderState
 render_limit count state = case count {
   Nothing -> state
@@ -685,6 +733,7 @@ select_frag items state = case state.from_source {
       RenderState { parts: [] }
       |> render_with state
       |> render_text "SELECT "
+      |> render_distinct state.distinct
       |> render_selects items
       |> render_from_onward source state
     SqlFrag { parts: List.reverse built.parts }

@@ -19,6 +19,10 @@ main () = {
   println (Read.user_posts_query ()).sql
   println (Read.users_with_optional_posts_query ()).sql
 
+  println "-- DISTINCT / DISTINCT ON (rendered SQL) --"
+  println (Read.distinct_ages_query ()).sql
+  println (Read.newest_user_per_age_query ()).sql
+
   println "-- dynamic filters: min_age=Just 18, name=Nothing, newest_first --"
   println (Read.search_users_query (Just 18) Nothing True).sql
   println "-- dynamic filters: min_age=Nothing, name=Just, oldest_first --"

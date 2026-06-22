@@ -112,6 +112,26 @@ search_users_query min_age name_like newest_first = Query.query (fun () -> {
   select! ({ id: u.id, name: u.name, age: u.age })
 })
 
+# SELECT DISTINCT: distinct (age) rows across all users.
+pub fun distinct_ages_query : Unit -> Query.Prepared { age: Int }
+distinct_ages_query () = Query.query (fun () -> {
+  let u = from! users
+  distinct! ()
+  order_by! [Db.asc u.age]
+  select! ({ age: u.age })
+})
+
+# SELECT DISTINCT ON: the newest (highest id) user per age — DISTINCT ON the age,
+# with ORDER BY age, id DESC choosing which row of each age wins.
+pub fun newest_user_per_age_query : Unit
+  -> Query.Prepared { id: Int, name: String, age: Int }
+newest_user_per_age_query () = Query.query (fun () -> {
+  let u = from! users
+  distinct_on! [Db.group u.age]
+  order_by! [Db.asc u.age, Db.desc u.id]
+  select! ({ id: u.id, name: u.name, age: u.age })
+})
+
 # Whole-row required + a scalar, both from inner joins
 pub fun user_posts_query : Unit -> Query.Prepared { user: User, title: String }
 user_posts_query () = Query.query (fun () -> {
