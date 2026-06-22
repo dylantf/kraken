@@ -2,6 +2,7 @@ module Kraken.Db.Query
 
 import Std.Dynamic (Dynamic, DecodeError)
 import Std.Generic (Generic)
+import Std.Dict as Dicts
 import Kraken.Db (
   Table,
   Nullable,
@@ -973,6 +974,78 @@ exactly_one conn prepared = case all conn prepared {
     _ -> Err (ExpectedOneRow (List.length rows))
   }
   Err err -> Err err
+}
+
+# --- Relation loading (separate query per relation, stitched in memory) ---
+
+# Group children into a Dict keyed by `child_key`, preserving each child's order
+# within its group (foldr + prepend puts the first child first). NB: the value type
+# is the bare builtin `Dict` — `Dicts.Dict` (qualifying the builtin through the module
+# alias) misresolves to a phantom type that won't unify with the real one.
+fun group_by_key : (child -> k) -> List child -> Dict k (List child)
+  where {k: Eq}
+group_by_key child_key children =
+  List.foldr (fun c dict -> {
+    let k = child_key c
+    let existing = case Dicts.get k dict {
+      Just xs -> xs
+      Nothing -> []
+    }
+    Dicts.put k (c :: existing) dict
+  }) (Dicts.new ()) children
+
+#@ Stitch already-loaded children onto already-loaded parents by a shared key — the
+#@ in-memory half of separate-query relation loading. Children are grouped by
+#@ `child_key` (O(n+m) via a Dict), then each parent is combined with its matching
+#@ children (in query order); a parent with no children gets `[]`. Pure — no DB.
+#@
+#@     Query.associate (fun u -> u.id) (fun p -> p.author_id)
+#@       (fun u ps -> { user: u, posts: ps }) users posts
+#@     -- List { user: User, posts: List Post }
+pub fun associate : (parent -> k)
+  -> (child -> k)
+  -> (parent -> List child -> r)
+  -> List parent
+  -> List child
+  -> List r
+  where {k: Eq}
+associate parent_key child_key combine parents children = {
+  let grouped = group_by_key child_key children
+  List.map (fun p -> {
+    let kids = case Dicts.get (parent_key p) grouped {
+      Just xs -> xs
+      Nothing -> []
+    }
+    combine p kids
+  }) parents
+}
+
+#@ Load and attach a has-many relation in one extra query (the classic `preload`):
+#@ extract the parents' keys, run the single `child_query` over them (its
+#@ `WHERE … IN (keys)` lives in the builder you pass), and `associate` the results.
+#@ One query per relation level — not N+1. Empty parents short-circuit to `Ok []`.
+#@
+#@     Query.preload conn users (fun u -> u.id)
+#@       posts_for_authors (fun p -> p.author_id)
+#@       (fun u ps -> { user: u, posts: ps })
+pub fun preload : Connection
+  -> List parent
+  -> (parent -> k)
+  -> (List k -> Prepared child)
+  -> (child -> k)
+  -> (parent -> List child -> r)
+  -> Result (List r) DbError
+  needs {Repo}
+  where {k: Eq}
+preload conn parents parent_key child_query child_key combine = case parents {
+  [] -> Ok []
+  _ -> {
+    let keys = List.map parent_key parents
+    case all conn (child_query keys) {
+      Err err -> Err err
+      Ok children -> Ok (associate parent_key child_key combine parents children)
+    }
+  }
 }
 
 #@ How a failed transaction body's `DbError` is carried across saga_pgo's
