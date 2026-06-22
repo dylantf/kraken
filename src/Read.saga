@@ -191,6 +191,32 @@ users_with_published_posts_query () = Query.query (fun () -> {
   select! ({ id: u.id, name: u.name })
 })
 
+# Nested correlated subqueries: users who authored at least two distinct posts —
+# EXISTS a post p (correlated to u), and within it EXISTS another post p2 (correlated
+# to BOTH u and the middle p). This is the case the nested-alias fix targets: p and
+# p2 must get distinct aliases, otherwise `p.id` in the inner subquery silently
+# resolves to p2's alias and the query is wrong.
+pub fun users_with_two_posts_query : Unit
+  -> Query.Prepared { id: Int, name: String }
+users_with_two_posts_query () = Query.query (fun () -> {
+  let u = from! users
+  where_! (Query.exists (fun () -> {
+    let p = from! posts
+    where_! (Db.and_ [
+      Db.eq_col p.author_id u.id,
+      Query.exists (fun () -> {
+        let p2 = from! posts
+        where_! (Db.and_ [
+          Db.eq_col p2.author_id u.id,
+          Db.not_eq_sql p2.id p.id,
+        ])
+      }),
+    ])
+  }))
+  order_by! [Db.asc u.id]
+  select! ({ id: u.id, name: u.name })
+})
+
 # IN (subquery): users who authored a published post. The subquery closure returns
 # the column to match against `u.id` (no select!); their types must agree.
 pub fun users_in_published_query : Unit

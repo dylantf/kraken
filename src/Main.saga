@@ -42,6 +42,9 @@ main () = {
   println "-- correlated EXISTS subquery (rendered SQL) --"
   println (Read.users_with_published_posts_query ()).sql
 
+  println "-- nested correlated EXISTS (distinct s1/s2 aliases, no shadowing) --"
+  println (Read.users_with_two_posts_query ()).sql
+
   println "-- IN (subquery), rendered SQL --"
   println (Read.users_in_published_query ()).sql
 

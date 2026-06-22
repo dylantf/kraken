@@ -192,6 +192,14 @@ pub effect QueryBuild {
   #@ Choose the result shape. The selected value's type determines the row type of
   #@ the resulting `Prepared`.
   fun select : selection -> selection
+  #@ Internal plumbing for nested subqueries: read the current table-alias counter.
+  #@ The subquery builders continue alias numbering into the nested scope from here
+  #@ (paired with `commit_aliases`) so a correlated subquery nested inside another
+  #@ never restarts numbering and shadows an enclosing alias. Not for direct use.
+  fun peek_aliases : Unit -> Int
+  #@ Internal plumbing: commit the alias counter a nested subquery advanced to, back
+  #@ into the enclosing scope. Pair with `peek_aliases`.
+  fun commit_aliases : Int -> Unit
 }
 
 fun empty_state : QueryState
@@ -281,6 +289,20 @@ handler collect_query for QueryBuild {
       let join = Join { kind: LeftJoin, source: source, on: on_fn cols }
       let QueryStep run_rest = resume Core.as_nullable cols
       run_rest ({ state2 | joins: List.append state2.joins [join] })
+    })
+  }
+
+  peek_aliases _unit = {
+    QueryStep (fun state -> {
+      let QueryStep run_rest = resume state.next_alias
+      run_rest state
+    })
+  }
+
+  commit_aliases n = {
+    QueryStep (fun state -> {
+      let QueryStep run_rest = resume ()
+      run_rest ({ state | next_alias: n })
     })
   }
 
@@ -421,8 +443,7 @@ pub fun from_subquery : (Unit -> selection needs {QueryBuild}) -> scope
     scope: Generic scope_rep,
   }
 from_subquery make = {
-  let QueryStep run_sub = make () with collect_query
-  let (selection, sub_state) = run_sub empty_state_sub
+  let (selection, sub_state) = run_subquery make
   let frag = select_frag (selection_items selection) sub_state
   bind_derived! (DerivedTable {
     frag: frag,
@@ -456,8 +477,7 @@ pub fun cte : String -> (Unit -> selection needs {QueryBuild}) -> Table scope
     scope: Generic scope_rep,
   }
 cte name make = {
-  let QueryStep run_sub = make () with collect_query
-  let (selection, sub_state) = run_sub empty_state_sub
+  let (selection, sub_state) = run_subquery make
   let frag = select_frag (selection_items selection) sub_state
   define_cte! (DerivedCte {
     name: name,
@@ -766,12 +786,26 @@ subquery_frag state = case state.from_source {
   }
 }
 
-# Run a subquery builder closure under its own `collect_query` handler (the nested
-# effect) and render it to a fragment.
-fun build_subquery : (Unit -> a needs {QueryBuild}) -> SqlFrag
-build_subquery make = {
+# Run a nested subquery builder under its own `collect_query` handler, but continue
+# the enclosing scope's alias counter into it and commit back the aliases it
+# consumed. This gives every table across the whole query tree a unique alias, so a
+# correlated subquery nested inside another never restarts numbering and shadows an
+# enclosing alias. Returns the closure's value and its rendered sub-state.
+fun run_subquery : (Unit -> a needs {QueryBuild}) -> (a, QueryState)
+  needs {QueryBuild}
+run_subquery make = {
+  let base = peek_aliases! ()
   let QueryStep run_sub = make () with collect_query
-  let (_value, state) = run_sub empty_state_sub
+  let (value, sub_state) = run_sub ({ empty_state_sub | next_alias: base })
+  commit_aliases! sub_state.next_alias
+  (value, sub_state)
+}
+
+# Run a subquery builder and render it to a `SELECT 1 …` fragment (for EXISTS).
+fun build_subquery : (Unit -> a needs {QueryBuild}) -> SqlFrag
+  needs {QueryBuild}
+build_subquery make = {
+  let (_value, state) = run_subquery make
   subquery_frag state
 }
 
@@ -784,18 +818,20 @@ wrap_subquery keyword body = {
 
 #@ A correlated `EXISTS (…)` subquery predicate. The builder closure uses the same
 #@ `from!` / `where_!` / … DSL; reference an outer table's columns directly inside it
-#@ for correlation (their aliases are captured at bind time). The subquery's own
-#@ tables get an `s`-prefixed alias so they never clash with the outer `t`-aliases.
+#@ for correlation (their aliases are captured at bind time). Subquery tables get an
+#@ `s`-prefixed alias, and alias numbering continues from the enclosing scope's
+#@ counter, so even a correlated subquery nested inside another never reuses (and
+#@ shadows) an enclosing alias.
 #@
 #@     where_! (Query.exists (fun () -> {
 #@       let p = from! posts
 #@       where_! (Db.eq_col p.author_id u.id)
 #@     }))
-pub fun exists : (Unit -> a needs {QueryBuild}) -> Expr
+pub fun exists : (Unit -> a needs {QueryBuild}) -> Expr needs {QueryBuild}
 exists make = wrap_subquery "EXISTS (" (build_subquery make)
 
 #@ The negation of `exists`: `NOT EXISTS (…)`.
-pub fun not_exists : (Unit -> a needs {QueryBuild}) -> Expr
+pub fun not_exists : (Unit -> a needs {QueryBuild}) -> Expr needs {QueryBuild}
 not_exists make = wrap_subquery "NOT EXISTS (" (build_subquery make)
 
 # Render a single-column subquery (`SELECT <col> FROM …`) as a deferred fragment.
@@ -818,10 +854,10 @@ scalar_select_frag col_frag state = case state.from_source {
 # the subquery closure returns. `input` and the returned `col` share element type
 # `a`, so a type mismatch (e.g. `id IN (subquery of names)`) fails to compile.
 fun membership : String -> input -> (Unit -> col needs {QueryBuild}) -> Expr
+  needs {QueryBuild}
   where {input: ToSql a, col: ToSql a}
 membership keyword input make = {
-  let QueryStep run_sub = make () with collect_query
-  let (selected, sub_state) = run_sub empty_state_sub
+  let (selected, sub_state) = run_subquery make
   let body = scalar_select_frag (frag_of selected) sub_state
   let left = frag_of input
   let opened = List.append left.parts (List.append [Text keyword] body.parts)
@@ -838,11 +874,13 @@ membership keyword input make = {
 #@       p.author_id
 #@     }))
 pub fun in_subquery : input -> (Unit -> col needs {QueryBuild}) -> Expr
+  needs {QueryBuild}
   where {input: ToSql a, col: ToSql a}
 in_subquery input make = membership " IN (" input make
 
 #@ The negation of `in_subquery`: `<input> NOT IN (subquery)`.
 pub fun not_in_subquery : input -> (Unit -> col needs {QueryBuild}) -> Expr
+  needs {QueryBuild}
   where {input: ToSql a, col: ToSql a}
 not_in_subquery input make = membership " NOT IN (" input make
 
@@ -850,10 +888,10 @@ not_in_subquery input make = membership " NOT IN (" input make
 # variants. The closure *returns* the single column (no `select!`); its element
 # type `a` flows out to whichever wrapper decodes the fragment.
 fun scalar_subquery_frag : (Unit -> col needs {QueryBuild}) -> SqlFrag
+  needs {QueryBuild}
   where {col: ToSql a}
 scalar_subquery_frag make = {
-  let QueryStep run_sub = make () with collect_query
-  let (selected, sub_state) = run_sub empty_state_sub
+  let (selected, sub_state) = run_subquery make
   let body = scalar_select_frag (frag_of selected) sub_state
   let opened = List.append [Text "("] body.parts
   let closed = List.append opened [Text ")"]
@@ -872,6 +910,7 @@ scalar_subquery_frag make = {
 #@ decoding fails at runtime; use `scalar_subquery_maybe` (which types that as
 #@ `Maybe a`) or wrap the call site in `Db.coalesce`.
 pub fun scalar_subquery : (Unit -> col needs {QueryBuild}) -> Core.Sql a
+  needs {QueryBuild}
   where {col: ToSql a, a: Core.PgType}
 scalar_subquery make = Core.sql_from_frag (scalar_subquery_frag make)
 
@@ -890,6 +929,7 @@ scalar_subquery make = Core.sql_from_frag (scalar_subquery_frag make)
 #@       }),
 #@     })   # { id: Int, a_title: Maybe String }
 pub fun scalar_subquery_maybe : (Unit -> col needs {QueryBuild}) -> Core.Sql (Maybe a)
+  needs {QueryBuild}
   where {col: ToSql a, a: Core.PgType}
 scalar_subquery_maybe make = Core.sql_from_frag (scalar_subquery_frag make)
 
