@@ -1091,7 +1091,7 @@ exactly_one conn prepared = if prepared.noop then Err (ExpectedOneRow 0)
 #@ child's column records `pcols` / `ccols`), so the foreign key is named exactly once
 #@ and the batched child query (`WHERE child_key IN (keys)`) is generated for you.
 #@
-#@     authored_posts = Query.has_many posts (fun u -> u.id) (fun p -> p.author_id)
+#@     authored_posts = Db.has_many posts (fun u -> u.id) (fun p -> p.author_id)
 opaque type Relation pcols ccols child k = Relation (RelationDef pcols ccols child k)
 
 #@ A to-one relation: the same join as `Relation`, built with `belongs_to` (the FK is
@@ -1191,7 +1191,7 @@ has_many child_table parent_key child_fk = Relation (relation_def child_table pa
 #@ child's key (e.g. a post's `author_id` → a user's `id`). Consume with `preload`
 #@ → `Maybe child`.
 #@
-#@     post_author = Query.belongs_to users (fun p -> p.author_id) (fun u -> u.id)
+#@     post_author = Db.belongs_to users (fun p -> p.author_id) (fun u -> u.id)
 pub fun belongs_to : Table ccols
   -> (pcols -> pk)
   -> (ccols -> ck)

@@ -1,0 +1,40 @@
+{
+  "sections": [
+    {
+      "slug": "getting-started",
+      "title": "Getting started",
+      "description": "Install Kraken, define a table, run the first typed query.",
+      "group": "guide"
+    },
+    {
+      "slug": "schema",
+      "title": "Schema",
+      "description": "Domain records, column records, ColumnSet impls, generated columns, insert shapes, custom codecs.",
+      "group": "guide"
+    },
+    {
+      "slug": "queries",
+      "title": "Queries",
+      "description": "from, select, joins, dynamic filters, grouping, subqueries, CTEs, and execution.",
+      "group": "guide"
+    },
+    {
+      "slug": "expressions",
+      "title": "Expressions",
+      "description": "Predicates, SQL functions, aggregates, arrays, JSONB, raw SQL, and window functions.",
+      "group": "guide"
+    },
+    {
+      "slug": "writes",
+      "title": "Writes",
+      "description": "insert, returning, bulk insert, update, delete, upsert, update_all, and transactions.",
+      "group": "guide"
+    },
+    {
+      "slug": "relations",
+      "title": "Relations",
+      "description": "has_many, belongs_to, preload, preload_where, nullable joins, anti-joins, and full joins.",
+      "group": "guide"
+    }
+  ]
+}
