@@ -48,9 +48,10 @@ results. You need that database reachable for `saga run` to succeed.
   `Jsonb` types, the typed-SQL expression layer (`Sql a`, `Expr`, `SqlFrag`),
   `Selectable`/`Projection`, and all predicate / ordering / grouping / aggregate
   helpers.
-- `lib/Kraken/Db/Query.saga` — the `QueryBuild` effect (the `from!`/`join!`/
-  `select!` DSL), SQL rendering, the `Prepared` type, the `Repo` effect + the
-  `pg_repo` handler, and execution (`all`/`one`/`run`/`into`).
+- `lib/Kraken/Db/Query.saga` — the `QueryBuild` effect (the `from!`/`join!`/`where_!`
+  DSL) plus `select` (a pure `a -> Select a` the builder closure *returns*, not an
+  effect op), SQL rendering, the `Prepared` type, the `Repo` effect + the `pg_repo`
+  handler, and execution (`all`/`one`/`run`/`into`).
 - `lib/Kraken/Db/Dml.saga` — writes: `update`, `delete`, `exec` (non-returning,
   returns affected-row count). Parallel to `Query`, reusing the `Db` vocabulary.
 - `lib/kraken_unsafe.erl` — tiny Erlang FFI: `from_dynamic` (unsafe cast) and
@@ -80,7 +81,7 @@ Everything funnels through a few opaque types:
 - `Projection a` — selections + a width + a positional `decode_at` that turns one
   result row into an `a`. Built generically from a selection value.
 
-The selection→row inference is the heart of the library. `select!` takes an
+The selection→row inference is the heart of the library. `select` takes an
 anonymous record/value; `Selectable` instances over the Generic representation
 (`Leaf`/`Labeled`/`And`/`Record`) walk it to build a `Projection`, and the row
 type is inferred from the selection's shape. There is **no per-table select
@@ -99,7 +100,7 @@ Nullability comes from **exactly two places: the schema and the join kind.**
   Select the whole `Maybe Post` instead. To reference a left-joined table's
   columns in post-join predicates/ordering (e.g. the anti-join
   `where_! (Db.is_null (Db.unwrap_cols p).id)`), use `Db.unwrap_cols` — but
-  **never in `select!`** (it drops nullability and fails at decode time).
+  **never in `select`** (it drops nullability and fails at decode time).
 
 ### Effects
 
@@ -107,7 +108,11 @@ Kraken uses Saga's algebraic effects:
 
 - `QueryBuild` — the query DSL. Its operations are invoked with `!` syntax inside
   the closure passed to `Query.query`. The `collect_query` handler threads a
-  `QueryState` through a continuation-passing `QueryStep`.
+  `QueryState` through a continuation-passing `QueryStep`. The closure must *return*
+  `select (…)` (a pure `a -> Select a`, opaque `Select`): the result shape comes from
+  the returned value, not an effect op, so it's type-enforced — you can't forget it or
+  return a bare record. (EXISTS / `in_subquery` / `scalar_subquery` builders instead
+  return a bare value, since they yield no row shape.)
 - `Repo` — the execute capability. `pg_repo` is the production handler (runs
   against `Postgres`); provide your own in tests. Wired at the call boundary with
   `... with Query.pg_repo` (see `Main.saga`).
@@ -174,7 +179,7 @@ Writable a` — and `deriving (Db.InsertRow)` is attached for encoding), `update
 path's `Selectable cols row | cols -> row` link), `delete`, and `exec`
 (affected-row count). `insert`/`update`/`delete` each have a `*_returning`
 variant: they take a projection callback over the table's columns (like
-`select!`), append `RETURNING`, and yield a `Prepared row` runnable with
+`select`), append `RETURNING`, and yield a `Prepared row` runnable with
 `Query.all`/`Query.one` — reusing the read path's `Selectable`/`Projection`
 decode. Upserts are covered by `insert_on_conflict_do_nothing` and `upsert`
 (`ON CONFLICT (<target>) DO UPDATE SET … = EXCLUDED.…`), with conflict targets

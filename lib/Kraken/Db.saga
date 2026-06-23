@@ -190,7 +190,7 @@ as_nullable scope = Nullable scope
 #@ anti-join such as `is_null (unwrap_cols p).id`. SQL ignores result nullability
 #@ in those positions, so the plain columns are appropriate.
 #@
-#@ Do not use the result in `select!`: it selects the columns as non-null and
+#@ Do not use the result in `select`: it selects the columns as non-null and
 #@ turns a compile-time `Maybe` into a runtime decode error on absent rows. Join
 #@ `ON` clauses never need this — `inner_join!`/`left_join!` already pass their
 #@ callback the plain columns.
@@ -542,7 +542,7 @@ record ProjectionDef a {
 
 opaque type Projection a = Projection (ProjectionDef a)
 
-#@ A relation field in a `select!`: it occupies one selected column (its parent
+#@ A relation field in a `select`: it occupies one selected column (its parent
 #@ key) but decodes to `out` — the children loaded by a separate query, shaped by
 #@ how the relation is consumed (`List child` for a to-many `preload`, `Maybe child`
 #@ for a to-one `preload_one`). Built by the query layer; selecting it contributes
@@ -679,7 +679,7 @@ value input = SqlArg (param (encode_pg input))
 #@ A typed literal as a first-class `Sql a`: a bound parameter with an explicit
 #@ `::type` cast (`$1::text`). Use it for literals in positions where Postgres can't
 #@ infer the parameter type from context — `concat`, `case_when` branches, a bare
-#@ `select!` of a constant — which otherwise fail with "could not determine data type
+#@ `select` of a constant — which otherwise fail with "could not determine data type
 #@ of parameter". In a comparison the other operand supplies the type, so `Db.value`
 #@ / the `eq` family don't need this.
 pub fun lit : a -> Sql a where {a: PgType + PgTypeName}
@@ -771,7 +771,7 @@ pub fun frag_of : input -> SqlFrag where {input: ToSql a}
 frag_of input = value_frag input
 
 #@ A SQL cast: render `(<input>)::<target>` and decode as the target type. The
-#@ result is a first-class `Sql b` usable in `select!` / predicates. This is a
+#@ result is a first-class `Sql b` usable in `select` / predicates. This is a
 #@ *typed assertion*, not a checked conversion — you vouch that the cast yields a
 #@ `b` (Postgres validates at runtime, like `raw`); Kraken just renders `::b` and
 #@ decodes accordingly. The target `b` must be annotated or fixed by an `as_*`
@@ -815,7 +815,7 @@ as_time input = cast input
 # --- SQL functions and expressions ---
 #
 # These all produce a first-class `Sql a` (or `Expr`), so they stay decoder-aware
-# and remain usable in `select!` / `where_!` / `having!`. Result types that aren't
+# and remain usable in `select` / `where_!` / `having!`. Result types that aren't
 # pinned by the inputs (e.g. `sql_fn`, `case_when`) are fixed by annotation or the
 # selection site, exactly like `cast`.
 
@@ -854,7 +854,7 @@ lit_param value = make_sql (param (encode_pg value))
 #@ `COALESCE(<input>, <fallback>)` — the first non-NULL of the two. The principled
 #@ way to recover a non-null scalar from a left join: after `Db.unwrap_cols`, a
 #@ left-joined column reads as `Col a`, and `coalesce` pairs it with a default of
-#@ the same type, yielding a non-null `Sql a` you *can* put in `select!`
+#@ the same type, yielding a non-null `Sql a` you *can* put in `select`
 #@ (`Db.coalesce (Db.unwrap_cols p).count 0` → `COALESCE(t1.count, $1)`).
 pub fun coalesce : input -> a -> Sql a where {input: ToSql a, a: PgType}
 coalesce input fallback = coalesce_sql input (lit_param fallback)
@@ -1390,7 +1390,7 @@ impl Selectable a for Sql a {
 
 # A preloaded relation contributes exactly one selected column (its parent key,
 # width 1) and decodes to `out` (its resolver's shape) from the executor-loaded
-# `RelData`. The functional dep `Preloaded out -> out` is what lets a `select!` field
+# `RelData`. The functional dep `Preloaded out -> out` is what lets a `select` field
 # of `Preloaded (List Post)` infer `List Post`, or `Preloaded (Maybe Post)` infer
 # `Maybe Post`.
 impl Selectable out for Preloaded out {

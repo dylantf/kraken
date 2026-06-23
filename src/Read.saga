@@ -3,7 +3,7 @@ module Read
 import Std.IO (Stdio)
 import Kraken.Db as Db
 import Kraken.Db.Query as Query
-import Kraken.Db.Query (QueryBuild, Repo)
+import Kraken.Db.Query (QueryBuild, Repo, select)
 import SagaJson.Codec (ToJson, FromJson)
 import SagaPgo (Connection)
 
@@ -81,7 +81,7 @@ users_query () = Query.query (fun () -> {
   where_! (Db.gt u.age 18)
   order_by! [Db.asc u.id]
   limit! 20
-  select! ({ id: u.id, name: u.name, age: u.age })
+  select ({ id: u.id, name: u.name, age: u.age })
 })
 
 # Cast: render the numeric age as text (`(t0.age)::text`) alongside the id.
@@ -89,7 +89,7 @@ pub fun users_age_text_query : Unit
   -> Query.Prepared { id: Int, age_text: String }
 users_age_text_query () = Query.query (fun () -> {
   let u = from! users
-  select! ({ id: u.id, age_text: Db.as_text u.age })
+  select ({ id: u.id, age_text: Db.as_text u.age })
 })
 
 # SPIKE: dynamic query — optional filters chosen at runtime. The closure is
@@ -109,7 +109,7 @@ search_users_query min_age name_like newest_first = Query.query (fun () -> {
     Nothing -> ()
   }
   if newest_first then order_by! [Db.desc u.id] else order_by! [Db.asc u.id]
-  select! ({ id: u.id, name: u.name, age: u.age })
+  select ({ id: u.id, name: u.name, age: u.age })
 })
 
 # SELECT DISTINCT: distinct (age) rows across all users.
@@ -118,7 +118,7 @@ distinct_ages_query () = Query.query (fun () -> {
   let u = from! users
   distinct! ()
   order_by! [Db.asc u.age]
-  select! ({ age: u.age })
+  select ({ age: u.age })
 })
 
 # SELECT DISTINCT ON: the newest (highest id) user per age — DISTINCT ON the age,
@@ -129,7 +129,7 @@ newest_user_per_age_query () = Query.query (fun () -> {
   let u = from! users
   distinct_on! [Db.group u.age]
   order_by! [Db.asc u.age, Db.desc u.id]
-  select! ({ id: u.id, name: u.name, age: u.age })
+  select ({ id: u.id, name: u.name, age: u.age })
 })
 
 # Whole-row required + a scalar, both from inner joins
@@ -139,7 +139,7 @@ user_posts_query () = Query.query (fun () -> {
   let p = inner_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
   where_! (Db.eq p.published True)
   order_by! [Db.desc p.id]
-  select! ({ user: u, title: p.title })
+  select ({ user: u, title: p.title })
 })
 
 pub fun users_with_optional_posts_query : Unit
@@ -150,7 +150,7 @@ users_with_optional_posts_query () = Query.query (fun () -> {
     left_join! posts (fun ps ->
       Db.and_ [Db.eq_col ps.author_id u.id, Db.eq ps.published True])
   order_by! [Db.asc u.id]
-  select! ({ user: u, post: p })
+  select ({ user: u, post: p })
 })
 
 # Force Nothing path
@@ -162,7 +162,7 @@ unmatched_posts_query () = Query.query (fun () -> {
     left_join! posts (fun ps ->
       Db.and_ [Db.eq_col ps.author_id u.id, Db.eq ps.id (-1)])
   order_by! [Db.asc u.id]
-  select! ({ user: u, post: p })
+  select ({ user: u, post: p })
 })
 
 # Example anti-join - needs unwrap to get around nullable col
@@ -173,7 +173,7 @@ users_without_posts_query () = Query.query (fun () -> {
   let p = left_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
   where_! (Db.is_null (Db.unwrap_cols p).id)
   order_by! [Db.asc u.id]
-  select! ({ id: u.id, name: u.name })
+  select ({ id: u.id, name: u.name })
 })
 
 # Correlated EXISTS subquery: users who have at least one published post. The inner
@@ -188,7 +188,7 @@ users_with_published_posts_query () = Query.query (fun () -> {
     where_! (Db.and_ [Db.eq_col p.author_id u.id, Db.eq p.published True])
   }))
   order_by! [Db.asc u.id]
-  select! ({ id: u.id, name: u.name })
+  select ({ id: u.id, name: u.name })
 })
 
 # Nested correlated subqueries: users who authored at least two distinct posts —
@@ -214,11 +214,11 @@ users_with_two_posts_query () = Query.query (fun () -> {
     ])
   }))
   order_by! [Db.asc u.id]
-  select! ({ id: u.id, name: u.name })
+  select ({ id: u.id, name: u.name })
 })
 
 # IN (subquery): users who authored a published post. The subquery closure returns
-# the column to match against `u.id` (no select!); their types must agree.
+# the column to match against `u.id` (no select); their types must agree.
 pub fun users_in_published_query : Unit
   -> Query.Prepared { id: Int, name: String }
 users_in_published_query () = Query.query (fun () -> {
@@ -229,7 +229,7 @@ users_in_published_query () = Query.query (fun () -> {
     p.author_id
   }))
   order_by! [Db.asc u.id]
-  select! ({ id: u.id, name: u.name })
+  select ({ id: u.id, name: u.name })
 })
 
 # Derived table: a subquery in FROM that aggregates post counts per author, which
@@ -241,11 +241,11 @@ prolific_authors_query () = Query.query (fun () -> {
   let t = Query.from_subquery (fun () -> {
     let p = from! posts
     group_by! [Db.group p.author_id]
-    select! ({ author_id: p.author_id, posts: Db.count_star })
+    select ({ author_id: p.author_id, posts: Db.count_star })
   })
   where_! (Db.gt t.posts 5)
   order_by! [Db.desc t.posts]
-  select! ({ author_id: t.author_id, posts: t.posts })
+  select ({ author_id: t.author_id, posts: t.posts })
 })
 
 # Tier 5 SQL functions: string fn + arithmetic in a select.
@@ -253,7 +253,7 @@ pub fun user_report_query : Unit
   -> Query.Prepared { id: Int, upper_name: String, age_next: Int }
 user_report_query () = Query.query (fun () -> {
   let u = from! users
-  select! ({ id: u.id, upper_name: Db.upper u.name, age_next: Db.add u.age 1 })
+  select ({ id: u.id, upper_name: Db.upper u.name, age_next: Db.add u.age 1 })
 })
 
 # CASE WHEN + CONCAT + NOT: bucket users by age, label with a prefix.
@@ -262,7 +262,7 @@ pub fun user_tier_query : Unit
 user_tier_query () = Query.query (fun () -> {
   let u = from! users
   where_! (Db.not_ (Db.eq u.age 0))
-  select! ({
+  select ({
     id: u.id,
     label: Db.concat [Db.sql (Db.lit "user:"), Db.sql u.name],
     tier: (Db.case_when [
@@ -279,7 +279,7 @@ pub fun user_post_title_query : Unit
 user_post_title_query () = Query.query (fun () -> {
   let u = from! users
   let p = left_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
-  select! ({ id: u.id, title: Db.coalesce (Db.unwrap_cols p).title "(none)" })
+  select ({ id: u.id, title: Db.coalesce (Db.unwrap_cols p).title "(none)" })
 })
 
 # CTE: factor the per-author post counts into a named WITH, then select from it.
@@ -289,12 +289,12 @@ prolific_authors_cte_query () = Query.query (fun () -> {
   let counts = Query.cte "post_counts" (fun () -> {
     let p = from! posts
     group_by! [Db.group p.author_id]
-    select! ({ author_id: p.author_id, posts: Db.count_star })
+    select ({ author_id: p.author_id, posts: Db.count_star })
   })
   let c = from! counts
   where_! (Db.gt c.posts 5)
   order_by! [Db.desc c.posts]
-  select! ({ author_id: c.author_id, posts: c.posts })
+  select ({ author_id: c.author_id, posts: c.posts })
 })
 
 # Scalar subquery in SELECT: each user plus the total post count as a value. The
@@ -304,7 +304,7 @@ pub fun users_with_total_posts_query : Unit
   -> Query.Prepared { id: Int, total_posts: Int }
 users_with_total_posts_query () = Query.query (fun () -> {
   let u = from! users
-  select! ({
+  select ({
     id: u.id,
     total_posts: Query.scalar_subquery (fun () -> {
       let _ = from! posts
@@ -320,7 +320,7 @@ pub fun users_with_a_post_title_query : Unit
   -> Query.Prepared { id: Int, a_title: Maybe String }
 users_with_a_post_title_query () = Query.query (fun () -> {
   let u = from! users
-  select! ({
+  select ({
     id: u.id,
     a_title: Query.scalar_subquery_maybe (fun () -> {
       let p = from! posts
@@ -342,7 +342,7 @@ users_over_post_count_query () = Query.query (fun () -> {
     Db.count_star
   })))
   order_by! [Db.asc u.id]
-  select! ({ id: u.id, name: u.name })
+  select ({ id: u.id, name: u.name })
 })
 
 # --- Relation loading: declare the relation in the query, get nested results ---
@@ -354,7 +354,7 @@ pub fun authored_posts : Query.Relation Users Posts Post Int
 authored_posts = Query.has_many posts (fun u -> u.id) (fun p -> p.author_id)
 
 # Load each user with their posts as one query expression: `preload` pulls the
-# relation into the `select!`, and `Query.all` runs the parent query plus one batched
+# relation into the `select`, and `Query.all` runs the parent query plus one batched
 # child query (not N+1), stitching the nested `{ user, posts }` rows.
 pub fun users_with_posts_query : Unit
   -> Query.Prepared { user: User, posts: List Post }
@@ -362,7 +362,7 @@ users_with_posts_query () = Query.query (fun () -> {
   let u = from! users
   let posts = Query.preload authored_posts u
   order_by! [Db.asc u.id]
-  select! ({ user: u, posts: posts })
+  select ({ user: u, posts: posts })
 })
 
 pub fun load_users_with_posts : Connection
@@ -383,7 +383,7 @@ posts_with_author_query () = Query.query (fun () -> {
   let p = from! posts
   let author = Query.preload post_author p
   order_by! [Db.asc p.id]
-  select! ({ post: p, author: author })
+  select ({ post: p, author: author })
 })
 
 pub fun load_posts_with_author : Connection
@@ -399,7 +399,7 @@ users_with_published_posts_only_query () = Query.query (fun () -> {
   let u = from! users
   let posts = Query.preload_where authored_posts u (fun p -> Db.eq p.published True)
   order_by! [Db.asc u.id]
-  select! ({ user: u, posts: posts })
+  select ({ user: u, posts: posts })
 })
 
 pub fun load_users_with_published_posts : Connection
@@ -413,7 +413,7 @@ load_users_with_published_posts conn = Query.all conn (users_with_published_post
 pub fun users_full_join_posts_query : Unit
   -> Query.Prepared { user: Maybe User, post: Maybe Post }
 users_full_join_posts_query () = Query.full_join_query users posts (fun u p -> Db.eq_col p.author_id u.id) (fun (user_scope, post_scope) -> {
-  select! ({ user: user_scope, post: post_scope })
+  select ({ user: user_scope, post: post_scope })
 })
 
 # Window functions: rank by age (ROW_NUMBER over ORDER BY), and a partitioned
@@ -422,7 +422,7 @@ pub fun ranked_users_query : Unit
   -> Query.Prepared { id: Int, age: Int, age_rank: Int, peers: Int }
 ranked_users_query () = Query.query (fun () -> {
   let u = from! users
-  select! ({
+  select ({
     id: u.id,
     age: u.age,
     age_rank: Db.row_number (Db.order_window [Db.desc u.age] Db.window),

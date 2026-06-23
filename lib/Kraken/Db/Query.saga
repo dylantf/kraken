@@ -227,9 +227,6 @@ pub effect QueryBuild {
   fun limit : Int -> Unit
   #@ Set `OFFSET`.
   fun offset : Int -> Unit
-  #@ Choose the result shape. The selected value's type determines the row type of
-  #@ the resulting `Prepared`.
-  fun select : selection -> selection
   #@ Internal plumbing for nested subqueries: read the current table-alias counter.
   #@ The subquery builders continue alias numbering into the nested scope from here
   #@ (paired with `commit_aliases`) so a correlated subquery nested inside another
@@ -421,23 +418,30 @@ handler collect_query for QueryBuild {
     })
   }
 
-  select selection = {
-    QueryStep (fun state -> {
-      let QueryStep run_rest = resume selection
-      run_rest state
-    })
-  }
   return value = QueryStep (fun state -> (value, state))
 }
 
+#@ The result shape of a query builder: the value passed to `select` wrapped so a
+#@ builder closure's *return* is required to be a projection. `Select` is opaque, so
+#@ `select` is the only way to produce one — a query body therefore cannot forget to
+#@ select, return a bare record, or have an early selection silently shadowed.
+pub opaque type Select a = Select a
+
+#@ Name a query's result shape. The `!` verbs (`from!`, `where_!`, …) build the
+#@ query; `select` names what comes back, and its value's type determines the row
+#@ type `all`/`one` decode. It is the closing expression of a `query` /
+#@ `from_subquery` / `cte` / full-join body — pure, not an effect.
+pub fun select : a -> Select a
+select value = Select value
+
 #@ Build a `Prepared` query from a builder closure. The closure performs
-#@ `QueryBuild` operations (`from!`, `inner_join!`, `select!`, …); the type of the
-#@ value passed to `select!` determines the row type that `all`/`one` will decode.
-pub fun query : (Unit -> selection needs {QueryBuild}) -> Prepared row
+#@ `QueryBuild` operations (`from!`, `inner_join!`, …) and *returns* a `select (…)`;
+#@ the type selected determines the row type that `all`/`one` will decode.
+pub fun query : (Unit -> Select selection needs {QueryBuild}) -> Prepared row
   where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 query make = {
   let QueryStep run_query = make () with collect_query
-  let (selection, state) = run_query empty_state
+  let (Select selection, state) = run_query empty_state
   let projection: Projection row = Core.select selection
   prepare projection state
 }
@@ -452,16 +456,16 @@ query make = {
 #@ This is sound by construction: the body never gets a non-null binder for these
 #@ tables, so there's no way to bind one non-null and have the full join silently
 #@ NULL it. The body is the ordinary `QueryBuild` DSL (add `where_!`, `order_by!`,
-#@ etc., then `select!`); `from!` would panic (the FROM is already set). Reference a
+#@ etc., then `select`); `from!` would panic (the FROM is already set). Reference a
 #@ scope's columns in further predicates via `Db.unwrap_cols`.
 #@
 #@     full_join_query employees departments
 #@       (fun e d -> Db.eq_col e.dept_id d.id)
-#@       (fun emp dept -> { select! ({ employee: emp, department: dept }) })
+#@       (fun emp dept -> { select ({ employee: emp, department: dept }) })
 pub fun full_join_query : Table colsA
   -> Table colsB
   -> (colsA -> colsB -> Expr)
-  -> ((Nullable colsA, Nullable colsB) -> selection needs {QueryBuild})
+  -> ((Nullable colsA, Nullable colsB) -> Select selection needs {QueryBuild})
   -> Prepared row
   where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 full_join_query table_a table_b on_fn body = {
@@ -474,27 +478,27 @@ full_join_query table_a table_b on_fn body = {
   let state4 = { state3 | joins: List.append state3.joins [join] }
   let scopes = (Core.as_nullable cols_a, Core.as_nullable cols_b)
   let QueryStep run = (body scopes) with collect_query
-  let (selection, state) = run state4
+  let (Select selection, state) = run state4
   let projection: Projection row = Core.select selection
   prepare projection state
 }
 
 #@ Use a subquery as a derived table in `FROM`. The builder closure is the same
-#@ `from!`/`where_!`/`select!` DSL under a nested handler; each `select!` label
+#@ `from!`/`where_!`/`select` DSL under a nested handler; each `select` label
 #@ becomes a column of the derived table, returned as a scope you dot into in the
 #@ outer query:
 #@
 #@     let t = from_subquery (fun () -> {
 #@       let p = from! posts
 #@       group_by! [Db.group p.author_id]
-#@       select! ({ author_id: p.author_id, posts: Db.count_star })
+#@       select ({ author_id: p.author_id, posts: Db.count_star })
 #@     })
 #@     where_! (Db.gt t.posts 5)
-#@     select! ({ author: t.author_id, posts: t.posts })
+#@     select ({ author: t.author_id, posts: t.posts })
 #@
 #@ The subquery's params are numbered in sequence by the outer query, and its own
 #@ tables get an `s`-prefixed alias so they never clash with the outer `t`-aliases.
-pub fun from_subquery : (Unit -> selection needs {QueryBuild}) -> scope
+pub fun from_subquery : (Unit -> Select selection needs {QueryBuild}) -> scope
   needs {QueryBuild}
   where {
     selection: Generic sel_rep,
@@ -502,7 +506,7 @@ pub fun from_subquery : (Unit -> selection needs {QueryBuild}) -> scope
     scope: Generic scope_rep,
   }
 from_subquery make = {
-  let (selection, sub_state) = run_subquery make
+  let (Select selection, sub_state) = run_subquery make
   let frag = select_frag (selection_items selection) sub_state
   bind_derived! (DerivedTable {
     frag: frag,
@@ -511,7 +515,7 @@ from_subquery make = {
 }
 
 #@ Define a named CTE and get back a `Table` handle for it. The builder closure is
-#@ the same `from!`/`select!` DSL as `from_subquery`; each `select!` label becomes a
+#@ the same `from!`/`select` DSL as `from_subquery`; each `select` label becomes a
 #@ column of the CTE. Unlike `from_subquery`, the body is hoisted into a leading
 #@ `WITH <name> AS (…)` and the handle is referenced by name — so it can be used in
 #@ several places (e.g. `from!` it and also `inner_join!` it):
@@ -519,16 +523,16 @@ from_subquery make = {
 #@     let counts = cte "post_counts" (fun () -> {
 #@       let p = from! posts
 #@       group_by! [Db.group p.author_id]
-#@       select! ({ author_id: p.author_id, posts: Db.count_star })
+#@       select ({ author_id: p.author_id, posts: Db.count_star })
 #@     })
 #@     let c = from! counts
 #@     where_! (Db.gt c.posts 5)
-#@     select! ({ author: c.author_id, posts: c.posts })
+#@     select ({ author: c.author_id, posts: c.posts })
 #@
 #@ Renders `WITH post_counts AS (…) SELECT … FROM post_counts AS t0 WHERE …`. The
 #@ CTE's params are numbered in sequence (the `WITH` is rendered first), and its own
 #@ tables get an `s`-prefixed alias so they never clash with the outer `t`-aliases.
-pub fun cte : String -> (Unit -> selection needs {QueryBuild}) -> Table scope
+pub fun cte : String -> (Unit -> Select selection needs {QueryBuild}) -> Table scope
   needs {QueryBuild}
   where {
     selection: Generic sel_rep,
@@ -536,7 +540,7 @@ pub fun cte : String -> (Unit -> selection needs {QueryBuild}) -> Table scope
     scope: Generic scope_rep,
   }
 cte name make = {
-  let (selection, sub_state) = run_subquery make
+  let (Select selection, sub_state) = run_subquery make
   let frag = select_frag (selection_items selection) sub_state
   define_cte! (DerivedCte {
     name: name,
@@ -896,7 +900,7 @@ pub fun not_exists : (Unit -> a needs {QueryBuild}) -> Expr needs {QueryBuild}
 not_exists make = wrap_subquery "NOT EXISTS (" (build_subquery make)
 
 # Render a single-column subquery (`SELECT <col> FROM …`) as a deferred fragment.
-# The selected column is the value the builder closure returns, so no `select!` /
+# The selected column is the value the builder closure returns, so no `select` /
 # row machinery is involved.
 fun scalar_select_frag : SqlFrag -> QueryState -> SqlFrag
 scalar_select_frag col_frag state = case state.from_source {
@@ -927,7 +931,7 @@ membership keyword input make = {
 }
 
 #@ `<input> IN (subquery)`. The subquery closure ends by *returning* the single
-#@ column to select (not via `select!`); its element type must match `input`'s:
+#@ column to select (not via `select`); its element type must match `input`'s:
 #@
 #@     where_! (Query.in_subquery u.id (fun () -> {
 #@       let p = from! posts
@@ -946,7 +950,7 @@ pub fun not_in_subquery : input -> (Unit -> col needs {QueryBuild}) -> Expr
 not_in_subquery input make = membership " NOT IN (" input make
 
 # Build the `(SELECT <col> FROM …)` fragment shared by the scalar-subquery
-# variants. The closure *returns* the single column (no `select!`); its element
+# variants. The closure *returns* the single column (no `select`); its element
 # type `a` flows out to whichever wrapper decodes the fragment.
 fun scalar_subquery_frag : (Unit -> col needs {QueryBuild}) -> SqlFrag
   needs {QueryBuild}
@@ -962,7 +966,7 @@ scalar_subquery_frag make = {
 #@ A scalar subquery used as a value: `(SELECT <col> FROM …)` wrapped as a `Sql a`,
 #@ so it's selectable and usable in comparisons (`Db.gt_sql u.age (scalar_subquery
 #@ …)`, `Db.eq_sql …`). The closure *returns* the single column (like `in_subquery`,
-#@ no `select!`).
+#@ no `select`).
 #@
 #@ This variant types the result as non-null `Sql a`, so it is sound only when the
 #@ subquery is *guaranteed* to return exactly one row with a non-null value — an
@@ -980,7 +984,7 @@ scalar_subquery make = Core.sql_from_frag (scalar_subquery_frag make)
 #@ instead of failing). This is the safe default; reach for `scalar_subquery` only
 #@ when the subquery provably yields one non-null row.
 #@
-#@     select! ({
+#@     select ({
 #@       id: u.id,
 #@       a_title: Query.scalar_subquery_maybe (fun () -> {
 #@         let p = from! posts
@@ -1296,7 +1300,7 @@ impl Preloadable pcols ccols (Maybe child) for (RelationOne pcols ccols child k)
   }
 }
 
-#@ Pull a relation into the current query as a `select!` field. The relation's declared
+#@ Pull a relation into the current query as a `select` field. The relation's declared
 #@ kind picks the result shape — `has_many` → `List child`, `belongs_to`/`has_one` →
 #@ `Maybe child` — so there's nothing to choose at the call site. The parent-key column
 #@ is added to the SELECT automatically, and the children are batch-loaded by
@@ -1304,11 +1308,11 @@ impl Preloadable pcols ccols (Maybe child) for (RelationOne pcols ccols child k)
 #@
 #@     let u = from! users
 #@     let posts = preload authored_posts u      -- Preloaded (List Post)
-#@     select! ({ user: u, posts: posts })
+#@     select ({ user: u, posts: posts })
 #@
 #@     let p = from! posts
 #@     let author = preload post_author p        -- Preloaded (Maybe User)
-#@     select! ({ post: p, author: author })
+#@     select ({ post: p, author: author })
 pub fun preload : rel -> pcols -> Preloaded out
   needs {QueryBuild}
   where {rel: Preloadable pcols ccols out}
@@ -1319,7 +1323,7 @@ preload relation parent = run_preload relation parent Nothing
 #@ are loaded and stitched; parents with none get `[]` (or `Nothing` for a to-one).
 #@
 #@     let posts = preload_where authored_posts u (fun p -> Db.eq p.published True)
-#@     select! ({ user: u, posts: posts })       -- each user's *published* posts
+#@     select ({ user: u, posts: posts })       -- each user's *published* posts
 pub fun preload_where : rel -> pcols -> (ccols -> Expr) -> Preloaded out
   needs {QueryBuild}
   where {rel: Preloadable pcols ccols out}
