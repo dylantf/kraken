@@ -192,7 +192,75 @@ Query.all conn (users_with_posts_query ())     -- List { user: User, posts: List
 
 ### Follow-ups
 
-- `belongs_to` / 1:1 (`Preloaded (Maybe child)` taking the first match).
 - Key dedup before the `IN` (parent PKs are unique, so harmless today).
+
+### Done since: filterable preload (`preload_where`) (2026-06-23)
+
+Scope the loaded children with a predicate over the child's columns, `AND`-ed into the
+generated child `WHERE`. `preload` is unchanged (all children); `preload_where rel
+parent (fun c -> …)` adds the predicate. To express a `(ccols -> Expr)` against the
+relation's child columns, the relation type now carries `ccols`:
+`Relation pcols ccols child k` / `RelationOne pcols ccols child k`. `load_children` takes
+a `Maybe (ccols -> Expr)`; the engine threads one `Maybe` and `preload`/`preload_where`
+pass `Nothing`/`Just`. Verified offline: child SQL becomes
+`… WHERE (t0.org_id IN ($1)) AND t0.active = $2` (params numbered correctly), and `preload`
+still renders the bare `IN`. Demo `users_with_published_posts_only_query` in
+`src/Read.saga`, wired into Main. (Filters *children*; filtering *parents* by a child
+condition remains `Query.exists` / `inner_join!`.)
+
+### Done since: `belongs_to` / `has_one` (to-one relations) (2026-06-23)
+
+`Preloaded` is now parameterized by its **output** (`Preloaded out`, instance
+`Selectable out for Preloaded out`) instead of `Preloaded child`. The loading engine is
+shared (`relation_def` builds the join; `register_relation` registers + decodes), and
+cardinality is a thin wrapper:
+
+- `has_many … -> Relation` consumed by `preload` → `Preloaded (List child)`.
+- `belongs_to` / `has_one … -> RelationOne` consumed by `preload_one` →
+  `Preloaded (Maybe child)` (first match). `RelationOne` is a *distinct* type so
+  `preload_one` can't be aimed at a to-many relation (which would silently drop all but
+  the first child), and `preload` can't be aimed at a to-one.
+
+Mechanically all three are the same match-parent-column-to-child-column + batch + group;
+`belongs_to` just has the FK on the parent side (`posts.author_id → users.id`).
+`register_relation` takes a `finish : List child -> out` (`identity` for many,
+`first_or_none` for one). Demo `post_author` / `posts_with_author_query` in
+`src/Read.saga`, wired into Main. Verified offline: parent injects the FK
+(`… t0.org_id AS org …`), child keys on the target (`… WHERE t0.id IN ($1,$2,$3)`),
+result resolves to `Maybe` correctly.
+
+**One `preload`, cardinality from the relation (2026-06-23).** The first cut exposed
+`preload` (many) + `preload_one` (one), making the caller restate what the relation
+already knows. Replaced by a single `preload` over a `Preloadable rel pcols child k out
+| rel -> pcols child k out` trait: `Relation → Preloaded (List child)`,
+`RelationOne → Preloaded (Maybe child)`. The user writes `preload authored_posts u` or
+`preload post_author p` and the result shape follows the relation's declared kind; you
+can't mismatch. `Preloaded` is parameterized by `out` with one instance
+`Selectable out for Preloaded out`. Trait `Preloadable rel pcols out | rel -> pcols out`;
+the `impl`s carry `where {k: Eq} needs {QueryBuild}` and call `register_relation`
+directly (shaping with `identity` for to-many, `first_or_none` for to-one); `preload` is
+a thin wrapper over the trait method.
+
+Compiler-bug detour (now fixed): the first cut put `where {k: Eq}` on the trait impls
+and crashed at runtime with `{badfun, {#Fun…}}`. Root-caused via `_build/dev/*.core` —
+the dispatch site emitted `apply (__dict_…Relation())( {} )`, applying the instance-dict
+tuple to the constraint's dictionary because the dict was compiled as a `/0` value. I'd
+first mis-blamed effects; the real trigger was a `where` clause on a trait *impl*
+(minimal repro, pure, ~15 lines: `impl Doer (List k) for (Box k) where {k: Eq}` +
+dispatch). A `where`-less intermediate design shipped briefly; once the compiler fix
+landed the impls went back to carrying `where {k: Eq}` directly (simpler — 3-param trait,
+no tuple-returning method).
 - The `__rel<i>` injected-key alias is relabeled to the field name by the `Labeled`
   instance; offsets are positional so it's cosmetic, but worth a note.
+
+### Done since: `one` / `exactly_one` no longer over-load relations (2026-06-23)
+
+`one`/`exactly_one` used to call `all`, which loads children for *every* matched
+parent, then discard all but one row — firing the child `IN (…)` over the whole
+result set to keep a single parent. Fixed: execution now goes through `decode_returned
+conn prepared rows`, and `one`/`exactly_one` pass only the row they keep, so children
+load for that one parent (`IN ($1)`, verified) and the discarded rows aren't decoded
+at all. `exactly_one` checks the raw row count *before* decoding, so a wrong count
+never loads relations. The parent query itself still runs unbounded — `one` documents
+`limit! 1` for when you want the database to stop at one row too (can't be injected
+safely: the SQL is already rendered and may carry its own `LIMIT`/`OFFSET`).

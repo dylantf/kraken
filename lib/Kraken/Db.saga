@@ -543,26 +543,27 @@ record ProjectionDef a {
 opaque type Projection a = Projection (ProjectionDef a)
 
 #@ A relation field in a `select!`: it occupies one selected column (its parent
-#@ key) but decodes to the `List child` loaded by a separate query. Built by the
-#@ query layer's `preload`; selecting it contributes the parent-key column to the
-#@ SELECT and a deferred decode that resolves children from the executor-supplied
-#@ `RelData`. See `make_preloaded` and the `Selectable (List child)` instance.
-opaque type Preloaded child = Preloaded (PreloadedDef child)
+#@ key) but decodes to `out` — the children loaded by a separate query, shaped by
+#@ how the relation is consumed (`List child` for a to-many `preload`, `Maybe child`
+#@ for a to-one `preload_one`). Built by the query layer; selecting it contributes
+#@ the parent-key column to the SELECT and a deferred decode that resolves children
+#@ from the executor-supplied `RelData`. See `make_preloaded` and `Selectable out`.
+opaque type Preloaded out = Preloaded (PreloadedDef out)
 
-record PreloadedDef child {
+record PreloadedDef out {
   # The parent-key column injected into the SELECT (so it's available to group on).
   key_item: SelectItem,
   # Decode this slot: in pass one emit a `RelSlot` (index + key-column offset); once
-  # `RelData` is populated, read the parent key at `offset` and resolve the children.
-  resolve: RelData -> Int -> Dynamic -> Result (List child, List RelSlot) DecodeError,
+  # `RelData` is populated, read the parent key at `offset` and resolve to `out`.
+  resolve: RelData -> Int -> Dynamic -> Result (out, List RelSlot) DecodeError,
 }
 
-#@ Build a `Preloaded` field from its injected parent-key column and a resolver.
-#@ The query layer's `preload` supplies both (the resolver closes over the child
-#@ types, so `Preloaded` itself stays parameterized only by `child`).
+#@ Build a `Preloaded` field from its injected parent-key column and a resolver. The
+#@ query layer supplies both; the resolver closes over the child types and the
+#@ to-many/to-one shaping, so `Preloaded` is parameterized only by the output `out`.
 pub fun make_preloaded : SelectItem
-  -> (RelData -> Int -> Dynamic -> Result (List child, List RelSlot) DecodeError)
-  -> Preloaded child
+  -> (RelData -> Int -> Dynamic -> Result (out, List RelSlot) DecodeError)
+  -> Preloaded out
 make_preloaded key_item resolve = Preloaded (PreloadedDef {
   key_item: key_item,
   resolve: resolve,
@@ -1404,10 +1405,11 @@ impl Selectable a for Sql a {
 }
 
 # A preloaded relation contributes exactly one selected column (its parent key,
-# width 1) and decodes to the `List child` resolved from the executor-loaded
-# `RelData`. The functional dep `Preloaded child -> List child` is what lets a
-# `select!` field of `Preloaded Post` infer a row field of `List Post`.
-impl Selectable (List child) for Preloaded child {
+# width 1) and decodes to `out` (its resolver's shape) from the executor-loaded
+# `RelData`. The functional dep `Preloaded out -> out` is what lets a `select!` field
+# of `Preloaded (List Post)` infer `List Post`, or `Preloaded (Maybe Post)` infer
+# `Maybe Post`.
+impl Selectable out for Preloaded out {
   to_projection preloaded = case preloaded {
     Preloaded def -> make_projection [def.key_item] 1 def.resolve
   }

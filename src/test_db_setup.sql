@@ -13,12 +13,13 @@ CREATE TABLE posts (
   author_id INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
   title TEXT NOT NULL,
   published BOOLEAN NOT NULL,
-  tags TEXT[] NOT NULL,
+  tags TEXT [] NOT NULL,
   metadata JSONB NOT NULL
 );
 
 CREATE INDEX posts_author_id_idx ON posts (author_id);
 
+--------------------------------------------------------
 INSERT INTO
   users (name, age)
 VALUES

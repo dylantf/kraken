@@ -1015,66 +1015,95 @@ pub fun all : Connection -> Prepared a -> Result (List a) DbError needs {Repo}
 all conn prepared = if prepared.noop then Ok []
   else case execute! conn prepared {
     Err err -> Err (QueryFailed err)
-    Ok returned -> case prepared.relations {
-      [] -> decode_rows prepared.decode Core.empty_rel_data returned.rows
-      _ -> case returned.rows {
-        # No rows → no parents → nothing to load; the relation slots resolve to [].
-        [] -> Ok []
-        # Pass 1: decode one row (with empty data) to locate each relation's key
-        # column. Offsets are structural — identical across rows — so one row suffices.
-        first :: _ -> case prepared.decode Core.empty_rel_data first {
-          Err err -> Err (DecodeFailed err)
-          Ok (_value, slots) -> case load_rel_entries conn prepared.relations returned.rows slots {
-            Err err -> Err err
-            Ok entries -> decode_rows prepared.decode (Core.rel_data_of entries) returned.rows
-          }
-        }
+    Ok returned -> decode_returned conn prepared returned.rows
+  }
+
+# Decode the given raw rows, batch-loading + stitching any relations for *just those
+# rows*. `all` passes the whole result; `one` / `exactly_one` pass only the row they
+# keep, so a relation query through them loads children for that one parent — not the
+# whole result set — and the discarded rows are never decoded.
+fun decode_returned : Connection -> Prepared a -> List Dynamic -> Result (List a) DbError
+  needs {Repo}
+decode_returned conn prepared rows = case prepared.relations {
+  [] -> decode_rows prepared.decode Core.empty_rel_data rows
+  _ -> case rows {
+    # No rows → no parents → nothing to load; the relation slots resolve to [].
+    [] -> Ok []
+    # Pass 1: decode one row (with empty data) to locate each relation's key column.
+    # Offsets are structural — identical across rows — so one row suffices.
+    first :: _ -> case prepared.decode Core.empty_rel_data first {
+      Err err -> Err (DecodeFailed err)
+      Ok (_value, slots) -> case load_rel_entries conn prepared.relations rows slots {
+        Err err -> Err err
+        Ok entries -> decode_rows prepared.decode (Core.rel_data_of entries) rows
+      }
+    }
+  }
+}
+
+#@ Execute a prepared query and decode the first row, if any. Returns `Ok Nothing`
+#@ when the result set is empty. For a query with `preload`ed relations, children are
+#@ loaded only for the returned row, not for every row the query matched. (The query
+#@ itself still runs unbounded — add `limit! 1` if you want the database to stop at
+#@ one row too.)
+pub fun one : Connection -> Prepared a -> Result (Maybe a) DbError needs {Repo}
+one conn prepared = if prepared.noop then Ok Nothing
+  else case execute! conn prepared {
+    Err err -> Err (QueryFailed err)
+    Ok returned -> case returned.rows {
+      [] -> Ok Nothing
+      first :: _ -> case decode_returned conn prepared [first] {
+        Err err -> Err err
+        Ok (row :: _) -> Ok (Just row)
+        Ok [] -> Ok Nothing
       }
     }
   }
 
-#@ Execute a prepared query and decode the first row, if any. Returns `Ok Nothing`
-#@ when the result set is empty.
-pub fun one : Connection -> Prepared a -> Result (Maybe a) DbError needs {Repo}
-one conn prepared = case all conn prepared {
-  Ok rows -> case rows {
-    [] -> Ok Nothing
-    row :: _ -> Ok (Just row)
-  }
-  Err err -> Err err
-}
-
 #@ Execute a prepared query expecting *exactly one* row. Unlike `one` (which yields
 #@ `Maybe`), this fails with `ExpectedOneRow n` when the result set is empty or has
 #@ more than one row — for queries where any other count is a real error (a lookup
-#@ by primary key, an aggregate, a `RETURNING` from a single-row write).
+#@ by primary key, an aggregate, a `RETURNING` from a single-row write). The row count
+#@ is checked before decoding, so a wrong count never loads relations or decodes rows.
 pub fun exactly_one : Connection -> Prepared a -> Result a DbError needs {Repo}
-exactly_one conn prepared = case all conn prepared {
-  Ok rows -> case rows {
-    [row] -> Ok row
-    _ -> Err (ExpectedOneRow (List.length rows))
+exactly_one conn prepared = if prepared.noop then Err (ExpectedOneRow 0)
+  else case execute! conn prepared {
+    Err err -> Err (QueryFailed err)
+    Ok returned -> case returned.rows {
+      [row] -> case decode_returned conn prepared [row] {
+        Err err -> Err err
+        Ok (value :: _) -> Ok value
+        Ok [] -> Err (ExpectedOneRow 0)
+      }
+      other -> Err (ExpectedOneRow (List.length other))
+    }
   }
-  Err err -> Err err
-}
 
 # --- Relation loading (declared in the query, loaded as a separate query each) ---
 
-#@ A has-many relation: a parent column joined to a child column. Define one near
-#@ the schema, then pull it into a query with `preload`. Both arguments are *column*
-#@ accessors (over the parent's and child's column records), so the foreign key is
-#@ named exactly once and the batched child query (`WHERE child_fk IN (keys)`) is
-#@ generated for you — no separate decode-side key extractor to keep in sync.
+#@ A to-many relation: a parent column matched to a child column. Build with
+#@ `has_many`, consume with `preload` → `List child` (or `preload_where` to scope the
+#@ loaded children). Both accessors are *column* accessors (over the parent's and
+#@ child's column records `pcols` / `ccols`), so the foreign key is named exactly once
+#@ and the batched child query (`WHERE child_key IN (keys)`) is generated for you.
 #@
 #@     authored_posts = Query.has_many posts (fun u -> u.id) (fun p -> p.author_id)
-opaque type Relation pcols child k = Relation (RelationDef pcols child k)
+opaque type Relation pcols ccols child k = Relation (RelationDef pcols ccols child k)
 
-record RelationDef pcols child k {
+#@ A to-one relation: the same join as `Relation`, built with `belongs_to` (the FK is
+#@ on the parent) or `has_one` (the FK is on the child, ≤1 per parent), and consumed
+#@ with `preload` → `Maybe child`. A distinct type so the to-one result shape follows
+#@ the relation automatically (and a to-many can't be mis-consumed as one).
+opaque type RelationOne pcols ccols child k = RelationOne (RelationDef pcols ccols child k)
+
+record RelationDef pcols ccols child k {
   # The parent's key column as a `Sql k` (injected into the parent SELECT and read
   # back to group); coerced from the accessor so `Col`/`Generated` keys both work.
   parent_key: pcols -> Core.Sql k,
   # Run the batched child query for these parent keys and group the rows by their
-  # foreign key into `Dict parent_key (List child)`.
-  load_children: Connection -> List k -> Result (Dict k (List child)) DbError needs {Repo},
+  # foreign key into `Dict parent_key (List child)`. The `Maybe (ccols -> Expr)` is an
+  # optional predicate `AND`-ed into the child `WHERE` to scope which children load.
+  load_children: Connection -> List k -> Maybe (ccols -> Expr) -> Result (Dict k (List child)) DbError needs {Repo},
 }
 
 # Group `(fk, child)` pairs by FK, preserving each child's order within its group
@@ -1092,15 +1121,14 @@ group_pairs pairs =
     Dicts.put fk (child :: existing) dict
   }) (Dicts.new ()) pairs
 
-#@ Define a has-many relation from a child table, a parent-key column, and the
-#@ child's foreign-key column. The generated child query selects each child paired
-#@ with its FK (`SELECT child_fk, <child cols> FROM child WHERE child_fk IN (keys)`)
-#@ and groups the result; nested relations on the child are loaded too, since the
-#@ child query runs through the ordinary `all`.
-pub fun has_many : Table ccols
+# The shared relation engine: match a parent column to a child column and generate
+# the batched child query that selects each child paired with its matching key and
+# groups by it. `has_many` / `belongs_to` / `has_one` all build this; they differ only
+# in the wrapper type (and so in how the result is consumed).
+fun relation_def : Table ccols
   -> (pcols -> pk)
   -> (ccols -> ck)
-  -> Relation pcols child k
+  -> RelationDef pcols ccols child k
   where {
     k: Core.PgType + Eq,
     pk: ToSql k,
@@ -1109,80 +1137,193 @@ pub fun has_many : Table ccols
     ccols_rep: Selectable child_rep,
     child: Generic child_rep,
   }
-has_many child_table parent_key child_fk = Relation (RelationDef {
+relation_def child_table parent_key child_key = RelationDef {
   parent_key: fun pc -> Core.as_sql (parent_key pc),
-  load_children: fun conn keys -> {
-    # Build the child query selecting (foreign key, child row): the row is a generic
+  load_children: fun conn keys filter -> {
+    # Build the child query selecting (matching key, child row): the row is a generic
     # select over `cols` alone (a single type variable, so its `Generic`/`Selectable`
-    # constraints can be surfaced on this signature), paired manually with the FK
+    # constraints can be surfaced on this signature), paired manually with the key
     # column's projection. Selecting a `(Col k, cols)` value directly is impossible —
-    # a `fun` can't carry a `Generic` constraint over an applied/anonymous type.
+    # a `fun` can't carry a `Generic` constraint over an applied/anonymous type. An
+    # optional `filter` predicate is `AND`-ed into the `WHERE` to scope the children.
     let QueryStep run = (fun () -> {
       let cols = from! child_table
-      where_! (Core.in_ (child_fk cols) keys)
+      let key_pred = Core.in_ (child_key cols) keys
+      where_! (case filter {
+        Nothing -> key_pred
+        Just predicate -> and_ [key_pred, predicate cols]
+      })
       cols
     }) () with collect_query
     let (cols, state) = run empty_state
-    let pair_projection = Core.project_pair (Core.col_projection (Core.as_sql (child_fk cols))) (Core.select cols)
+    let pair_projection = Core.project_pair (Core.col_projection (Core.as_sql (child_key cols))) (Core.select cols)
     case all conn (prepare pair_projection state) {
       Err err -> Err err
       Ok pairs -> Ok (group_pairs pairs)
     }
   },
-})
+}
 
-#@ Pull a `has_many` relation into the current query as a `select!` field. Returns a
-#@ `Preloaded child`; drop it into the selection (`select! ({ user: u, posts: posts })`)
-#@ and the row field infers to `List child`. The parent-key column is added to the
-#@ SELECT automatically, and the children are batch-loaded by `all`/`one` after the
-#@ main query — one extra query per relation, not N+1.
+#@ Define a has-many relation: a parent-key column matched to the child's foreign-key
+#@ column. The generated child query selects each child paired with its FK
+#@ (`SELECT child_fk, <child cols> FROM child WHERE child_fk IN (keys)`) and groups the
+#@ result; nested relations on the child load too, since the child query runs through
+#@ the ordinary `all`. Consume with `preload` → `List child`.
+pub fun has_many : Table ccols
+  -> (pcols -> pk)
+  -> (ccols -> ck)
+  -> Relation pcols ccols child k
+  where {
+    k: Core.PgType + Eq,
+    pk: ToSql k,
+    ck: ToSql k,
+    ccols: Generic ccols_rep,
+    ccols_rep: Selectable child_rep,
+    child: Generic child_rep,
+  }
+has_many child_table parent_key child_fk = Relation (relation_def child_table parent_key child_fk)
+
+#@ Define a belongs-to relation: the parent holds the foreign key pointing at the
+#@ child's key (e.g. a post's `author_id` → a user's `id`). Consume with `preload`
+#@ → `Maybe child`.
 #@
-#@     let u = from! users
-#@     let posts = preload authored_posts u
-#@     select! ({ user: u, posts: posts })
-pub fun preload : Relation pcols child k -> pcols -> Preloaded child
+#@     post_author = Query.belongs_to users (fun p -> p.author_id) (fun u -> u.id)
+pub fun belongs_to : Table ccols
+  -> (pcols -> pk)
+  -> (ccols -> ck)
+  -> RelationOne pcols ccols child k
+  where {
+    k: Core.PgType + Eq,
+    pk: ToSql k,
+    ck: ToSql k,
+    ccols: Generic ccols_rep,
+    ccols_rep: Selectable child_rep,
+    child: Generic child_rep,
+  }
+belongs_to child_table parent_key child_key = RelationOne (relation_def child_table parent_key child_key)
+
+#@ Define a has-one relation: like `has_many` (the child holds the foreign key) but at
+#@ most one child per parent. Consume with `preload` → `Maybe child`.
+pub fun has_one : Table ccols
+  -> (pcols -> pk)
+  -> (ccols -> ck)
+  -> RelationOne pcols ccols child k
+  where {
+    k: Core.PgType + Eq,
+    pk: ToSql k,
+    ck: ToSql k,
+    ccols: Generic ccols_rep,
+    ccols_rep: Selectable child_rep,
+    child: Generic child_rep,
+  }
+has_one child_table parent_key child_fk = RelationOne (relation_def child_table parent_key child_fk)
+
+# The shared preload engine: register the relation's load spec and build a `Preloaded`
+# whose decode resolves the grouped children through `finish` — `identity` for a
+# to-many `preload` (→ `List child`), `first_or_none` for a to-one (→ `Maybe child`).
+# `filter` is the optional child-scoping predicate threaded into the child query.
+fun register_relation : RelationDef pcols ccols child k
+  -> pcols
+  -> (List child -> out)
+  -> Maybe (ccols -> Expr)
+  -> Preloaded out
   needs {QueryBuild}
-  where {k: Core.PgType + Eq}
-preload relation pcols = case relation {
-  Relation def -> {
-    let index = relation_count! ()
-    let alias = "__rel" <> show index
-    let key_col = def.parent_key pcols
-    let key_item = Core.col_select_item alias key_col
-    let read_key = Core.col_decoder key_col
-    push_relation! (RelSpec {
-      index: index,
-      # Read the parent keys *typed* from the raw rows (the normal column decoder, not
-      # an unsafe cast), run the typed child loader, and erase only the grouped `Dict`.
-      load: fun conn rows offset -> case extract_keys read_key offset rows {
+  where {k: Eq}
+register_relation def pcols finish filter = {
+  let index = relation_count! ()
+  let alias = "__rel" <> show index
+  let key_col = def.parent_key pcols
+  let key_item = Core.col_select_item alias key_col
+  let read_key = Core.col_decoder key_col
+  push_relation! (RelSpec {
+    index: index,
+    # Read the parent keys *typed* from the raw rows (the normal column decoder, not
+    # an unsafe cast), run the typed child loader, and erase only the grouped `Dict`.
+    load: fun conn rows offset -> case extract_keys read_key offset rows {
+      Err err -> Err err
+      Ok keys -> case def.load_children conn keys filter {
         Err err -> Err err
-        Ok keys -> case def.load_children conn keys {
-          Err err -> Err err
-          Ok grouped -> Ok (erase grouped)
-        }
-      },
-    })
-    # Pass 1 (empty data): just locate this slot — its index and key-column offset.
-    # Pass 2 (data populated): read the parent key typed, un-erase this relation's
-    # grouped map, and look up the children. `unerase` here is the inverse of the
-    # `erase` above — same `Dict parent_key (List child)`, both built in this closure.
-    Core.make_preloaded key_item (fun data offset row ->
-      case Core.rel_data_get index data {
-        Nothing -> Ok ([], [Core.RelSlot index offset])
-        Just grouped_dyn -> case read_key offset row {
-          Err err -> Err err
-          Ok key -> {
-            let grouped = unerase grouped_dyn
-            let kids = case Dicts.get key grouped {
-              Just xs -> xs
-              Nothing -> []
-            }
-            Ok (kids, [Core.RelSlot index offset])
+        Ok grouped -> Ok (erase grouped)
+      }
+    },
+  })
+  # Pass 1 (empty data): just locate this slot — its index and key-column offset.
+  # Pass 2 (data populated): read the parent key typed, un-erase this relation's
+  # grouped map, look up the children, and shape them with `finish`. `unerase` here is
+  # the inverse of the `erase` above — same `Dict parent_key (List child)`.
+  Core.make_preloaded key_item (fun data offset row ->
+    case Core.rel_data_get index data {
+      Nothing -> Ok (finish [], [Core.RelSlot index offset])
+      Just grouped_dyn -> case read_key offset row {
+        Err err -> Err err
+        Ok key -> {
+          let grouped = unerase grouped_dyn
+          let kids = case Dicts.get key grouped {
+            Just xs -> xs
+            Nothing -> []
           }
+          Ok (finish kids, [Core.RelSlot index offset])
         }
-      })
+      }
+    })
+}
+
+fun first_or_none : List a -> Maybe a
+first_or_none items = case items {
+  [] -> Nothing
+  item :: _ -> Just item
+}
+
+# Relations carry their own cardinality, so a single `preload` does the right thing:
+# the relation *type* (`Relation` vs `RelationOne`) determines the output shape via the
+# `rel -> …` functional dependency. The user never picks a to-many vs to-one variant —
+# `has_many` → `List child`, `belongs_to` / `has_one` → `Maybe child`. The instance
+# does the registration directly, shaping the grouped children with `identity` (to-many)
+# or `first_or_none` (to-one).
+pub trait Preloadable rel pcols ccols out | rel -> pcols ccols out {
+  fun run_preload : rel -> pcols -> Maybe (ccols -> Expr) -> Preloaded out needs {QueryBuild}
+}
+
+impl Preloadable pcols ccols (List child) for (Relation pcols ccols child k) where {k: Eq} needs {QueryBuild} {
+  run_preload relation parent filter = case relation {
+    Relation def -> register_relation def parent (fun kids -> kids) filter
   }
 }
+
+impl Preloadable pcols ccols (Maybe child) for (RelationOne pcols ccols child k) where {k: Eq} needs {QueryBuild} {
+  run_preload relation parent filter = case relation {
+    RelationOne def -> register_relation def parent first_or_none filter
+  }
+}
+
+#@ Pull a relation into the current query as a `select!` field. The relation's declared
+#@ kind picks the result shape — `has_many` → `List child`, `belongs_to`/`has_one` →
+#@ `Maybe child` — so there's nothing to choose at the call site. The parent-key column
+#@ is added to the SELECT automatically, and the children are batch-loaded by
+#@ `all`/`one` after the main query — one extra query per relation, not N+1.
+#@
+#@     let u = from! users
+#@     let posts = preload authored_posts u      -- Preloaded (List Post)
+#@     select! ({ user: u, posts: posts })
+#@
+#@     let p = from! posts
+#@     let author = preload post_author p        -- Preloaded (Maybe User)
+#@     select! ({ post: p, author: author })
+pub fun preload : rel -> pcols -> Preloaded out
+  needs {QueryBuild}
+  where {rel: Preloadable pcols ccols out}
+preload relation parent = run_preload relation parent Nothing
+
+#@ Like `preload`, but scopes the loaded children with a predicate over the child's
+#@ columns — `AND`-ed into the generated child query's `WHERE`. Only matching children
+#@ are loaded and stitched; parents with none get `[]` (or `Nothing` for a to-one).
+#@
+#@     let posts = preload_where authored_posts u (fun p -> Db.eq p.published True)
+#@     select! ({ user: u, posts: posts })       -- each user's *published* posts
+pub fun preload_where : rel -> pcols -> (ccols -> Expr) -> Preloaded out
+  needs {QueryBuild}
+  where {rel: Preloadable pcols ccols out}
+preload_where relation parent predicate = run_preload relation parent (Just predicate)
 
 # Read one relation's parent keys (typed) from the raw result rows at `offset`, using
 # the relation's own column decoder. This is ordinary positional decoding — the keys

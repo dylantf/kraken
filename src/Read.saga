@@ -350,7 +350,7 @@ users_over_post_count_query () = Query.query (fun () -> {
 # A has-many relation, defined once next to the schema: users have many posts, joined
 # parent `users.id` -> child `posts.author_id`. Both are column accessors, so the FK is
 # named once and the batched child query is generated.
-pub fun authored_posts : Query.Relation Users Post Int
+pub fun authored_posts : Query.Relation Users Posts Post Int
 authored_posts = Query.has_many posts (fun u -> u.id) (fun p -> p.author_id)
 
 # Load each user with their posts as one query expression: `preload` pulls the
@@ -369,6 +369,43 @@ pub fun load_users_with_posts : Connection
   -> Result (List { user: User, posts: List Post }) Query.DbError
   needs {Repo}
 load_users_with_posts conn = Query.all conn (users_with_posts_query ())
+
+# A belongs-to relation: a post points at its author via `posts.author_id` -> `users.id`.
+# Consumed with `preload`, it yields `Maybe User` (the author, if present).
+pub fun post_author : Query.RelationOne Posts Users User Int
+post_author = Query.belongs_to users (fun p -> p.author_id) (fun u -> u.id)
+
+# Each post with its author in one query expression (parent query + one batched child
+# query). The to-one relation makes the `author` field `Maybe User`.
+pub fun posts_with_author_query : Unit
+  -> Query.Prepared { post: Post, author: Maybe User }
+posts_with_author_query () = Query.query (fun () -> {
+  let p = from! posts
+  let author = Query.preload post_author p
+  order_by! [Db.asc p.id]
+  select! ({ post: p, author: author })
+})
+
+pub fun load_posts_with_author : Connection
+  -> Result (List { post: Post, author: Maybe User }) Query.DbError
+  needs {Repo}
+load_posts_with_author conn = Query.all conn (posts_with_author_query ())
+
+# Filterable preload: each user with only their *published* posts. The predicate is a
+# `(Posts -> Expr)` `AND`-ed into the generated child query's `WHERE`.
+pub fun users_with_published_posts_only_query : Unit
+  -> Query.Prepared { user: User, posts: List Post }
+users_with_published_posts_only_query () = Query.query (fun () -> {
+  let u = from! users
+  let posts = Query.preload_where authored_posts u (fun p -> Db.eq p.published True)
+  order_by! [Db.asc u.id]
+  select! ({ user: u, posts: posts })
+})
+
+pub fun load_users_with_published_posts : Connection
+  -> Result (List { user: User, posts: List Post }) Query.DbError
+  needs {Repo}
+load_users_with_published_posts conn = Query.all conn (users_with_published_posts_only_query ())
 
 # FULL JOIN via the dedicated full-join constructor: both tables are bound nullable,
 # so the row is all-Maybe (user-only rows, post-only rows, and matched rows all
