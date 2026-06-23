@@ -24,7 +24,7 @@ import Kraken.Db (
   and_,
   Col,
   RelData,
-  RelKey,
+  RelSlot,
   Preloaded
 )
 import Kraken.Db as Core
@@ -39,15 +39,18 @@ import SagaPgo (
 import SagaPgo as Pgo
 import SagaPgo.Types (Value)
 
-# Type-erasure boundary for relation loading: parent keys and grouped children are
-# stored as `Dynamic` (the relation's `k` / `child` types differ per relation, so a
-# `Prepared`'s relation specs can't be statically typed in them). Both are identity
-# on the BEAM; the casts only move types past the checker at the erase/unerase points.
-@external("erlang", "kraken_unsafe", "from_dynamic")
-fun unsafe_from_dynamic : Dynamic -> a
-
+# The one type-erasure boundary in relation loading. A query can `preload` several
+# relations with different `child` types, all collected into one `RelData` (index →
+# grouped children); without existentials that shared table can't be typed, so each
+# relation's grouped `Dict parent_key (List child)` is held opaquely. `erase` /
+# `unerase` are a strict inverse pair (identity on the BEAM) used ONLY in `preload`,
+# where the map is erased and un-erased a few lines apart with the same concrete type.
+# Everything else — parent keys, column offsets — stays fully typed.
 @external("erlang", "kraken_unsafe", "to_dynamic")
-fun unsafe_to_dynamic : a -> Dynamic
+fun erase : a -> Dynamic
+
+@external("erlang", "kraken_unsafe", "from_dynamic")
+fun unerase : Dynamic -> a
 
 # A FROM / JOIN source: either a named table or a derived table (a subquery
 # fragment), each bound to an alias.
@@ -132,7 +135,7 @@ pub record Prepared a {
   #@ Decode one result row, threading relation data and collecting the relation
   #@ keys the row's `Preloaded` slots emit. With no relations, `relations` is empty,
   #@ the emitted key list is empty, and `decode` is called once with `empty_rel_data`.
-  decode: RelData -> Dynamic -> Result (a, List RelKey) DecodeError,
+  decode: RelData -> Dynamic -> Result (a, List RelSlot) DecodeError,
   #@ Relations to batch-load and stitch after the main query runs (see `preload`).
   relations: List RelSpec,
   noop: Bool,
@@ -175,14 +178,15 @@ pub handler pg_repo for Repo needs {Postgres} {
 }
 
 # A relation registered by `preload` while building a query. `index` is its slot
-# (0-based, in registration order), matching the `RelKey`s its `Preloaded` field
-# emits during decode. `load` takes the parent keys collected in the first decode
-# pass (erased to `Dynamic`), runs the batched child query, and returns the grouped
-# children (`Dict parent_key (List child)`, also erased). Defined after `Repo` because
-# its `load` field's type mentions that effect.
+# (0-based, in registration order), matching the `RelSlot`s its `Preloaded` field
+# emits during decode. `load` is given the raw parent rows and the column offset of
+# this relation's key (located in the first decode pass); it reads the keys *typed*
+# from those rows, runs the batched child query, and returns the grouped children
+# (`Dict parent_key (List child)`, erased — the one opaque value). Defined after
+# `Repo` because its `load` field's type mentions that effect.
 record RelSpec {
   index: Int,
-  load: Connection -> List Dynamic -> Result Dynamic DbError needs {Repo},
+  load: Connection -> List Dynamic -> Int -> Result Dynamic DbError needs {Repo},
 }
 
 #@ The query-building DSL. Its operations are performed with `!` inside the
@@ -1003,21 +1007,27 @@ run conn prepared =
 #@ the query fails or any row fails to decode.
 #@
 #@ When the query has `preload`ed relations, decoding runs in two passes: the first
-#@ collects each row's parent keys, then every relation's children are batch-loaded
-#@ (one extra query per relation) and grouped, and the second pass resolves each
-#@ relation slot to its matching children. This is the classic preload — one query
-#@ per relation level, never N+1.
+#@ decodes one row to locate each relation's parent-key column, then every relation's
+#@ children are batch-loaded (one extra query per relation) and grouped, and the
+#@ second pass resolves each relation slot to its matching children. This is the
+#@ classic preload — one query per relation level, never N+1.
 pub fun all : Connection -> Prepared a -> Result (List a) DbError needs {Repo}
 all conn prepared = if prepared.noop then Ok []
   else case execute! conn prepared {
     Err err -> Err (QueryFailed err)
     Ok returned -> case prepared.relations {
       [] -> decode_rows prepared.decode Core.empty_rel_data returned.rows
-      _ -> case collect_rel_keys prepared.decode returned.rows {
-        Err err -> Err err
-        Ok keys -> case load_rel_entries conn prepared.relations keys {
-          Err err -> Err err
-          Ok entries -> decode_rows prepared.decode (Core.rel_data_of entries) returned.rows
+      _ -> case returned.rows {
+        # No rows → no parents → nothing to load; the relation slots resolve to [].
+        [] -> Ok []
+        # Pass 1: decode one row (with empty data) to locate each relation's key
+        # column. Offsets are structural — identical across rows — so one row suffices.
+        first :: _ -> case prepared.decode Core.empty_rel_data first {
+          Err err -> Err (DecodeFailed err)
+          Ok (_value, slots) -> case load_rel_entries conn prepared.relations returned.rows slots {
+            Err err -> Err err
+            Ok entries -> decode_rows prepared.decode (Core.rel_data_of entries) returned.rows
+          }
         }
       }
     }
@@ -1142,74 +1152,84 @@ preload relation pcols = case relation {
     let read_key = Core.col_decoder key_col
     push_relation! (RelSpec {
       index: index,
-      # Un-erase the parent keys, run the typed child loader, and re-erase the grouped
-      # `Dict` so the executor can carry it without knowing `k` / `child`.
-      load: fun conn dyn_keys -> {
-        let keys = List.map unsafe_from_dynamic dyn_keys
-        case def.load_children conn keys {
+      # Read the parent keys *typed* from the raw rows (the normal column decoder, not
+      # an unsafe cast), run the typed child loader, and erase only the grouped `Dict`.
+      load: fun conn rows offset -> case extract_keys read_key offset rows {
+        Err err -> Err err
+        Ok keys -> case def.load_children conn keys {
           Err err -> Err err
-          Ok grouped -> Ok (unsafe_to_dynamic grouped)
+          Ok grouped -> Ok (erase grouped)
         }
       },
     })
+    # Pass 1 (empty data): just locate this slot — its index and key-column offset.
+    # Pass 2 (data populated): read the parent key typed, un-erase this relation's
+    # grouped map, and look up the children. `unerase` here is the inverse of the
+    # `erase` above — same `Dict parent_key (List child)`, both built in this closure.
     Core.make_preloaded key_item (fun data offset row ->
-      case read_key offset row {
-        Err err -> Err err
-        Ok key -> {
-          let req = Core.RelKey index (unsafe_to_dynamic key)
-          case Core.rel_data_get index data {
-            Nothing -> Ok ([], [req])
-            Just grouped_dyn -> {
-              let grouped = unsafe_from_dynamic grouped_dyn
-              let kids = case Dicts.get key grouped {
-                Just xs -> xs
-                Nothing -> []
-              }
-              Ok (kids, [req])
+      case Core.rel_data_get index data {
+        Nothing -> Ok ([], [Core.RelSlot index offset])
+        Just grouped_dyn -> case read_key offset row {
+          Err err -> Err err
+          Ok key -> {
+            let grouped = unerase grouped_dyn
+            let kids = case Dicts.get key grouped {
+              Just xs -> xs
+              Nothing -> []
             }
+            Ok (kids, [Core.RelSlot index offset])
           }
         }
       })
   }
 }
 
-# Collect every relation key emitted across all rows (first decode pass, run with
-# empty `RelData`). The decoded values are discarded; only the keys matter here.
-fun collect_rel_keys : (RelData -> Dynamic -> Result (a, List RelKey) DecodeError)
+# Read one relation's parent keys (typed) from the raw result rows at `offset`, using
+# the relation's own column decoder. This is ordinary positional decoding — the keys
+# never become `Dynamic`.
+fun extract_keys : (Int -> Dynamic -> Result k DecodeError)
+  -> Int
   -> List Dynamic
-  -> Result (List RelKey) DbError
-collect_rel_keys decode rows = case rows {
+  -> Result (List k) DbError
+extract_keys read offset rows = case rows {
   [] -> Ok []
-  row :: rest -> case decode Core.empty_rel_data row {
+  row :: rest -> case read offset row {
     Err err -> Err (DecodeFailed err)
-    Ok (_value, keys) -> case collect_rel_keys decode rest {
+    Ok key -> case extract_keys read offset rest {
       Err err -> Err err
-      Ok more -> Ok (List.append keys more)
+      Ok more -> Ok (key :: more)
     }
   }
 }
 
-# The parent keys (still erased) requested for one relation index.
-fun keys_for : Int -> List RelKey -> List Dynamic
-keys_for index keys = List.foldr (fun req acc -> case req {
-  RelKey i value -> if i == index then value :: acc else acc
-}) [] keys
+# The key-column offset for a relation index (from the first decode pass). `Nothing`
+# if the slot never fired (e.g. a relation under an all-NULL left-joined scope), in
+# which case the relation is simply skipped and resolves to `[]`.
+fun offset_for : Int -> List RelSlot -> Maybe Int
+offset_for index slots = case slots {
+  [] -> Nothing
+  RelSlot i off :: rest -> if i == index then Just off else offset_for index rest
+}
 
-# For each relation, load + group its children (one batched query via `load`) and pair
-# the erased `Dict` with the relation's index — the entries that populate the second
-# decode pass's `RelData`.
+# For each relation, load + group its children (one batched query via `load`, reading
+# keys from `rows` at the located offset) and pair the erased `Dict` with the relation's
+# index — the entries that populate the second decode pass's `RelData`.
 fun load_rel_entries : Connection
   -> List RelSpec
-  -> List RelKey
+  -> List Dynamic
+  -> List RelSlot
   -> Result (List (Int, Dynamic)) DbError
   needs {Repo}
-load_rel_entries conn specs keys = case specs {
+load_rel_entries conn specs rows slots = case specs {
   [] -> Ok []
-  spec :: rest -> case spec.load conn (keys_for spec.index keys) {
-    Err err -> Err err
-    Ok grouped -> case load_rel_entries conn rest keys {
+  spec :: rest -> case offset_for spec.index slots {
+    Nothing -> load_rel_entries conn rest rows slots
+    Just offset -> case spec.load conn rows offset {
       Err err -> Err err
-      Ok more -> Ok ((spec.index, grouped) :: more)
+      Ok grouped -> case load_rel_entries conn rest rows slots {
+        Err err -> Err err
+        Ok more -> Ok ((spec.index, grouped) :: more)
+      }
     }
   }
 }
@@ -1255,8 +1275,8 @@ transaction conn body = {
 
 # Decode every row with the given relation data (the second pass when relations are
 # present, or the only pass with `empty_rel_data` when there are none). The relation
-# keys each row emits are not needed here — they were gathered in `collect_rel_keys`.
-fun decode_rows : (RelData -> Dynamic -> Result (a, List RelKey) DecodeError)
+# slots each row emits are not needed here — offsets were located in the first pass.
+fun decode_rows : (RelData -> Dynamic -> Result (a, List RelSlot) DecodeError)
   -> RelData
   -> List Dynamic
   -> Result (List a) DbError

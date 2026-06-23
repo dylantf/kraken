@@ -496,24 +496,31 @@ opaque type Field a = Field (FieldDef a)
 #
 # A relation field (`Db.Preloaded`) does not decode from its own columns alone: it
 # decodes from children fetched by a *separate* query. Decoding therefore runs in
-# two passes. Pass one decodes every row with empty `RelData`, and each relation
-# slot emits a `RelKey` (its parent-key value, tagged with the relation's index).
-# The executor batches those keys, loads + groups each relation's children, and
-# packs the grouped results into a populated `RelData`. Pass two re-decodes the
-# rows with that `RelData`, so each slot resolves to its matching `List child`.
+# two passes. Pass one decodes a row with empty `RelData`, and each relation slot
+# emits a `RelSlot` locating *where* its parent-key column sits (relation index +
+# column offset) — plain ints, no value erasure. The executor reads the keys
+# (typed, via the relation's own decoder) straight from the raw rows at that offset,
+# loads + groups each relation's children, and packs the grouped maps into a
+# populated `RelData`. Pass two re-decodes with that `RelData`, so each slot resolves
+# to its matching `List child`.
+#
+# The ONLY type erasure in the whole mechanism is `RelData`'s values: N relations of
+# different `child` types share one index→map table, which parametric polymorphism
+# can't express, so each grouped `Dict parent_key (List child)` is held opaquely and
+# cast back in the one `preload` closure that produced it. Keys and offsets stay typed.
 
-#@ A parent-key value emitted by a relation slot during decode, tagged with the
-#@ index of the relation that needs it. Collected in the first decode pass so the
-#@ executor can batch-load that relation's children.
-pub type RelKey = RelKey Int Dynamic
+#@ Locates a relation's parent-key column during the first decode pass: the relation's
+#@ index (its slot, matching `RelData`) and the column offset of its key in the row.
+#@ Both plain ints — the key value itself is read later, typed, from the raw rows.
+pub type RelSlot = RelSlot Int Int
 
-#@ Loaded children for each relation, keyed by relation index, type-erased (each
-#@ value is a `Dict parent_key (List child)`). Empty during the key-collection
-#@ pass; populated for the final decode pass.
+#@ Loaded children for each relation, keyed by relation index. The values are the one
+#@ irreducible erasure: each is a `Dict parent_key (List child)` held opaquely because
+#@ relations in one query have differing `child` types. Empty during the first pass.
 opaque type RelData = RelData (Dict Int Dynamic)
 
-#@ The empty relation data used during the key-collection pass (and by callers
-#@ with no relations at all).
+#@ The empty relation data used during the first decode pass (and by callers with no
+#@ relations at all).
 pub fun empty_rel_data : RelData
 empty_rel_data = RelData (Dicts.new ())
 
@@ -521,7 +528,7 @@ empty_rel_data = RelData (Dicts.new ())
 pub fun rel_data_of : List (Int, Dynamic) -> RelData
 rel_data_of entries = RelData (Dicts.from_list entries)
 
-#@ Look up a relation's grouped children (still type-erased) by its index.
+#@ Look up a relation's grouped children (still opaque) by its index.
 pub fun rel_data_get : Int -> RelData -> Maybe Dynamic
 rel_data_get index data = case data {
   RelData dict -> Dicts.get index dict
@@ -530,7 +537,7 @@ rel_data_get index data = case data {
 record ProjectionDef a {
   selections: List SelectItem,
   width: Int,
-  decode_at: RelData -> Int -> Dynamic -> Result (a, List RelKey) DecodeError,
+  decode_at: RelData -> Int -> Dynamic -> Result (a, List RelSlot) DecodeError,
 }
 
 opaque type Projection a = Projection (ProjectionDef a)
@@ -545,16 +552,16 @@ opaque type Preloaded child = Preloaded (PreloadedDef child)
 record PreloadedDef child {
   # The parent-key column injected into the SELECT (so it's available to group on).
   key_item: SelectItem,
-  # Decode this slot: read the parent key at `offset`, emit it as a `RelKey`, and
-  # (once `RelData` is populated) resolve to the matching children.
-  resolve: RelData -> Int -> Dynamic -> Result (List child, List RelKey) DecodeError,
+  # Decode this slot: in pass one emit a `RelSlot` (index + key-column offset); once
+  # `RelData` is populated, read the parent key at `offset` and resolve the children.
+  resolve: RelData -> Int -> Dynamic -> Result (List child, List RelSlot) DecodeError,
 }
 
 #@ Build a `Preloaded` field from its injected parent-key column and a resolver.
 #@ The query layer's `preload` supplies both (the resolver closes over the child
 #@ types, so `Preloaded` itself stays parameterized only by `child`).
 pub fun make_preloaded : SelectItem
-  -> (RelData -> Int -> Dynamic -> Result (List child, List RelKey) DecodeError)
+  -> (RelData -> Int -> Dynamic -> Result (List child, List RelSlot) DecodeError)
   -> Preloaded child
 make_preloaded key_item resolve = Preloaded (PreloadedDef {
   key_item: key_item,
@@ -1219,7 +1226,7 @@ fun lift_decode : (Int -> Dynamic -> Result a DecodeError)
   -> RelData
   -> Int
   -> Dynamic
-  -> Result (a, List RelKey) DecodeError
+  -> Result (a, List RelSlot) DecodeError
 lift_decode decoder = fun _data offset row -> case decoder offset row {
   Err err -> Err err
   Ok value -> Ok (value, [])
@@ -1323,7 +1330,7 @@ projection_selections projection = {
 #@ projection (its single parent-key column plus a deferred child-resolving decode).
 pub fun make_projection : List SelectItem
   -> Int
-  -> (RelData -> Int -> Dynamic -> Result (a, List RelKey) DecodeError)
+  -> (RelData -> Int -> Dynamic -> Result (a, List RelSlot) DecodeError)
   -> Projection a
 make_projection selections width decoder =
   Projection (ProjectionDef {
@@ -1368,7 +1375,7 @@ project_pair left right = zip_projection left right
 pub fun decode_projection : Projection a
   -> RelData
   -> Dynamic
-  -> Result (a, List RelKey) DecodeError
+  -> Result (a, List RelSlot) DecodeError
 decode_projection projection data row = {
   let Projection def = projection
   def.decode_at data 0 row

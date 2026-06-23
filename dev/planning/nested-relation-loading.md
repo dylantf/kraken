@@ -149,15 +149,22 @@ Query.all conn (users_with_posts_query ())     -- List { user: User, posts: List
 - **`Db.Preloaded child` + `Selectable (List child)`** — a `select!` field that
   contributes one column (the parent key, injected into the SELECT) and a deferred
   decode. `preload` returns it; `selection -> row` maps `Preloaded Post → List Post`.
-- **Two-pass decode.** `decode_at` now threads a `RelData` and returns
-  `(value, List RelKey)`. Pass 1 decodes rows with empty `RelData`, each relation slot
-  emitting its parent key as a `RelKey`. The executor batches those keys, runs one
-  child query per relation (`WHERE fk IN (keys)`), groups into a `Dict`, and packs a
-  populated `RelData`. Pass 2 re-decodes, resolving each slot to its `List child`. One
-  query per relation level — not N+1; nesting composes (the child query runs through
-  the same `all`). `RelData`/`RelKey`/specs are type-erased via `kraken_unsafe`
-  (`from_dynamic`/`to_dynamic`), since per-relation `k`/`child` can't be typed in a
-  `Prepared`.
+- **Two-pass decode.** `decode_at` threads a `RelData` and returns
+  `(value, List RelSlot)`. Pass 1 decodes one row with empty `RelData`; each relation
+  slot emits a `RelSlot` = `(relation index, key-column offset)` — **plain ints, no
+  value erasure**. The executor reads that relation's keys *typed* (the ordinary column
+  decoder) straight from the raw rows at the offset, runs one child query per relation
+  (`WHERE fk IN (keys)`), groups into a `Dict`, and packs a populated `RelData`. Pass 2
+  re-decodes, resolving each slot to its `List child`. One query per relation level —
+  not N+1; nesting composes (the child query runs through the same `all`).
+- **Exactly one type erasure.** A query can preload several relations with different
+  `child` types, all collected into one `RelData` (index → grouped children). Without
+  existentials that shared table can't be typed, so each grouped
+  `Dict parent_key (List child)` is held opaquely (`erase`/`unerase`, identity on the
+  BEAM) — a single inverse pair confined to the `preload` closure, same type both
+  sides. Keys and offsets stay fully typed; nothing else casts. (If Saga grows
+  existentials / trait objects, even this one disappears: pack each relation as
+  `∃ k child. RelImpl k child`.)
 - **Grouping is `Dict`-grouped, O(n+m)** (`group_pairs`, foldr+prepend preserves
   order). Use the **bare builtin `Dict`** in signatures — `Dicts.Dict` misresolves to a
   phantom type (repro `/tmp/dicttest2`).
