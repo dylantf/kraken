@@ -343,16 +343,31 @@ Compiler footgun found along the way: qualifying the builtin `Dict` type as
 
 ---
 
-## 6. Consider collapsing the `_sql` API doubling
+## 6. Consider collapsing the `_sql` API doubling — DONE (decision: keep split, dedup impls) (2026-06-23)
 
 - **Problem:** `eq`/`eq_sql`, `add`/`add_sql`, `coalesce`/`coalesce_sql`, etc. roughly
   double the predicate/arithmetic surface; cost compounds as operators are added.
-- **Fix to evaluate (not necessarily adopt):** a single `lit`/`val` wrapper at call
-  sites (`eq u.age (val other_col)` vs `eq u.age 18`) to collapse each pair. The
-  answer may end up "no, the split reads better" — this is a decision to make
-  deliberately, not a guaranteed change.
-- **Note:** a bare-value `ToSql` instance is ambiguous/overlapping, which is why the
-  split exists today.
+- **Decision:** keep the public split — the literal-RHS forms (`eq u.age 18`) read
+  cleanly and are the common case; collapsing to `eq u.age (lit 18)` would tax the
+  common path to clean up the rare column-to-column one. A bare-value `ToSql`
+  instance is ambiguous/overlapping (overlaps `Col`/`Sql`), which is why the split
+  exists and why full collapse isn't free.
+- **What was done instead (the maintenance-dedup middle option):** the duplication
+  was *implementation-level*, not surface-level — two parallel rendering bodies per
+  operator. Added a private `lit_param : a -> Sql a` (the single place that turns a
+  literal into a bare `$n` param, no `::type` cast) and rewrote every literal-RHS op
+  as a one-liner over its `_sql` cousin: `eq input value = eq_sql input (lit_param
+  value)`, likewise `not_eq`/`gt`/`gte`/`lt`/`lte`, `add`/`sub`/`mul`/`div`,
+  `coalesce`. Deleted the `arith_lit` helper (now `lit_param` + `arith_sql`). The
+  `_sql` variants are now the primitives; 11 operators went from two rendering
+  bodies each to one. **No call-site churn, public surface unchanged, rendered SQL
+  byte-identical** (`lit_param` emits the same `param (encode_pg …)` the old inline
+  bodies did). Distinct from the existing public `Db.lit`, which wraps a literal as
+  `Sql a` *with* an explicit `::type` cast for constants in `select!`/`concat`/CASE
+  where PG can't infer the param type — unneeded in operators since the other
+  operand supplies the type.
+- **Where:** `lib/Kraken/Db.saga` (`lit_param` + the 11 delegations; `arith_lit`
+  removed). `saga check` green.
 
 ---
 

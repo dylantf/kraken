@@ -843,20 +843,21 @@ pub fun sql_fn : String -> List SqlArg -> Sql a where {a: PgType}
 sql_fn name args =
   make_sql (append_frags [raw_frag (name <> "("), join_args args, raw_frag ")"])
 
+# A literal Saga value as a bare bound-param `Sql a` (rendered `$n`, no `::type`
+# cast — unlike the public `lit`). The single place that turns a literal into a
+# param, so the literal-RHS operators (`eq`, `add`, `coalesce`, …) are just
+# `<op>_sql input (lit_param value)`. The cast is unnecessary here because the
+# other operand always supplies the type.
+fun lit_param : a -> Sql a where {a: PgType}
+lit_param value = make_sql (param (encode_pg value))
+
 #@ `COALESCE(<input>, <fallback>)` — the first non-NULL of the two. The principled
 #@ way to recover a non-null scalar from a left join: after `Db.unwrap_cols`, a
 #@ left-joined column reads as `Col a`, and `coalesce` pairs it with a default of
 #@ the same type, yielding a non-null `Sql a` you *can* put in `select!`
 #@ (`Db.coalesce (Db.unwrap_cols p).count 0` → `COALESCE(t1.count, $1)`).
 pub fun coalesce : input -> a -> Sql a where {input: ToSql a, a: PgType}
-coalesce input fallback =
-  make_sql (append_frags [
-    raw_frag "COALESCE(",
-    value_frag input,
-    raw_frag ", ",
-    param (encode_pg fallback),
-    raw_frag ")",
-  ])
+coalesce input fallback = coalesce_sql input (lit_param fallback)
 
 #@ `COALESCE(<left>, <right>)` over two SQL values of the same type (e.g. two
 #@ columns) rather than a literal fallback.
@@ -903,17 +904,6 @@ pub fun concat : List SqlArg -> Sql String
 concat args =
   make_sql (append_frags [raw_frag "CONCAT(", join_args args, raw_frag ")"])
 
-# `(<input> OP <literal>)` arithmetic against a same-typed literal.
-fun arith_lit : String -> input -> a -> Sql a where {input: ToSql a, a: PgType}
-arith_lit op input operand =
-  make_sql (append_frags [
-    raw_frag "(",
-    value_frag input,
-    raw_frag (" " <> op <> " "),
-    param (encode_pg operand),
-    raw_frag ")",
-  ])
-
 # `(<left> OP <right>)` arithmetic between two same-typed SQL values.
 fun arith_sql : String -> left -> right -> Sql a
   where {left: ToSql a, right: ToSql a, a: PgType}
@@ -928,19 +918,19 @@ arith_sql op left right =
 
 #@ `(<input> + <literal>)` — e.g. the upsert idiom `count = users.count + 1`.
 pub fun add : input -> a -> Sql a where {input: ToSql a, a: PgType}
-add input operand = arith_lit "+" input operand
+add input operand = add_sql input (lit_param operand)
 
 #@ `(<input> - <literal>)`.
 pub fun sub : input -> a -> Sql a where {input: ToSql a, a: PgType}
-sub input operand = arith_lit "-" input operand
+sub input operand = sub_sql input (lit_param operand)
 
 #@ `(<input> * <literal>)`.
 pub fun mul : input -> a -> Sql a where {input: ToSql a, a: PgType}
-mul input operand = arith_lit "*" input operand
+mul input operand = mul_sql input (lit_param operand)
 
 #@ `(<input> / <literal>)`.
 pub fun div : input -> a -> Sql a where {input: ToSql a, a: PgType}
-div input operand = arith_lit "/" input operand
+div input operand = div_sql input (lit_param operand)
 
 #@ `(<left> + <right>)` between two SQL values (e.g. `price + tax`).
 pub fun add_sql : left -> right -> Sql a
@@ -999,28 +989,22 @@ fun jsonb_frag : input -> SqlFrag where {input: ToJsonbSql a}
 jsonb_frag input = sql_frag (to_jsonb_sql input)
 
 pub fun eq : input -> a -> Expr where {input: ToSql a, a: PgType}
-eq input value =
-  make_expr (spaced (value_frag input) "=" (param (encode_pg value)))
+eq input value = eq_sql input (lit_param value)
 
 pub fun not_eq : input -> a -> Expr where {input: ToSql a, a: PgType}
-not_eq input value =
-  make_expr (spaced (value_frag input) "<>" (param (encode_pg value)))
+not_eq input value = not_eq_sql input (lit_param value)
 
 pub fun gt : input -> a -> Expr where {input: ToSql a, a: PgType}
-gt input value =
-  make_expr (spaced (value_frag input) ">" (param (encode_pg value)))
+gt input value = gt_sql input (lit_param value)
 
 pub fun gte : input -> a -> Expr where {input: ToSql a, a: PgType}
-gte input value =
-  make_expr (spaced (value_frag input) ">=" (param (encode_pg value)))
+gte input value = gte_sql input (lit_param value)
 
 pub fun lt : input -> a -> Expr where {input: ToSql a, a: PgType}
-lt input value =
-  make_expr (spaced (value_frag input) "<" (param (encode_pg value)))
+lt input value = lt_sql input (lit_param value)
 
 pub fun lte : input -> a -> Expr where {input: ToSql a, a: PgType}
-lte input value =
-  make_expr (spaced (value_frag input) "<=" (param (encode_pg value)))
+lte input value = lte_sql input (lit_param value)
 
 pub fun eq_sql : left -> right -> Expr
   where {left: ToSql a, right: ToSql a, a: PgType}
