@@ -545,6 +545,7 @@ expr_from_frag frag = make_expr frag
 pub record SelectItem {
   expr: SqlFrag,
   alias: String,
+  relabelable: Bool,
 }
 
 record OrderItem {
@@ -1266,7 +1267,11 @@ join_exprs sep exprs = case exprs {
 fun field_as : String -> Col a -> Field a where {a: PgType}
 field_as alias column =
   Field (FieldDef {
-    selection: SelectItem { expr: column_frag column, alias: alias },
+    selection: SelectItem {
+      expr: column_frag column,
+      alias: alias,
+      relabelable: True,
+    },
     decoder: decode_pg,
   })
 
@@ -1327,19 +1332,25 @@ fun sql_projection : Sql a -> Projection a
 sql_projection sql_value = case sql_value {
   Sql def ->
     field_def_projection (FieldDef {
-      selection: SelectItem { expr: def.frag, alias: "value" },
+      selection: SelectItem {
+        expr: def.frag,
+        alias: "value",
+        relabelable: True,
+      },
       decoder: def.decoder,
     })
 }
 
 fun relabel_item : String -> SelectItem -> SelectItem
-relabel_item alias item = { item | alias: alias }
+relabel_item alias item =
+  if item.relabelable then { item | alias: alias } else item
 
 fun relabel_items : String -> List SelectItem -> List SelectItem
 relabel_items alias items = List.map (relabel_item alias) items
 
 fun prefix_item : String -> SelectItem -> SelectItem
-prefix_item prefix item = { item | alias: prefix <> "_" <> item.alias }
+prefix_item prefix item =
+  if item.relabelable then { item | alias: prefix <> "_" <> item.alias } else item
 
 fun prefix_items : String -> List SelectItem -> List SelectItem
 prefix_items prefix items = List.map (prefix_item prefix) items
@@ -1404,7 +1415,11 @@ as_sql input = to_sql input
 #@ A `SelectItem` selecting a single `Sql` value under the given alias. Exposed so
 #@ the query layer can inject a relation's parent-key column into the SELECT.
 pub fun col_select_item : String -> Sql a -> SelectItem
-col_select_item alias sql_value = SelectItem { expr: sql_frag sql_value, alias: alias }
+col_select_item alias sql_value = SelectItem {
+  expr: sql_frag sql_value,
+  alias: alias,
+  relabelable: False,
+}
 
 #@ A positional decoder for a single `Sql` value, using its own decoder. Exposed so
 #@ the query layer can read a relation's parent-key value at decode time.

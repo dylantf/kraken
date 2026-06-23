@@ -1235,7 +1235,7 @@ fun register_relation : RelationDef pcols ccols child k
   where {k: Eq}
 register_relation def pcols finish filter = {
   let index = relation_count! ()
-  let alias = "__rel" <> show index
+  let alias = "__kraken_rel" <> show index <> "_key"
   let key_col = def.parent_key pcols
   let key_item = Core.col_select_item alias key_col
   let read_key = Core.col_decoder key_col
