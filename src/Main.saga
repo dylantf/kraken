@@ -1,7 +1,8 @@
 module Main
 
 import Std.IO (console, Stdio)
-import Kraken.Db.Query
+import Kraken.Db
+import Kraken.Query
 import Read
 import SagaPgo (Connection, connect, default_config, pg, pg_transaction)
 import Write
@@ -29,15 +30,15 @@ main () = {
   println (Read.search_users_query Nothing (Just "Alice") False).sql
 
   println "-- left join, real matches --"
-  Read.print_optional_posts (Read.load_optional_posts conn with Query.pg_repo)
+  Read.print_optional_posts (Read.load_optional_posts conn with Db.pg_repo)
 
   println "-- left join, unsatisfiable ON (forces Nothing) --"
-  Read.print_optional_posts (Read.load_unmatched_posts conn with Query.pg_repo)
+  Read.print_optional_posts (Read.load_unmatched_posts conn with Db.pg_repo)
 
   println "-- anti-join: users with no post (unwrap_cols + IS NULL) --"
   println (Read.users_without_posts_query ()).sql
   Read.print_users_without_posts (Read.load_users_without_posts conn
-    with Query.pg_repo)
+    with Db.pg_repo)
 
   println "-- correlated EXISTS subquery (rendered SQL) --"
   println (Read.users_with_published_posts_query ()).sql
@@ -52,59 +53,74 @@ main () = {
   println (Read.prolific_authors_query ()).sql
 
   println "-- SQL fn: UPPER + age+1 --"
-  let report = Read.load_user_report conn with Query.pg_repo
-  Read.print_rows report (fun r -> $"{show r.id}: {r.upper_name} (age+1={show r.age_next})")
+  let report = Read.load_user_report conn with Db.pg_repo
+  Read.print_rows report (fun r ->
+    $"{show r.id}: {r.upper_name} (age+1={show r.age_next})")
 
   println "-- SQL fn: CASE/CONCAT/NOT age tiers --"
-  let tiers = Read.load_user_tiers conn with Query.pg_repo
+  let tiers = Read.load_user_tiers conn with Db.pg_repo
   Read.print_rows tiers (fun r -> $"{show r.id}: {r.label} [{r.tier}]")
 
   println "-- SQL fn: COALESCE post title off a left join --"
-  let titles = Read.load_user_post_titles conn with Query.pg_repo
+  let titles = Read.load_user_post_titles conn with Db.pg_repo
   Read.print_rows titles (fun r -> $"{show r.id}: {r.title}")
 
   println "-- CTE (WITH): authors with > 5 posts --"
-  let prolific = Read.load_prolific_authors_cte conn with Query.pg_repo
-  Read.print_rows prolific (fun r -> $"author {show r.author_id}: {show r.posts} posts")
+  let prolific = Read.load_prolific_authors_cte conn with Db.pg_repo
+  Read.print_rows prolific (fun r ->
+    $"author {show r.author_id}: {show r.posts} posts")
 
   println "-- scalar subquery in SELECT: total post count per row --"
-  let totals = Read.load_users_with_total_posts conn with Query.pg_repo
-  Read.print_rows totals (fun r -> $"{show r.id}: {show r.total_posts} total posts")
+  let totals = Read.load_users_with_total_posts conn with Db.pg_repo
+  Read.print_rows totals (fun r ->
+    $"{show r.id}: {show r.total_posts} total posts")
 
   println "-- scalar subquery in comparison: age > total posts --"
-  let over = Read.load_users_over_post_count conn with Query.pg_repo
+  let over = Read.load_users_over_post_count conn with Db.pg_repo
   Read.print_rows over (fun r -> $"{show r.id}: {r.name}")
 
   println "-- FULL JOIN: both sides Maybe (matched / user-only / post-only) --"
   println (Read.users_full_join_posts_query ()).sql
-  let fj = Read.load_full_join conn with Query.pg_repo
+  let fj = Read.load_full_join conn with Db.pg_repo
   Read.print_rows fj (fun r -> {
-    let u = case r.user { Just usr -> usr.name; Nothing -> "<none>" }
-    let p = case r.post { Just pst -> pst.title; Nothing -> "<none>" }
+    let u = case r.user {
+      Just usr -> usr.name
+      Nothing -> "<none>"
+    }
+    let p = case r.post {
+      Just pst -> pst.title
+      Nothing -> "<none>"
+    }
     $"user={u} post={p}"
   })
 
   println "-- window functions: ROW_NUMBER + COUNT(*) OVER (PARTITION BY age) --"
-  let ranked = Read.load_ranked_users conn with Query.pg_repo
-  Read.print_rows ranked (fun r -> $"#{show r.age_rank} id={show r.id} age={show r.age} peers={show r.peers}")
+  let ranked = Read.load_ranked_users conn with Db.pg_repo
+  Read.print_rows ranked (fun r ->
+    $"#{show r.age_rank} id={show r.id} age={show r.age} peers={show r.peers}")
 
   println "-- relation preload (has_many): each user with their posts (2 queries, not N+1) --"
   println (Read.users_with_posts_query ()).sql
-  let uwp = Read.load_users_with_posts conn with Query.pg_repo
-  Read.print_rows uwp (fun r -> $"{r.user.name}: {show (List.length r.posts)} posts")
+  let uwp = Read.load_users_with_posts conn with Db.pg_repo
+  Read.print_rows uwp (fun r ->
+    $"{r.user.name}: {show (List.length r.posts)} posts")
 
   println "-- relation preload (belongs_to): each post with its author (Maybe User) --"
   println (Read.posts_with_author_query ()).sql
-  let pwa = Read.load_posts_with_author conn with Query.pg_repo
+  let pwa = Read.load_posts_with_author conn with Db.pg_repo
   Read.print_rows pwa (fun r -> {
-    let author = case r.author { Just u -> u.name; Nothing -> "<none>" }
+    let author = case r.author {
+      Just u -> u.name
+      Nothing -> "<none>"
+    }
     $"{r.post.title} by {author}"
   })
 
   println "-- relation preload_where: each user with only their PUBLISHED posts --"
   println (Read.users_with_published_posts_only_query ()).sql
-  let uwpp = Read.load_users_with_published_posts conn with Query.pg_repo
-  Read.print_rows uwpp (fun r -> $"{r.user.name}: {show (List.length r.posts)} published")
+  let uwpp = Read.load_users_with_published_posts conn with Db.pg_repo
+  Read.print_rows uwpp (fun r ->
+    $"{r.user.name}: {show (List.length r.posts)} published")
 
   println "-- DML: insert / update / update_all / delete (rendered SQL) --"
   println (Write.insert_user_query ()).sql

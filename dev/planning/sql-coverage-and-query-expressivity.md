@@ -21,7 +21,7 @@ replaced by:
 - `Kraken.Db` — the vocabulary (imported as `Db`): `PgType`, `Col`, `Table`,
   `Nullable`, `Array`, `Jsonb`, `Selectable`/`Projection`, typed SQL
   expressions, predicates, ordering, grouping, aggregates.
-- `Kraken.Db.Query` — the `QueryBuild` effect, rendering, `Prepared`, `Repo` /
+- `Kraken.Query` — the `QueryBuild` effect, rendering, `Prepared`, `Repo` /
   `pg_repo`, and `all` / `one` / `run` / `into`.
 
 **Nullability comes from exactly two places: the schema and the join kind.**
@@ -97,7 +97,7 @@ Current module layout (see the Update section above):
   - typed SQL expressions
   - projections and `Selectable`
   - predicates, ordering, grouping, and aggregates
-- `Kraken.Db.Query`
+- `Kraken.Query`
   - `QueryBuild`
   - query collection/rendering
   - prepared queries
@@ -776,7 +776,7 @@ correlated subquery never collides with the outer scope.
 
 Status:
 
-- **`EXISTS` / `NOT EXISTS`** (done) — `Query.exists` / `Query.not_exists` take a
+- **`EXISTS` / `NOT EXISTS`** (done) — `Db.exists` / `Db.not_exists` take a
   builder closure and return an `Expr` for `where_!`. Renders `EXISTS (SELECT 1 …)`;
   reference outer columns directly inside for correlation.
 - **Derived table / subquery in `FROM`** (done) — `Query.from_subquery` runs the
@@ -785,13 +785,13 @@ Status:
   alias), and binds it as the FROM source. The outer query dots into it
   (`t.posts`, `is_null t.id`) with full inference — no annotation (this is what the
   compiler's `rep -> type` inference fix on 2026-06-20 unblocked).
-- **`IN (subquery)` / `NOT IN (subquery)`** (done) — `Query.in_subquery` /
+- **`IN (subquery)` / `NOT IN (subquery)`** (done) — `Db.in_subquery` /
   `not_in_subquery`. The subquery closure *returns* the single column to match
   (no `select!`), and both the left input and that column are `ToSql a`, so their
   element types must agree (`id IN (subquery of names)` won't compile). Renders
   `<left> IN (SELECT <col> FROM …)`. (Literal-list `in_` still exists for the
   in-memory case.)
-- **scalar subquery as `Sql a`** (done 2026-06-21) — `Query.scalar_subquery` uses
+- **scalar subquery as `Sql a`** (done 2026-06-21) — `Db.scalar_subquery` uses
   the same "closure returns the column" pattern as `in_subquery`, but wraps the
   rendered `(SELECT <col> FROM …)` as a first-class `Sql a` (via the new pub
   `Db.sql_from_frag`, decoding with `a`'s `PgType`), so it's selectable and usable
@@ -834,7 +834,7 @@ Design decisions:
 
 ### Implementation status (2026-06-19)
 
-Built and compiling in `Kraken.Db.Dml`: **`insert`** (Rung 1), **`update`**,
+Built and compiling in `Kraken.Write`: **`insert`** (Rung 1), **`update`**,
 **`delete`**, and **`exec`** (non-returning, returns affected-row count via
 `Returned.count`). Demonstrated in `src/Write.saga`. Schema column records
 (`Users`/`Posts`) are now `pub` in `src/Read.saga` so the write side can reference
@@ -918,7 +918,7 @@ The builder is a uniform `!`-effect-operation DSL — `set!` / `where_!` inside 
 `update` closure:
 
 ```saga
-Dml.update users (fun u -> {
+Db.update users (fun u -> {
   set! u.age 43
   where_! (Db.eq u.id 1)
 })
@@ -942,8 +942,8 @@ trait — it reuses the same `cols -> row` fundep that `select`/`all` rely on.
 
 **`RETURNING`** (done 2026-06-19): `insert_returning` / `update_returning` /
 `delete_returning` take a projection callback over the table's columns (exactly
-like `select!`) and return a `Prepared row`, runnable with `Query.all` /
-`Query.one`. Implemented by reusing `Db.select` to build the `Projection`,
+like `select!`) and return a `Prepared row`, runnable with `Db.all` /
+`Db.one`. Implemented by reusing `Db.select` to build the `Projection`,
 rendering its selection frags as the RETURNING list (positional decode, so aliases
 are dropped), and setting `Prepared.decode = decode_projection`. E.g.
 `INSERT INTO users (name, age) VALUES ($1, $2) RETURNING users.id` decoded into
@@ -960,7 +960,7 @@ targets named with `Db.ref` (not raw strings):
 
 `ON CONFLICT` + `RETURNING` (done 2026-06-19): `upsert_returning` and
 `insert_on_conflict_do_nothing_returning` mirror the plain returning ops (a skipped
-DO-NOTHING row returns nothing, so `Query.one` gives `Ok Nothing` on conflict).
+DO-NOTHING row returns nothing, so `Db.one` gives `Ok Nothing` on conflict).
 
 **Custom `DO UPDATE SET` + `ON CONSTRAINT`** (done 2026-06-21): `upsert_set` /
 `upsert_set_returning` take an explicit assignment callback instead of the blanket
@@ -1030,11 +1030,11 @@ projection, or reference the column from a scope where `cols` is already fixed.
 
 ### Worked design
 
-This section is the worked-out DML design (2026-06-18). New module
-`Kraken.Db.Dml` (imported as `Dml`), parallel to `Kraken.Db.Query`, reusing the
-existing `Db` vocabulary: `Table` / `Col` / the `Schema` trait, `PgType.encode_pg`
-for value encoding, `Selectable`/`Projection` for `RETURNING`, and
-`Prepared`/`Repo`/`all`/`one` for execution.
+This section is the worked-out write design (2026-06-18). The implementation
+lives in `Kraken.Write`, parallel to `Kraken.Query`, while user-facing calls are
+re-exported through `Kraken.Db`: `Table` / `Col` / the `Schema` trait,
+`PgType.encode_pg` for value encoding, `Selectable`/`Projection` for `RETURNING`,
+and `Prepared`/`Repo`/`all`/`one` for execution.
 
 ### Guiding principle: two axes of schema config
 
@@ -1140,24 +1140,24 @@ needs a shape conversion:
 
 ```saga
 # INSERT — record literal, no `set!` spam. Generated cols omitted & type-enforced.
-Dml.insert users { name: "Alice", age: 42 }
+Db.insert users { name: "Alice", age: 42 }
 
 # INSERT ... RETURNING — closure ends in a selection, exactly like select!
-Dml.insert_returning users { name: "Alice", age: 42 } (fun u -> { id: u.id })
+Db.insert_returning users { name: "Alice", age: 42 } (fun u -> { id: u.id })
 
 # UPDATE (targeted/partial) — only write what changes. `set`/`where_` are plain
 # functions returning clauses (see Implementation status for why not `!`-ops).
-Dml.update users (fun u -> [
-  Dml.set u.age 43,
-  Dml.where_ (Db.eq u.id 1),
+Db.update users (fun u -> [
+  Db.set u.age 43,
+  Db.where_ (Db.eq u.id 1),
 ])
 
 # UPDATE (save whole entity) — eats the domain record as-is, keyed by primary_key.
 let updated = { user | age: 43 }       # native record update; no UserUpdate type
-Dml.update_all users updated           # UPDATE users SET name=$1, age=$2 WHERE id=$3
+Db.update_all users updated           # UPDATE users SET name=$1, age=$2 WHERE id=$3
 
 # DELETE
-Dml.delete users (fun u -> { where_! (Db.eq u.id 1) })
+Db.delete users (fun u -> { where_! (Db.eq u.id 1) })
 ```
 
 Notably **there is no id-less, Maybe-wrapped `UserUpdate` mirror record** — that
@@ -1228,9 +1228,9 @@ pub fun transaction : Connection
   needs {Postgres, Transaction}
 
 Query.transaction conn (fun () -> {
-  case Dml.exec conn (Dml.insert users new_row) {
+  case Db.exec conn (Db.insert users new_row) {
     Err err -> Err err                       # rolls back
-    Ok _ -> Dml.exec conn (bump_age_query ()) |> Result.map (fun _ -> ())
+    Ok _ -> Db.exec conn (bump_age_query ()) |> Result.map (fun _ -> ())
   }
   # commits on Ok, rolls back on Err
 })
@@ -1298,7 +1298,7 @@ Two things genuinely **don't** work — and both are caught at typecheck, not ru
   type mismatch: expected Posts, got Unit
   ```
   The JOIN *clause* can be conditional, but a bound column scope can't be. Outs: if
-  the join only feeds a filter, make it a conditional `where_! (Query.exists (…))`
+  the join only feeds a filter, make it a conditional `where_! (Db.exists (…))`
   / `in_subquery` (those nest cleanly and add nothing to the row type); otherwise
   you're back to the superset/raw escape.
 

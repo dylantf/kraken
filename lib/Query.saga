@@ -1,9 +1,9 @@
-module Kraken.Db.Query
+module Kraken.Query
 
 import Std.Dynamic (Dynamic, DecodeError)
 import Std.Generic (Generic)
 import Std.Dict as Dicts
-import Kraken.Db (
+import Kraken.Core (
   Table,
   Nullable,
   Expr,
@@ -27,7 +27,7 @@ import Kraken.Db (
   RelSlot,
   Preloaded
 )
-import Kraken.Db as Core
+import Kraken.Core as Core
 import SagaPgo (
   Connection,
   Postgres,
@@ -126,7 +126,7 @@ record QueryState {
 #@ one result row into an `a`. Produced by `query` and consumed by `all`/`one`.
 #@
 #@ `noop` marks a statement that affects and returns no rows without a database
-#@ round trip — built for empty bulk operations (e.g. `Dml.insert_all` on `[]`),
+#@ round trip — built for empty bulk operations (e.g. `Db.insert_all` on `[]`),
 #@ where there is no valid SQL to send. `all` short-circuits to `Ok []`, `exec` to
 #@ `Ok 0`; everything else carries `noop: False`.
 pub record Prepared a {
@@ -442,7 +442,7 @@ pub fun query : (Unit -> Select selection needs {QueryBuild}) -> Prepared row
 query make = {
   let QueryStep run_query = make () with collect_query
   let (Select selection, state) = run_query empty_state
-  let projection: Projection row = Core.select selection
+  let projection: Projection row = Core.project selection
   prepare projection state
 }
 
@@ -479,7 +479,7 @@ full_join_query table_a table_b on_fn body = {
   let scopes = (Core.as_nullable cols_a, Core.as_nullable cols_b)
   let QueryStep run = (body scopes) with collect_query
   let (Select selection, state) = run state4
-  let projection: Projection row = Core.select selection
+  let projection: Projection row = Core.project selection
   prepare projection state
 }
 
@@ -888,7 +888,7 @@ wrap_subquery keyword body = {
 #@ counter, so even a correlated subquery nested inside another never reuses (and
 #@ shadows) an enclosing alias.
 #@
-#@     where_! (Query.exists (fun () -> {
+#@     where_! (Db.exists (fun () -> {
 #@       let p = from! posts
 #@       where_! (Db.eq_col p.author_id u.id)
 #@     }))
@@ -933,7 +933,7 @@ membership keyword input make = {
 #@ `<input> IN (subquery)`. The subquery closure ends by *returning* the single
 #@ column to select (not via `select`); its element type must match `input`'s:
 #@
-#@     where_! (Query.in_subquery u.id (fun () -> {
+#@     where_! (Db.in_subquery u.id (fun () -> {
 #@       let p = from! posts
 #@       where_! (Db.eq p.published True)
 #@       p.author_id
@@ -986,7 +986,7 @@ scalar_subquery make = Core.sql_from_frag (scalar_subquery_frag make)
 #@
 #@     select ({
 #@       id: u.id,
-#@       a_title: Query.scalar_subquery_maybe (fun () -> {
+#@       a_title: Db.scalar_subquery_maybe (fun () -> {
 #@         let p = from! posts
 #@         where_! (Db.eq_col p.author_id u.id)
 #@         limit! 1
@@ -1160,7 +1160,7 @@ relation_def child_table parent_key child_key = RelationDef {
       cols
     }) () with collect_query
     let (cols, state) = run empty_state
-    let pair_projection = Core.project_pair (Core.col_projection (Core.as_sql (child_key cols))) (Core.select cols)
+    let pair_projection = Core.project_pair (Core.col_projection (Core.as_sql (child_key cols))) (Core.project cols)
     case all conn (prepare pair_projection state) {
       Err err -> Err err
       Ok pairs -> Ok (group_pairs pairs)

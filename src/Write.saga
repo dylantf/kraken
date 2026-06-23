@@ -1,22 +1,18 @@
 module Write
 
-import Kraken.Db
-import Kraken.Db.Dml
-import Kraken.Db.Dml (Update)
-import Kraken.Db.Query (Prepared, Repo, DbError, QueryFailed)
-import Kraken.Db.Query as Query
+import Kraken.Db (Update, Prepared, Repo, DbError, QueryFailed)
 import Read (users, User, UsersInsert)
 import SagaPgo (Connection, Postgres, Transaction, QueryError)
 
 # INSERT using the schema-generated insert type. Generated id via Db.auto.
 pub fun insert_user_query : Unit -> Prepared Unit
 insert_user_query () =
-  Dml.insert users (UsersInsert { id: Db.auto, name: "Carol", age: 31 })
+  Db.insert users (UsersInsert { id: Db.auto, name: "Carol", age: 31 })
 
 # Bulk INSERT: many rows in one statement (one round trip).
 pub fun insert_users_query : Unit -> Prepared Unit
 insert_users_query () =
-  Dml.insert_all users [
+  Db.insert_all users [
     UsersInsert { id: Db.auto, name: "Carol", age: 31 },
     UsersInsert { id: Db.auto, name: "Dave", age: 40 },
     UsersInsert { id: Db.auto, name: "Erin", age: 22 },
@@ -24,43 +20,43 @@ insert_users_query () =
 
 # Bulk INSERT ... RETURNING the generated ids of every inserted row.
 pub fun insert_users_returning_ids : Unit -> Prepared { id: Int }
-insert_users_returning_ids () =
-  Dml.insert_all_returning users [
-    UsersInsert { id: Db.auto, name: "Carol", age: 31 },
-    UsersInsert { id: Db.auto, name: "Dave", age: 40 },
-  ] (fun u -> { id: u.id })
+insert_users_returning_ids () = Db.insert_all_returning users [UsersInsert { id: Db.auto, name: "Carol", age: 31 }, UsersInsert { id: Db.auto, name: "Dave", age: 40 }] (fun u -> {
+  id: u.id,
+})
 
 # INSERT ... RETURNING the whole inserted row, decoded back into the domain type.
 pub fun insert_user_returning : Unit -> Prepared User
 insert_user_returning () = {
   let row = UsersInsert { id: Db.auto, name: "Carol", age: 31 }
-  Dml.insert_returning users row (fun u -> u)
+  Db.insert_returning users row (fun u -> u)
 }
 
 # INSERT ... RETURNING just the generated id (the common "get my new id" case).
 pub fun insert_user_returning_id : Unit -> Prepared { id: Int }
 insert_user_returning_id () = {
   let row = UsersInsert { id: Db.auto, name: "Carol", age: 31 }
-  Dml.insert_returning users row (fun u -> { id: u.id })
+  Db.insert_returning users row (fun u -> { id: u.id })
 }
 
 # UPDATE ... RETURNING the updated row.
 pub fun bump_age_returning : Unit -> Prepared User
-bump_age_returning () = Dml.update_returning users (fun u -> {
-  set! u.age 43
-  where_! (Db.eq u.id 1)
-}) (fun u -> u)
+bump_age_returning () =
+  Db.update_returning users (fun u -> {
+    set! u.age 43
+    where_! (Db.eq u.id 1)
+  }) (fun u -> u)
 
 # Run an INSERT ... RETURNING and decode the single row back.
-pub fun run_insert_returning : Connection -> Result (Maybe User) DbError needs {Repo}
-run_insert_returning conn = Query.one conn (insert_user_returning ())
+pub fun run_insert_returning : Connection -> Result (Maybe User) DbError
+  needs {Repo}
+run_insert_returning conn = Db.one conn (insert_user_returning ())
 
 # Upsert: insert, or on a primary-key collision overwrite name/age with the new
 # values. Provides the id so the conflict can actually fire.
 pub fun upsert_user_query : Unit -> Prepared Unit
 upsert_user_query () = {
   let row = UsersInsert { id: Db.provide 1, name: "Carol", age: 31 }
-  Dml.upsert users row (fun u -> [Db.ref u.id])
+  Db.upsert users row (fun u -> [Db.ref u.id])
 }
 
 # Upsert with a custom DO UPDATE SET: on id conflict, bump age by 1 (an expression
@@ -69,7 +65,10 @@ upsert_user_query () = {
 pub fun upsert_bump_query : Unit -> Prepared Unit
 upsert_bump_query () = {
   let row = UsersInsert { id: Db.provide 1, name: "Carol", age: 31 }
-  Dml.upsert_set users row (fun u -> Db.on_columns [Db.ref u.id]) (fun u -> [Db.assign u.age (Db.add u.age 1), Db.assign u.name (Db.excluded u.name)])
+  Db.upsert_set users row (fun u -> Db.on_columns [Db.ref u.id]) (fun u -> [
+    Db.assign u.age (Db.add u.age 1),
+    Db.assign u.name (Db.excluded u.name),
+  ])
 }
 
 # Same, but the conflict is detected by a named constraint (ON CONSTRAINT) rather
@@ -77,21 +76,23 @@ upsert_bump_query () = {
 pub fun upsert_on_constraint_query : Unit -> Prepared Unit
 upsert_on_constraint_query () = {
   let row = UsersInsert { id: Db.provide 1, name: "Carol", age: 31 }
-  Dml.upsert_set users row (fun _ -> Db.on_constraint "users_pkey") (fun u -> [Db.assign u.age (Db.excluded u.age)])
+  Db.upsert_set users row (fun _ -> Db.on_constraint "users_pkey") (fun u -> [
+    Db.assign u.age (Db.excluded u.age),
+  ])
 }
 
 # Insert-or-skip: do nothing if a row with this name already exists.
 pub fun insert_user_if_new_query : Unit -> Prepared Unit
 insert_user_if_new_query () = {
   let row = UsersInsert { id: Db.auto, name: "Carol", age: 31 }
-  Dml.insert_on_conflict_do_nothing users row (fun u -> [Db.ref u.name])
+  Db.insert_on_conflict_do_nothing users row (fun u -> [Db.ref u.name])
 }
 
 # Upsert and read back the resulting row (inserted or updated).
 pub fun upsert_user_returning : Unit -> Prepared User
 upsert_user_returning () = {
   let row = UsersInsert { id: Db.provide 1, name: "Carol", age: 31 }
-  Dml.upsert_returning users row (fun u -> [Db.ref u.id]) (fun u -> u)
+  Db.upsert_returning users row (fun u -> [Db.ref u.id]) (fun u -> u)
 }
 
 # Insert-if-new and read back the row (Nothing on conflict, since a skipped row
@@ -99,12 +100,15 @@ upsert_user_returning () = {
 pub fun insert_user_if_new_returning : Unit -> Prepared User
 insert_user_if_new_returning () = {
   let row = UsersInsert { id: Db.auto, name: "Carol", age: 31 }
-  Dml.insert_on_conflict_do_nothing_returning users row (fun u -> [Db.ref u.name]) (fun u -> u)
+  Db.insert_on_conflict_do_nothing_returning users row (fun u -> [
+    Db.ref u.name,
+  ]) (fun u -> u)
 }
 
 # Run an upsert-returning and decode the resulting row.
-pub fun run_upsert_returning : Connection -> Result (Maybe User) DbError needs {Repo}
-run_upsert_returning conn = Query.one conn (upsert_user_returning ())
+pub fun run_upsert_returning : Connection -> Result (Maybe User) DbError
+  needs {Repo}
+run_upsert_returning conn = Db.one conn (upsert_user_returning ())
 
 # Atomic multi-statement write: insert a user and bump another's age in one
 # transaction. Both commit together, or — if either op fails — both roll back.
@@ -113,11 +117,11 @@ run_upsert_returning conn = Query.one conn (upsert_user_returning ())
 # Postgres handler is pulled in at the boundary because `pg_transaction needs
 # {Postgres}` (wire `with {pg_transaction, pg, …}`).
 pub fun atomic_writes : Connection -> Result Int DbError needs {Transaction}
-atomic_writes conn = Query.transaction conn (fun () -> {
+atomic_writes conn = Db.transaction conn (fun () -> {
   let new_row = UsersInsert { id: Db.auto, name: "Dave", age: 40 }
-  case Dml.exec conn (Dml.insert users new_row) {
+  case Db.exec conn (Db.insert users new_row) {
     Err err -> Err err
-    Ok inserted -> case Dml.exec conn (bump_age_query ()) {
+    Ok inserted -> case Db.exec conn (bump_age_query ()) {
       Err err -> Err err
       Ok bumped -> Ok (inserted + bumped)
     }
@@ -126,13 +130,11 @@ atomic_writes conn = Query.transaction conn (fun () -> {
 
 # Rollback path: the INSERT itself succeeds, but the body returns Err, so the
 # transaction rolls back and the row never persists.
-pub fun rolled_back_write : Connection
-  -> QueryError
-  -> Result Unit DbError
+pub fun rolled_back_write : Connection -> QueryError -> Result Unit DbError
   needs {Transaction}
-rolled_back_write conn abort = Query.transaction conn (fun () -> {
+rolled_back_write conn abort = Db.transaction conn (fun () -> {
   let new_row = UsersInsert { id: Db.auto, name: "Ghost", age: 99 }
-  case Dml.exec conn (Dml.insert users new_row) {
+  case Db.exec conn (Db.insert users new_row) {
     Err err -> Err err
     Ok _ -> Err (QueryFailed abort)
   }
@@ -140,21 +142,21 @@ rolled_back_write conn abort = Query.transaction conn (fun () -> {
 
 # Surgical UPDATE: only the columns that change.
 pub fun bump_age_query : Unit -> Prepared Unit
-bump_age_query () = Dml.update users (fun u -> {
+bump_age_query () = Db.update users (fun u -> {
   set! u.age 43
   where_! (Db.eq u.id 1)
 })
 
 # Whole-entity save: read -> modify -> save, keyed by primary_key
 pub fun save_user_query : User -> Prepared Unit
-save_user_query user = Dml.update_all users user
+save_user_query user = Db.update_all users user
 
 # DELETE with a predicate.
 pub fun delete_user_query : Unit -> Prepared Unit
-delete_user_query () = Dml.delete users (fun u -> Db.eq u.id 999)
+delete_user_query () = Db.delete users (fun u -> Db.eq u.id 999)
 
 pub fun run_bump_age : Connection -> Result Int DbError needs {Repo}
-run_bump_age conn = Dml.exec conn (bump_age_query ())
+run_bump_age conn = Db.exec conn (bump_age_query ())
 
 pub fun run_delete_user : Connection -> Result Int DbError needs {Repo}
-run_delete_user conn = Dml.exec conn (delete_user_query ())
+run_delete_user conn = Db.exec conn (delete_user_query ())

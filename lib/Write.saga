@@ -1,8 +1,8 @@
-module Kraken.Db.Dml
+module Kraken.Write
 
 import Std.Generic (Generic)
 
-import Kraken.Db (
+import Kraken.Core (
   Table,
   Col,
   Expr,
@@ -17,7 +17,7 @@ import Kraken.Db (
   Projection,
   SelectItem,
   ColRef,
-  select,
+  project as project_selection,
   projection_selections,
   decode_projection,
   primary_key_columns,
@@ -37,7 +37,7 @@ import Kraken.Db (
   set_expr_column,
   set_expr_frag
 )
-import Kraken.Db.Query (Prepared, DbError, QueryFailed, Repo, noop_prepared, number_parts)
+import Kraken.Query (Prepared, DbError, QueryFailed, Repo, noop_prepared, number_parts)
 import SagaPgo (Connection)
 import SagaPgo.Types (Value)
 
@@ -128,7 +128,7 @@ returning_parts items = case items {
 }
 
 # Append `RETURNING <projection>` to a statement body and decode rows through the
-# projection, yielding a `Prepared row` runnable by `Query.all` / `Query.one`.
+# projection, yielding a `Prepared row` runnable by `Db.all` / `Db.one`.
 fun finish_returning : List SqlPart -> Projection a -> Prepared a
 finish_returning body projection = {
   let returning = returning_parts (projection_selections projection)
@@ -312,11 +312,11 @@ insert_all_parts_of table_value values = {
   let rows_pairs = List.map (fun v -> insert_pairs table_value v) values
   case rows_pairs {
     [] ->
-      panic "Dml.insert_all: empty row list (guard the call and insert nothing when the batch is empty)"
+      panic "Db.insert_all: empty row list (guard the call and insert nothing when the batch is empty)"
     first_pairs :: _ -> {
       let names = pair_names first_pairs
       if all_names_match names rows_pairs then ()
-      else panic "Dml.insert_all: rows set different columns (a generated column is Db.auto in some rows and Db.provide in others); a multi-row INSERT needs one shared column list — make the auto/provide choice consistent across the batch"
+      else panic "Db.insert_all: rows set different columns (a generated column is Db.auto in some rows and Db.provide in others); a multi-row INSERT needs one shared column list — make the auto/provide choice consistent across the batch"
       let row_values =
         fun pairs ->
           List.map (fun pair -> {
@@ -341,7 +341,7 @@ insert table_value value =
 
 #@ Like `insert`, but appends a `RETURNING` clause built from the projection
 #@ callback (the table's columns are passed in, exactly like `select`). The result
-#@ is a `Prepared row`; run it with `Query.one` (single insert) or `Query.all`.
+#@ is a `Prepared row`; run it with `Db.one` (single insert) or `Db.all`.
 pub fun insert_returning : Table cols
   -> ins
   -> (cols -> selection)
@@ -351,7 +351,7 @@ insert_returning table_value value project = {
   let body = insert_parts table_value (insert_pairs table_value value)
   let alias = table_name table_value
   let cols = table_cols alias table_value
-  let projection = select (project cols)
+  let projection = project_selection (project cols)
   finish_returning body projection
 }
 
@@ -361,7 +361,7 @@ insert_returning table_value value project = {
 #@ value order come from the synthesized insert record, exactly like `insert`.
 #@
 #@ An empty list is a no-op: there is no valid zero-row VALUES SQL, so this returns
-#@ a `noop` `Prepared` that `Dml.exec` short-circuits to `Ok 0` (and `Query.all` to
+#@ a `noop` `Prepared` that `Db.exec` short-circuits to `Ok 0` (and `Db.all` to
 #@ `Ok []`) without a database round trip — no call-site guard needed.
 #@
 #@ Note Postgres caps a statement at 65535 bind parameters, so a single call is
@@ -375,8 +375,8 @@ insert_all table_value values = case values {
 
 #@ Like `insert_all`, but appends a `RETURNING` clause built from the projection
 #@ callback (the table's columns, exactly like `select`). Yields a `Prepared row`
-#@ with one row per inserted row; run it with `Query.all`. An empty list is a no-op
-#@ that `Query.all` short-circuits to `Ok []` (no round trip).
+#@ with one row per inserted row; run it with `Db.all`. An empty list is a no-op
+#@ that `Db.all` short-circuits to `Ok []` (no round trip).
 pub fun insert_all_returning : Table cols
   -> List ins
   -> (cols -> selection)
@@ -388,7 +388,7 @@ insert_all_returning table_value values project = case values {
     let body = insert_all_parts_of table_value values
     let alias = table_name table_value
     let cols = table_cols alias table_value
-    let projection = select (project cols)
+    let projection = project_selection (project cols)
     finish_returning body projection
   }
 }
@@ -424,7 +424,7 @@ drop_names remove names = case names {
 fun conflict_update_parts : List String -> List String -> List SqlPart
 conflict_update_parts target_names set_names = case set_names {
   [] ->
-    panic "Dml.upsert: conflict target covers every inserted column; nothing to update (use insert_on_conflict_do_nothing)"
+    panic "Db.upsert: conflict target covers every inserted column; nothing to update (use insert_on_conflict_do_nothing)"
   _ -> {
     let target = conflict_target_parts target_names
     let head = List.append target [Text " DO UPDATE SET "]
@@ -494,7 +494,7 @@ upsert table_value value target = {
 }
 
 #@ Like `insert_on_conflict_do_nothing`, but appends a `RETURNING` clause. Note a
-#@ skipped (conflicting) row produces *no* returned row, so `Query.one` yields
+#@ skipped (conflicting) row produces *no* returned row, so `Db.one` yields
 #@ `Ok Nothing` on conflict.
 pub fun insert_on_conflict_do_nothing_returning : Table cols
   -> ins
@@ -508,11 +508,11 @@ insert_on_conflict_do_nothing_returning table_value value target project = {
   let target_names = List.map ref_name (target cols)
   let body =
     do_nothing_parts table_value (insert_pairs table_value value) target_names
-  finish_returning body (select (project cols))
+  finish_returning body (project_selection (project cols))
 }
 
 #@ Like `upsert`, but appends a `RETURNING` clause built from the projection
-#@ callback. Both the inserted and the updated row are returned, so `Query.one`
+#@ callback. Both the inserted and the updated row are returned, so `Db.one`
 #@ always yields the resulting row.
 pub fun upsert_returning : Table cols
   -> ins
@@ -526,7 +526,7 @@ upsert_returning table_value value target project = {
   let target_names = List.map ref_name (target cols)
   let body =
     upsert_parts table_value (insert_pairs table_value value) target_names
-  finish_returning body (select (project cols))
+  finish_returning body (project_selection (project cols))
 }
 
 # --- ON CONFLICT with a custom DO UPDATE SET (subsets / arbitrary expressions) ---
@@ -551,7 +551,7 @@ one_set_expr set = {
 # Comma-join the custom DO UPDATE SET assignments.
 fun set_expr_parts : List SetExpr -> List SqlPart
 set_expr_parts sets = case sets {
-  [] -> panic "Dml.upsert_set: no assignments (use insert_on_conflict_do_nothing for DO NOTHING)"
+  [] -> panic "Db.upsert_set: no assignments (use insert_on_conflict_do_nothing for DO NOTHING)"
   [set] -> one_set_expr set
   set :: rest -> {
     let head = List.append (one_set_expr set) [Text ", "]
@@ -594,7 +594,7 @@ upsert_set table_value value target set_fn = {
 }
 
 #@ Like `upsert_set`, but appends a `RETURNING` clause built from the projection
-#@ callback. Yields the resulting row (inserted or updated) via `Query.one`.
+#@ callback. Yields the resulting row (inserted or updated) via `Db.one`.
 pub fun upsert_set_returning : Table cols
   -> ins
   -> (cols -> ConflictTarget)
@@ -607,7 +607,7 @@ upsert_set_returning table_value value target set_fn project = {
   let cols = table_cols alias table_value
   let body =
     upsert_set_parts table_value (insert_pairs table_value value) (target cols) (set_fn cols)
-  finish_returning body (select (project cols))
+  finish_returning body (project_selection (project cols))
 }
 
 fun update_body : Table cols -> UpdateState -> List SqlPart
@@ -637,7 +637,7 @@ update table_value build = {
 }
 
 #@ Like `update`, but appends a `RETURNING` clause built from the projection
-#@ callback. Returns a `Prepared row`; run it with `Query.all` / `Query.one`.
+#@ callback. Returns a `Prepared row`; run it with `Db.all` / `Db.one`.
 pub fun update_returning : Table cols
   -> (cols -> Unit needs {Update})
   -> (cols -> selection)
@@ -645,7 +645,7 @@ pub fun update_returning : Table cols
   where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 update_returning table_value build project = {
   let (cols, state) = run_update table_value build
-  let projection = select (project cols)
+  let projection = project_selection (project cols)
   finish_returning (update_body table_value state) projection
 }
 
@@ -693,7 +693,7 @@ key_conditions pairs = case pairs {
 fun key_where_parts : List (String, Value) -> List SqlPart
 key_where_parts pairs = case pairs {
   [] ->
-    panic "Dml.update_all: table has no primary_key (declare one in its ColumnSet impl)"
+    panic "Db.update_all: table has no primary_key (declare one in its ColumnSet impl)"
   _ -> {
     let conds = key_conditions pairs
     List.append [Text " WHERE "] conds
@@ -737,7 +737,7 @@ delete table_value predicate = {
 }
 
 #@ Like `delete`, but appends a `RETURNING` clause built from the projection
-#@ callback. Returns a `Prepared row`; run it with `Query.all` / `Query.one`.
+#@ callback. Returns a `Prepared row`; run it with `Db.all` / `Db.one`.
 pub fun delete_returning : Table cols
   -> (cols -> Expr)
   -> (cols -> selection)
@@ -746,12 +746,12 @@ pub fun delete_returning : Table cols
 delete_returning table_value predicate project = {
   let alias = table_name table_value
   let cols = table_cols alias table_value
-  let projection = select (project cols)
+  let projection = project_selection (project cols)
   finish_returning (delete_body table_value (predicate cols)) projection
 }
 
 #@ Execute a non-returning DML statement and return the number of affected rows.
-#@ For statements with `RETURNING`, decode rows with `Query.all` / `Query.one`
+#@ For statements with `RETURNING`, decode rows with `Db.all` / `Db.one`
 #@ instead.
 pub fun exec : Connection -> Prepared a -> Result Int DbError needs {Repo}
 exec conn prepared = if prepared.noop then Ok 0

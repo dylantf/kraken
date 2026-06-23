@@ -1,7 +1,8 @@
-module Kraken.Db
+module Kraken.Core
 
 import Std.Base (Proxy, KnownSymbol)
 import Std.DateTime (Date, Time, NaiveDateTime)
+import Std.Dict as Dicts
 import Std.Dynamic (
   Dynamic,
   DecodeError,
@@ -17,7 +18,6 @@ import Std.Dynamic (
   from_erlang
 )
 import Std.Generic (Generic, Leaf, Labeled, And, Record)
-import Std.Dict as Dicts
 import SagaJson as Json
 import SagaJson.Codec as JsonCodec (ToJson, FromJson)
 import SagaPgo (Connection, Postgres, QueryError, Returned)
@@ -162,7 +162,8 @@ decode_via from_rep = Decoder (fun data -> case decode decode_pg data {
 fun lookup_label : List (a, String) -> a -> Maybe String where {a: Eq}
 lookup_label mapping value = case mapping {
   [] -> Nothing
-  (v, label) :: rest -> if v == value then Just label else lookup_label rest value
+  (v, label) :: rest ->
+    if v == value then Just label else lookup_label rest value
 }
 
 fun lookup_value : List (a, String) -> String -> Maybe a
@@ -282,7 +283,7 @@ opaque type Table cols =
 pub trait ColumnSet cols {
   #@ Build the column record for a given table alias (maps fields to SQL names).
   fun columns : String -> cols
-  #@ The table's primary key, used by `Dml.update_all` to build its `WHERE`.
+  #@ The table's primary key, used by `Db.update_all` to build its `WHERE`.
   #@ Defaults to `NoKey`; override it for tables you save whole entities into.
   fun primary_key : cols -> PrimaryKey
   primary_key _cols = NoKey
@@ -383,7 +384,7 @@ impl InsertField a for Col a {}
 impl InsertField (Writable a) for Generated a {}
 
 #@ Links a table's column record to its generated insert-shape type. Emitted by
-#@ `deriving (Db.Insertable <Name>)` on the column record; consumed by `Dml.insert`
+#@ `deriving (Db.Insertable <Name>)` on the column record; consumed by `Db.insert`
 #@ to fix the accepted input type from the table (`cols` determines `ins`). The
 #@ `synthesizes` clause tells the compiler to create the insert record by mapping
 #@ each column field through `InsertField` and to attach `deriving (InsertRow)` so
@@ -487,7 +488,8 @@ opaque type SetExpr = SetExpr SetExprDef
 #@ u.count))` → `count = users.count + EXCLUDED.count`. Listing only the columns you
 #@ want also gives a partial DO UPDATE (a subset, not the blanket overwrite).
 pub fun assign : Col a -> rhs -> SetExpr where {rhs: ToSql a}
-assign column rhs = SetExpr (SetExprDef { column: col_name column, frag: frag_of rhs })
+assign column rhs =
+  SetExpr (SetExprDef { column: col_name column, frag: frag_of rhs })
 
 pub fun set_expr_column : SetExpr -> String
 set_expr_column set = case set {
@@ -636,10 +638,8 @@ record PreloadedDef out {
 pub fun make_preloaded : SelectItem
   -> (RelData -> Int -> Dynamic -> Result (out, List RelSlot) DecodeError)
   -> Preloaded out
-make_preloaded key_item resolve = Preloaded (PreloadedDef {
-  key_item: key_item,
-  resolve: resolve,
-})
+make_preloaded key_item resolve =
+  Preloaded (PreloadedDef { key_item: key_item, resolve: resolve })
 
 pub trait Selectable selection row | selection -> row {
   fun to_projection : selection -> Projection row
@@ -662,10 +662,6 @@ pub fun project : selection -> Projection row
 project selection =
   to_projection (to selection)
   |> map from
-
-pub fun select : selection -> Projection row
-  where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
-select selection = project selection
 
 #@ The `SelectItem`s a selection renders to, without committing to the decoded row
 #@ type. Used to render a subquery's `SELECT` list (a derived table decodes through
@@ -1089,10 +1085,11 @@ eq_col left right = eq_sql left right
 #@ Comparisons between two SQL values (columns, expressions, scalar subqueries)
 #@ rather than against a literal. The `eq` family compares against a literal RHS;
 #@ these compare two `ToSql` operands of the same element type — e.g.
-#@ `Db.gt_sql u.age (Query.scalar_subquery …)`.
+#@ `Db.gt_sql u.age (Db.scalar_subquery …)`.
 pub fun not_eq_sql : left -> right -> Expr
   where {left: ToSql a, right: ToSql a, a: PgType}
-not_eq_sql left right = make_expr (spaced (value_frag left) "<>" (value_frag right))
+not_eq_sql left right =
+  make_expr (spaced (value_frag left) "<>" (value_frag right))
 
 pub fun gt_sql : left -> right -> Expr
   where {left: ToSql a, right: ToSql a, a: PgType}
@@ -1100,7 +1097,8 @@ gt_sql left right = make_expr (spaced (value_frag left) ">" (value_frag right))
 
 pub fun gte_sql : left -> right -> Expr
   where {left: ToSql a, right: ToSql a, a: PgType}
-gte_sql left right = make_expr (spaced (value_frag left) ">=" (value_frag right))
+gte_sql left right =
+  make_expr (spaced (value_frag left) ">=" (value_frag right))
 
 pub fun lt_sql : left -> right -> Expr
   where {left: ToSql a, right: ToSql a, a: PgType}
@@ -1108,7 +1106,8 @@ lt_sql left right = make_expr (spaced (value_frag left) "<" (value_frag right))
 
 pub fun lte_sql : left -> right -> Expr
   where {left: ToSql a, right: ToSql a, a: PgType}
-lte_sql left right = make_expr (spaced (value_frag left) "<=" (value_frag right))
+lte_sql left right =
+  make_expr (spaced (value_frag left) "<=" (value_frag right))
 
 fun true_expr : Unit -> Expr
 true_expr () = make_expr (raw_frag "TRUE")
@@ -1288,17 +1287,20 @@ fun lift_decode : (Int -> Dynamic -> Result a DecodeError)
   -> Int
   -> Dynamic
   -> Result (a, List RelSlot) DecodeError
-lift_decode decoder = fun _data offset row -> case decoder offset row {
-  Err err -> Err err
-  Ok value -> Ok (value, [])
-}
+lift_decode decoder =
+  fun _data offset row ->
+    case decoder offset row {
+      Err err -> Err err
+      Ok value -> Ok (value, [])
+    }
 
 fun field_def_projection : FieldDef a -> Projection a
 field_def_projection def =
   Projection (ProjectionDef {
     selections: [def.selection],
     width: 1,
-    decode_at: lift_decode (fun offset row -> decode_element offset def.decoder row),
+    decode_at: lift_decode (fun offset row ->
+      decode_element offset def.decoder row),
   })
 
 fun field_projection : Col a -> Projection a where {a: PgType}
@@ -1350,7 +1352,8 @@ relabel_items alias items = List.map (relabel_item alias) items
 
 fun prefix_item : String -> SelectItem -> SelectItem
 prefix_item prefix item =
-  if item.relabelable then { item | alias: prefix <> "_" <> item.alias } else item
+  if item.relabelable then { item | alias: prefix <> "_" <> item.alias }
+  else item
 
 fun prefix_items : String -> List SelectItem -> List SelectItem
 prefix_items prefix items = List.map (prefix_item prefix) items
@@ -1672,7 +1675,7 @@ impl EncodeLeaf for Leaf a where {a: InsertCol} {
 #@ Encode a whole record to an ordered list of `(column_name, parameter)` pairs.
 #@ Column names are taken from the record's field labels, in declaration order.
 #@ This is the write-direction counterpart of `Selectable`: derive it on a domain
-#@ record (`deriving (Db.InsertRow)`) and `Dml.insert` uses it to build the column
+#@ record (`deriving (Db.InsertRow)`) and `Db.insert` uses it to build the column
 #@ list and bound values.
 pub trait InsertRow a {
   fun insert_row : a -> List (String, Value)
@@ -1899,7 +1902,8 @@ window_clause win = case win {
       ([], []) -> raw_frag ""
       (ps, []) -> partition_clause ps
       ([], os) -> order_clause os
-      (ps, os) -> append_frags [partition_clause ps, raw_frag " ", order_clause os]
+      (ps, os) ->
+        append_frags [partition_clause ps, raw_frag " ", order_clause os]
     }
     append_frags [raw_frag " OVER (", inner, raw_frag ")"]
   }
@@ -1923,7 +1927,8 @@ over sql_value win =
 
 #@ `ROW_NUMBER() OVER (<window>)` — sequential row number within each partition.
 pub fun row_number : Window -> Sql Int
-row_number win = make_sql (append_frag (raw_frag "ROW_NUMBER()") (window_clause win))
+row_number win =
+  make_sql (append_frag (raw_frag "ROW_NUMBER()") (window_clause win))
 
 #@ `RANK() OVER (<window>)` — rank with gaps after ties.
 pub fun rank : Window -> Sql Int
@@ -1931,7 +1936,8 @@ rank win = make_sql (append_frag (raw_frag "RANK()") (window_clause win))
 
 #@ `DENSE_RANK() OVER (<window>)` — rank without gaps after ties.
 pub fun dense_rank : Window -> Sql Int
-dense_rank win = make_sql (append_frag (raw_frag "DENSE_RANK()") (window_clause win))
+dense_rank win =
+  make_sql (append_frag (raw_frag "DENSE_RANK()") (window_clause win))
 
 #@ `LAG(<input>) OVER (<window>)` — the value from the previous row in the window
 #@ (NULL on the first row, hence `Maybe a`).
@@ -1946,7 +1952,8 @@ lag input win =
 
 #@ `LEAD(<input>) OVER (<window>)` — the value from the next row in the window
 #@ (NULL on the last row, hence `Maybe a`).
-pub fun lead : input -> Window -> Sql (Maybe a) where {input: ToSql a, a: PgType}
+pub fun lead : input -> Window -> Sql (Maybe a)
+  where {input: ToSql a, a: PgType}
 lead input win =
   make_sql (append_frags [
     raw_frag "LEAD(",
