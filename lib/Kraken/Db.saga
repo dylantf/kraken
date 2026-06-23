@@ -130,6 +130,77 @@ impl PgType for Maybe a where {a: PgType} {
   decode_pg = optional decode_pg
 }
 
+# --- Codecs: deriving a column type from an existing one ----------------------
+#
+# `PgType` *is* the codec — a bidirectional mapping between a Saga value and a
+# Postgres wire value. `Jsonb a` / `Array a` above are already codecs built on
+# other codecs (`Jsonb` maps through `String` via JSON). These two combinators
+# expose that pattern so you can give any Saga type a `PgType` by mapping it
+# through a *representation type* that already has one — without touching the
+# `Value` / `Decoder` plumbing by hand. The mapping attaches to the *type*, so a
+# distinct mapping (e.g. two `String`-backed columns with different label
+# conventions) means a distinct Saga type — the newtype discipline, on purpose.
+
+#@ Encode `a` by mapping it to a representation `b` that already has `PgType`.
+#@ The forward direction is total: `encode_via to_rep`.
+pub fun encode_via : (a -> b) -> a -> Value where {b: PgType}
+encode_via to_rep value = encode_pg (to_rep value)
+
+#@ Decode `a` from a representation `b` that has `PgType`, via a *fallible*
+#@ back-mapping — a stored value may not correspond to any `a` (an unknown enum
+#@ label, an unparseable number), so `from_rep` returns `Result a String` and the
+#@ `Err` message surfaces as a decode failure.
+pub fun decode_via : (b -> Result a String) -> Decoder a where {b: PgType}
+decode_via from_rep = Decoder (fun data -> case decode decode_pg data {
+  Err err -> Err err
+  Ok rep -> case from_rep rep {
+    Ok value -> Ok value
+    Err message -> Err (DecodeError message "" [])
+  }
+})
+
+fun lookup_label : List (a, String) -> a -> Maybe String where {a: Eq}
+lookup_label mapping value = case mapping {
+  [] -> Nothing
+  (v, label) :: rest -> if v == value then Just label else lookup_label rest value
+}
+
+fun lookup_value : List (a, String) -> String -> Maybe a
+lookup_value mapping label = case mapping {
+  [] -> Nothing
+  (v, l) :: rest -> if l == label then Just v else lookup_value rest label
+}
+
+#@ Encode an enum-like type as text via an explicit value→label table, e.g. for a
+#@ Postgres `enum` column (or a text column with fixed values). The table is the
+#@ single source of truth for the wire labels — which can differ freely from the
+#@ Saga constructor names (`SCREAMING_SNAKE` ↔ friendly). Pair with
+#@ `enum_text_decode` over the same table in a tiny `impl PgType`:
+#@
+#@     type Status = Active | Archived deriving (Eq)
+#@     status_labels = [(Active, "ACTIVE"), (Archived, "ARCHIVED")]
+#@     impl PgType for Status {
+#@       encode_pg = enum_text_encode status_labels
+#@       decode_pg = enum_text_decode status_labels
+#@     }
+#@
+#@ Panics if `value` is missing from the table (an incomplete mapping is a
+#@ programmer error, not a data error).
+pub fun enum_text_encode : List (a, String) -> a -> Value where {a: Eq}
+enum_text_encode mapping value = case lookup_label mapping value {
+  Just label -> T.pg_text label
+  Nothing -> panic "Db.enum_text_encode: value not present in enum mapping"
+}
+
+#@ Decode an enum-like type from text via an explicit value→label table (the
+#@ inverse of `enum_text_encode`). An unrecognized label fails the decode rather
+#@ than guessing.
+pub fun enum_text_decode : List (a, String) -> Decoder a
+enum_text_decode mapping = decode_via (fun label -> case lookup_value mapping label {
+  Just value -> Ok value
+  Nothing -> Err ("Db.enum_text_decode: unknown enum label: " <> label)
+})
+
 #@ A phantom carrier for a (`Star`-kinded) type, so a cast can name its target type
 #@ without having a value of it. (`Std.Base.Proxy` is `Symbol`-kinded only.)
 pub type TypeTag a = TypeTag

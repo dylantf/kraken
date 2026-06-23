@@ -72,7 +72,71 @@ users = Db.table "users"
 pub fun posts : Db.Table Posts
 posts = Db.table "posts"
 
+# Custom column type via a codec ------------------------------------------------
+#
+# A Postgres `enum` column surfaced as a Saga sum type. The codec lives entirely
+# in the `PgType` impl — no new derive, no query-site annotation. The label table
+# is the single source of truth and lets the wire labels differ from the Saga
+# constructor names. Once `AccountStatus` has `PgType`, it flows through
+# `select`/`where_!`/`insert` like any built-in scalar.
+
+pub type AccountStatus =
+  | Active
+  | Suspended
+  | Closed
+  deriving (Eq)
+
+fun account_status_labels : List (AccountStatus, String)
+account_status_labels = [
+  (Active, "ACTIVE"),
+  (Suspended, "SUSPENDED"),
+  (Closed, "CLOSED"),
+]
+
+impl Db.PgType for AccountStatus {
+  encode_pg value = Db.enum_text_encode account_status_labels value
+  decode_pg = Db.enum_text_decode account_status_labels
+}
+
+# Optional: name the SQL type so `Db.cast`/future DDL can reference `::account_status`.
+impl Db.PgTypeName for AccountStatus {
+  pg_type_name _ = "account_status"
+}
+
+pub record Account {
+  id: Int,
+  email: String,
+  status: AccountStatus,
+}
+
+pub record Accounts {
+  id: Db.Generated Int,
+  email: Db.Col String,
+  status: Db.Col AccountStatus,
+} deriving (Db.Selectable Account)
+
+impl Db.ColumnSet for Accounts {
+  columns source = Accounts {
+    id: Db.generated "id" source,
+    email: Db.col "email" source,
+    status: Db.col "status" source,
+  }
+}
+
+pub fun accounts : Db.Table Accounts
+accounts = Db.table "accounts"
+
 # Queries
+
+# Codec round-trip: `Db.eq a.status Active` *encodes* the enum into a bound param,
+# and `select (a)` *decodes* the `status` column back into `AccountStatus`.
+pub fun active_accounts_query : Unit -> Query.Prepared Account
+active_accounts_query () = Query.query (fun () -> {
+  let a = from! accounts
+  where_! (Db.eq a.status Active)
+  order_by! [Db.asc a.id]
+  select (a)
+})
 
 # Plain scalars from a non-null scope: bare dotting, inferred non-null
 pub fun users_query : Unit -> Query.Prepared { id: Int, name: String, age: Int }
