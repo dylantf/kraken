@@ -670,9 +670,6 @@ pub fun selection_items : selection -> List SelectItem
   where {selection: Generic selection_rep, selection_rep: Selectable row_rep}
 selection_items selection = projection_selections (to_projection (to selection))
 
-pub fun into : (row -> out) -> Projection row -> Projection out
-into transform projection = map transform projection
-
 pub fun map : (a -> b) -> Projection a -> Projection b
 map transform projection = {
   let Projection def = projection
@@ -1620,8 +1617,8 @@ derived_columns selection alias = from (build_scope (to selection) alias)
 #@ (a generated column) omits on `Auto` and binds on `Provide`.
 #@
 #@ Instances are keyed per column-type head (no blanket over `PgType`, since Saga
-#@ forbids overlapping/bare-variable instance heads — a blanket would clash with
-#@ the `Writable` instance). A column type not listed here is not insertable.
+#@ requires impl targets to be named or tuple types). A column type not listed here
+#@ is not insertable unless the user adds its own `InsertCol` impl.
 pub trait InsertCol a {
   fun insert_col : a -> Maybe Value
 }
@@ -1639,6 +1636,15 @@ impl InsertCol for Bool {
   insert_col v = Just (encode_value v)
 }
 impl InsertCol for T.Uuid {
+  insert_col v = Just (encode_value v)
+}
+impl InsertCol for Date {
+  insert_col v = Just (encode_value v)
+}
+impl InsertCol for NaiveDateTime {
+  insert_col v = Just (encode_value v)
+}
+impl InsertCol for Time {
   insert_col v = Just (encode_value v)
 }
 

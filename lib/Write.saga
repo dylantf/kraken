@@ -351,7 +351,7 @@ insert_returning table_value value project = {
   let body = insert_parts table_value (insert_pairs table_value value)
   let alias = table_name table_value
   let cols = table_cols alias table_value
-  let projection = project_selection (project cols)
+  let projection: Projection row = project_selection (project cols)
   finish_returning body projection
 }
 
@@ -388,7 +388,7 @@ insert_all_returning table_value values project = case values {
     let body = insert_all_parts_of table_value values
     let alias = table_name table_value
     let cols = table_cols alias table_value
-    let projection = project_selection (project cols)
+    let projection: Projection row = project_selection (project cols)
     finish_returning body projection
   }
 }
@@ -508,7 +508,8 @@ insert_on_conflict_do_nothing_returning table_value value target project = {
   let target_names = List.map ref_name (target cols)
   let body =
     do_nothing_parts table_value (insert_pairs table_value value) target_names
-  finish_returning body (project_selection (project cols))
+  let projection: Projection row = project_selection (project cols)
+  finish_returning body projection
 }
 
 #@ Like `upsert`, but appends a `RETURNING` clause built from the projection
@@ -526,7 +527,8 @@ upsert_returning table_value value target project = {
   let target_names = List.map ref_name (target cols)
   let body =
     upsert_parts table_value (insert_pairs table_value value) target_names
-  finish_returning body (project_selection (project cols))
+  let projection: Projection row = project_selection (project cols)
+  finish_returning body projection
 }
 
 # --- ON CONFLICT with a custom DO UPDATE SET (subsets / arbitrary expressions) ---
@@ -607,7 +609,8 @@ upsert_set_returning table_value value target set_fn project = {
   let cols = table_cols alias table_value
   let body =
     upsert_set_parts table_value (insert_pairs table_value value) (target cols) (set_fn cols)
-  finish_returning body (project_selection (project cols))
+  let projection: Projection row = project_selection (project cols)
+  finish_returning body projection
 }
 
 fun update_body : Table cols -> UpdateState -> List SqlPart
@@ -645,7 +648,7 @@ pub fun update_returning : Table cols
   where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 update_returning table_value build project = {
   let (cols, state) = run_update table_value build
-  let projection = project_selection (project cols)
+  let projection: Projection row = project_selection (project cols)
   finish_returning (update_body table_value state) projection
 }
 
@@ -746,14 +749,14 @@ pub fun delete_returning : Table cols
 delete_returning table_value predicate project = {
   let alias = table_name table_value
   let cols = table_cols alias table_value
-  let projection = project_selection (project cols)
+  let projection: Projection row = project_selection (project cols)
   finish_returning (delete_body table_value (predicate cols)) projection
 }
 
 #@ Execute a non-returning DML statement and return the number of affected rows.
 #@ For statements with `RETURNING`, decode rows with `Db.all` / `Db.one`
 #@ instead.
-pub fun exec : Connection -> Prepared a -> Result Int DbError needs {Repo}
+pub fun exec : Connection -> Prepared Unit -> Result Int DbError needs {Repo}
 exec conn prepared = if prepared.noop then Ok 0
   else case execute! conn prepared {
     Ok returned -> Ok returned.count

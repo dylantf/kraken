@@ -162,7 +162,18 @@ Users write `a.email`; SQL renders `t0.email_address`.
 
 ## Custom PostgreSQL types
 
-Implement `Db.PgType` to encode and decode custom scalar types.
+Implement `Db.PgType` for custom scalar column types such as Postgres enums,
+domain types, or application newtypes.
+
+`PgType` is the database codec for a Saga type:
+
+- `encode_pg` is used when the value becomes a bound parameter: `where_!`,
+  `insert`, `update`, `upsert`, raw `Db.value`, and so on.
+- `decode_pg` is used when the value comes back from a selected column or SQL
+  expression.
+
+For enum-like types stored as text labels, use `Db.enum_text_encode` and
+`Db.enum_text_decode`:
 
 ```saga
 type AccountStatus =
@@ -184,6 +195,87 @@ impl Db.PgType for AccountStatus {
 }
 ```
 
+If you want the compiler to check that encoding covers every constructor, write
+the encode side as a normal exhaustive `case` and then encode the resulting
+`String` with `Db.encode_value`:
+
+```saga
+impl Db.PgType for AccountStatus {
+  encode_pg value = Db.encode_value (case value {
+    Active -> "ACTIVE"
+    Suspended -> "SUSPENDED"
+    Closed -> "CLOSED"
+  })
+
+  decode_pg = Db.decode_via (fun label -> case label {
+    "ACTIVE" -> Ok Active
+    "SUSPENDED" -> Ok Suspended
+    "CLOSED" -> Ok Closed
+    other -> Err ("unknown account status: " <> other)
+  })
+}
+```
+
+`encode_pg` returns a Postgres `Value`, not the intermediate string, so returning
+`"ACTIVE"` directly is a type error. `decode_pg` is a decoder value, not a direct
+method that receives the raw text; `Db.decode_via` runs the built-in `String`
+decoder first and then applies your conversion function. The decode side must
+still handle unknown strings because the database can contain values your Saga
+type does not recognize.
+
+Then use the type directly in your domain record and column record:
+
+```saga
+record Account {
+  id: Int,
+  email: String,
+  status: AccountStatus,
+}
+
+record Accounts {
+  id: Db.Generated Int,
+  email: Db.Col String,
+  status: Db.Col AccountStatus,
+} deriving (Core.Selectable Account)
+```
+
+The `ColumnSet` maps `status` to the actual SQL column:
+
+```saga
+impl Core.ColumnSet for Accounts {
+  columns source = Accounts {
+    id: Db.generated "id" source,
+    email: Db.col "email" source,
+    status: Db.col "status" source,
+  }
+}
+```
+
+After that, the custom type behaves like a built-in:
+
+```saga
+where_! (Db.eq a.status Active)
+select a
+```
+
+This comparison encodes `Active` with `encode_pg`. Selecting `a` decodes the
+`status` column with `decode_pg`.
+
+If you have a custom wrapper that encodes through an existing `PgType`, use
+`Db.encode_via` and `Db.decode_via`:
+
+```saga
+type UserId =
+  | UserId Int
+
+impl Db.PgType for UserId {
+  encode_pg = Db.encode_via (fun value -> case value {
+    UserId id -> id
+  })
+  decode_pg = Db.decode_via (fun id -> Ok (UserId id))
+}
+```
+
 If you want to cast to the database type, also implement `PgTypeName`:
 
 ```saga
@@ -192,11 +284,12 @@ impl Db.PgTypeName for AccountStatus {
 }
 ```
 
-Then the type works like a built-in:
+`PgTypeName` is only needed when Kraken has to render a cast, such as
+`Db.cast`, `Db.lit`, or one of the `Db.as_*` helpers. Normal selects,
+comparisons, inserts, and updates only need `PgType`.
 
 ```saga
-where_! (Db.eq a.status Active)
-select a
+Db.cast a.status : Db.Sql AccountStatus
 ```
 
 ## Arrays and JSONB
