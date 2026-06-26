@@ -204,7 +204,7 @@ Use a named constraint:
 Wrap several operations in `Db.transaction`:
 
 ```saga
-pub fun atomic_writes : Connection -> Result Int Db.DbError needs {Transaction}
+pub fun atomic_writes : Connection -> Result Int (Db.TransactionError Db.DbError) needs {Transaction}
 atomic_writes conn = Db.transaction conn (fun () -> {
   let new_row = UsersInsert { id: Db.auto, name: "Dave", age: 40 }
   case Db.exec conn (Db.insert users new_row) {
@@ -218,7 +218,21 @@ atomic_writes conn = Db.transaction conn (fun () -> {
 ```
 
 The transaction commits when the body returns `Ok` and rolls back when the body
-returns `Err`.
+returns `Err`. Body errors are returned as `RolledBack err`; failures before the
+body starts, such as failing to begin the transaction, are returned as
+`TransactionFailed query_error`.
+
+`Db.transaction` is generic in the error type. Import `Rollback` when you want
+an early non-resuming rollback:
+
+```saga
+import Kraken.Db (Rollback, Transaction)
+
+Db.transaction conn (fun () -> {
+  if invalid then rollback! (Validation "bad data")
+  else Ok ()
+})
+```
 
 At the application boundary, provide `pg_transaction` and `pg`:
 

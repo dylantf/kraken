@@ -1223,9 +1223,9 @@ Final shape:
 
 ```saga
 pub fun transaction : Connection
-  -> (Unit -> Result a DbError needs {Repo})
-  -> Result a DbError
-  needs {Postgres, Transaction}
+  -> (Unit -> Result a e needs {Repo, Rollback e})
+  -> Result a (TransactionError e)
+  needs {Transaction}
 
 Query.transaction conn (fun () -> {
   case Db.exec conn (Db.insert users new_row) {
@@ -1244,11 +1244,11 @@ Resolved design decisions:
   helpers) and those calls auto-join the transaction. The boundary therefore needs
   `{Postgres, Transaction}` (wire `with {pg_transaction, pg, ...}` — dependent
   handler first), not `Repo`.
-- **Error-channel impedance.** saga_pgo's callback rolls back via a
-  `QueryError`-typed `Err`, but Kraken bodies fail with `DbError`. A `QueryFailed`
-  round-trips losslessly; a `DecodeFailed` (a row returned but undecodable) rolls
-  back with its message preserved (mapped onto `UnexpectedResultType`). This is the
-  one lossy corner and it's documented.
+- **Transaction error shape.** saga_pgo returns `TransactionError e`:
+  `TransactionFailed QueryError` for failures before the body starts, and
+  `RolledBack e` for body errors or explicit `rollback! e`. Kraken can therefore
+  preserve `DbError` or an application error without a begin-error mapper at the
+  call site.
 - **Continuation caveat (inherited from saga_pgo):** don't let a continuation
   captured inside the body escape and run later — its re-invocation happens after
   commit/rollback, outside the transaction.

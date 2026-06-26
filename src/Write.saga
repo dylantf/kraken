@@ -1,6 +1,6 @@
 module Write
 
-import Kraken.Db (Update, Prepared, Repo, DbError, QueryFailed)
+import Kraken.Db (Update, Prepared, Repo, DbError, QueryFailed, TransactionError)
 import Read (users, User, UsersInsert)
 import SagaPgo (Connection, Postgres, Transaction, QueryError)
 
@@ -116,7 +116,7 @@ run_upsert_returning conn = Db.one conn (upsert_user_returning ())
 # {Transaction}; the body's Repo capability is provided by `transaction`, and the
 # Postgres handler is pulled in at the boundary because `pg_transaction needs
 # {Postgres}` (wire `with {pg_transaction, pg, …}`).
-pub fun atomic_writes : Connection -> Result Int DbError needs {Transaction}
+pub fun atomic_writes : Connection -> Result Int (TransactionError DbError) needs {Transaction}
 atomic_writes conn = Db.transaction conn (fun () -> {
   let new_row = UsersInsert { id: Db.auto, name: "Dave", age: 40 }
   case Db.exec conn (Db.insert users new_row) {
@@ -130,7 +130,7 @@ atomic_writes conn = Db.transaction conn (fun () -> {
 
 # Rollback path: the INSERT itself succeeds, but the body returns Err, so the
 # transaction rolls back and the row never persists.
-pub fun rolled_back_write : Connection -> QueryError -> Result Unit DbError
+pub fun rolled_back_write : Connection -> QueryError -> Result Unit (TransactionError DbError)
   needs {Transaction}
 rolled_back_write conn abort = Db.transaction conn (fun () -> {
   let new_row = UsersInsert { id: Db.auto, name: "Ghost", age: 99 }

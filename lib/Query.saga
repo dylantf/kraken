@@ -32,8 +32,9 @@ import SagaPgo (
   Connection,
   Postgres,
   Transaction,
+  Rollback,
+  TransactionError,
   QueryError,
-  UnexpectedResultType,
   Returned
 )
 import SagaPgo as Pgo
@@ -1445,44 +1446,19 @@ load_rel_entries conn specs rows slots = case specs {
   }
 }
 
-#@ How a failed transaction body's `DbError` is carried across saga_pgo's
-#@ `QueryError`-typed rollback channel. A `QueryFailed` round-trips losslessly; a
-#@ `DecodeFailed` (a row that came back but did not match the expected shape) is
-#@ surfaced with its message preserved.
-fun rollback_error : DbError -> QueryError
-rollback_error err = case err {
-  QueryFailed query_error -> query_error
-  DecodeFailed decode_error -> UnexpectedResultType (show decode_error)
-  ExpectedOneRow count -> UnexpectedResultType ("expected exactly one row, got " <> show count)
-}
-
 #@ Run `body` inside a database transaction. Every Kraken operation the body
-#@ performs against `conn` (via `all`/`one`/`exec`/the DML helpers) automatically
-#@ joins the transaction. The transaction commits if `body` returns `Ok` and rolls
-#@ back if it returns `Err`, propagating that result to the caller.
+#@ performs against `conn` automatically joins the transaction. The transaction
+#@ commits if `body` returns `Ok` and rolls back if it returns `Err`.
 #@
-#@ The body's `Repo` capability is provided internally (over the ambient
-#@ `Postgres`), so only `Postgres` + `Transaction` need handlers at the call
-#@ boundary — wire them with `... with {pg_transaction, pg}`.
-#@
-#@ Caveat (from saga_pgo): don't let a continuation captured inside `body` escape
-#@ and run later — its re-invocation happens after commit/rollback, outside the
-#@ transaction.
+#@ Body errors are returned as `RolledBack e`; failures before the body starts
+#@ are returned as `TransactionFailed QueryError`. `rollback! e` is available
+#@ inside the body for an early non-resuming rollback.
 pub fun transaction : Connection
-  -> (Unit -> Result a DbError needs {Repo})
-  -> Result a DbError
+  -> (Unit -> Result a e needs {Repo, Rollback e})
+  -> Result a (TransactionError e)
   needs {Transaction}
-transaction conn body = {
-  let outcome = Pgo.transaction conn (fun () ->
-    case body () with pg_repo {
-      Ok value -> Ok value
-      Err err -> Err (rollback_error err)
-    })
-  case outcome {
-    Ok value -> Ok value
-    Err query_error -> Err (QueryFailed query_error)
-  }
-}
+transaction conn body =
+  Pgo.transaction conn (fun () -> body () with pg_repo)
 
 # Decode every row with the given relation data (the second pass when relations are
 # present, or the only pass with `empty_rel_data` when there are none). The relation

@@ -120,8 +120,10 @@ Kraken uses Saga's algebraic effects:
   `Query.transaction conn body` wraps `SagaPgo.transaction`: it provides `pg_repo`
   *inside* the body (so the body uses the full `Repo` API — `all`/`one`/`exec`/the
   DML helpers — and they auto-join the tx via pgo's process dictionary), commits on
-  `Ok`, rolls back on `Err`. So a transaction needs `{Postgres, Transaction}` at the
-  boundary (wire `with {pg_transaction, pg, ...}`), not `Repo`.
+  `Ok`, rolls back on `Err`, and returns body failures as `RolledBack e` while begin
+  failures are `TransactionFailed QueryError`. So a transaction needs
+  `{Postgres, Transaction}` at the boundary (wire `with {pg_transaction, pg, ...}`),
+  not `Repo`.
 
 ### Schema declaration pattern
 
@@ -187,12 +189,10 @@ named type-safely via `Db.ref`; both have `*_returning` variants that append
 `RETURNING` and decode through the projection. Schema columns the DB fills are marked
 `Db.Generated a` (reads like a column, unsettable via `set!`). **Transactions**
 (Tier 8) are done: `Query.transaction conn body` runs a `body :
-Unit -> Result a DbError needs {Repo}` atomically — committing on `Ok`, rolling
-back on `Err` — as a thin wrapper over `SagaPgo.transaction` (no direct Erlang
-bridging). The body uses the ordinary Kraken `Repo` API; the only impedance is the
-error channel — saga_pgo's rollback path is `QueryError`-typed, so a `QueryFailed`
-round-trips losslessly while a `DecodeFailed` (a row that came back but didn't
-decode) rolls back with its message preserved. The roadmap's remaining items are
+Unit -> Result a e needs {Repo, Rollback e}` atomically — committing on `Ok`,
+rolling back on `Err`, and returning `Result a (TransactionError e)` — as a thin
+wrapper over `SagaPgo.transaction` (no direct Erlang bridging). The body uses the
+ordinary Kraken `Repo` API. The roadmap's remaining items are
 smaller (DO UPDATE column subsets / arbitrary expressions like
 `count = users.count + 1`, `ON CONSTRAINT` conflict targets). When extending SQL
 coverage, prefer growing the typed `Sql a` expression model over adding one-off

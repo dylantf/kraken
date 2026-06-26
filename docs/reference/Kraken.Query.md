@@ -458,19 +458,18 @@ select ({ user: u, posts: posts })       -- each user's *published* posts
 ### transaction
 
 ```saga
-fun transaction : Connection -> Unit -> Result a DbError needs {Repo} -> Result a DbError needs {Transaction}
+fun transaction : Connection -> Unit -> Result a e needs {Repo, Rollback e} -> Result a (TransactionError e) needs {Transaction}
 ```
 
 Run `body` inside a database transaction. Every Kraken operation the body
 performs against `conn` (via `all`/`one`/`exec`/the DML helpers) automatically
 joins the transaction. The transaction commits if `body` returns `Ok` and rolls
-back if it returns `Err`, propagating that result to the caller.
+back if it returns `Err`.
 
-The body's `Repo` capability is provided internally (over the ambient
-`Postgres`), so only `Postgres` + `Transaction` need handlers at the call
-boundary — wire them with `... with {pg_transaction, pg}`.
+Body errors are returned as `RolledBack e`; failures before the body starts
+are returned as `TransactionFailed QueryError`. `rollback! e` is available
+inside the body for an early non-resuming rollback.
 
 Caveat (from saga_pgo): don't let a continuation captured inside `body` escape
 and run later — its re-invocation happens after commit/rollback, outside the
 transaction.
-

@@ -3,3 +3,4 @@ module Kraken.Db
 import Kraken.Core (pub ..)
 import Kraken.Query (pub ..)
 import Kraken.Write (pub ..)
+import SagaPgo (pub Rollback, pub Transaction, pub TransactionError)
