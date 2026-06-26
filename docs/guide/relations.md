@@ -160,6 +160,66 @@ users_with_published_posts_only_query () = Db.query (fun () -> {
 
 Parents with no matching children decode `posts: []`.
 
+## Many-to-many relations
+
+Use `Db.has_many_through` when a relation is reached through a join table.
+For example, sessions have many gear items through `sesh_gear`:
+
+```saga
+pub fun sesh_gear_items : Db.RelationThrough Seshes SeshGear Gears Gear Int Int
+sesh_gear_items = (
+  Db.has_many_through sesh_gear gear
+    (fun s -> s.id)
+    (fun sg -> sg.sesh_id)
+    (fun sg -> sg.gear_id)
+    (fun g -> g.id)
+)
+```
+
+Then preload it like any other to-many relation:
+
+```saga
+pub fun seshes_with_gear_query : Unit
+  -> Db.Prepared { sesh: Sesh, gear: List Gear }
+seshes_with_gear_query () = Db.query (fun () -> {
+  let s = from! seshes
+  let gear = Db.preload sesh_gear_items s
+  select ({ sesh: s, gear: gear })
+})
+```
+
+The generated relation query joins through the link table and groups by the
+parent key:
+
+```sql
+SELECT sg.sesh_id, gear.*
+FROM sesh_gear AS sg
+INNER JOIN gear ON sg.gear_id = gear.id
+WHERE sg.sesh_id IN (...)
+```
+
+Define the reverse direction as a second relation with the accessors swapped:
+
+```saga
+pub fun gear_seshes : Db.RelationThrough Gears SeshGear Seshes Sesh Int Int
+gear_seshes = (
+  Db.has_many_through sesh_gear seshes
+    (fun g -> g.id)
+    (fun sg -> sg.gear_id)
+    (fun sg -> sg.sesh_id)
+    (fun s -> s.id)
+)
+```
+
+Use `Db.preload_where` to filter the target table:
+
+```saga
+let recent_seshes = Db.preload_where gear_seshes g (fun s -> Db.gte s.date cutoff)
+```
+
+If the join table has meaningful payload, model it as its own table and preload
+that directly rather than hiding it behind a through relation.
+
 ## To-one relations
 
 Use `Db.belongs_to` when the parent holds the foreign key:

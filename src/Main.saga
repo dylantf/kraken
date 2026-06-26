@@ -4,6 +4,7 @@ import Std.IO (console, Stdio)
 import Kraken.Db
 import Kraken.Query
 import Read
+import Read (User)
 import SagaPgo (Connection, connect, default_config, pg, pg_transaction)
 import Write
 

@@ -1086,13 +1086,19 @@ exactly_one conn prepared = if prepared.noop then Err (ExpectedOneRow 0)
 # --- Relation loading (declared in the query, loaded as a separate query each) ---
 
 #@ A to-many relation: a parent column matched to a child column. Build with
-#@ `has_many`, consume with `preload` → `List child` (or `preload_where` to scope the
-#@ loaded children). Both accessors are *column* accessors (over the parent's and
-#@ child's column records `pcols` / `ccols`), so the foreign key is named exactly once
-#@ and the batched child query (`WHERE child_key IN (keys)`) is generated for you.
+#@ `has_many` or `has_many_through`, consume with `preload` → `List child` (or
+#@ `preload_where` to scope the loaded children). Accessors are *column* accessors
+#@ (over the parent's and child's column records), so keys are named exactly once
+#@ and the batched child query is generated for you.
 #@
 #@     authored_posts = Db.has_many posts (fun u -> u.id) (fun p -> p.author_id)
 opaque type Relation pcols ccols child k = Relation (RelationDef pcols ccols child k)
+
+#@ A to-many relation through a join table. It consumes exactly like `Relation`
+#@ (`preload` → `List child`), but its type also records the join table columns and
+#@ the target-link key type.
+opaque type RelationThrough pcols jcols ccols child k link =
+  RelationThrough (RelationDef pcols ccols child k)
 
 #@ A to-one relation: the same join as `Relation`, built with `belongs_to` (the FK is
 #@ on the parent) or `has_one` (the FK is on the child, ≤1 per parent), and consumed
@@ -1186,6 +1192,60 @@ pub fun has_many : Table ccols
     child: Generic child_rep,
   }
 has_many child_table parent_key child_fk = Relation (relation_def child_table parent_key child_fk)
+
+#@ Define a many-to-many relation through a join table. The generated child query
+#@ selects each target child paired with the join row's parent foreign key:
+#@
+#@     SELECT join_parent_fk, child.*
+#@     FROM join_table
+#@     INNER JOIN child_table ON join_child_fk = child_key
+#@     WHERE join_parent_fk IN (...)
+#@
+#@ Consume with `preload` → `List child`. Define the inverse direction as another
+#@ relation with the parent/child tables and join-key accessors swapped.
+pub fun has_many_through : Table jcols
+  -> Table ccols
+  -> (pcols -> pk)
+  -> (jcols -> jpk)
+  -> (jcols -> jck)
+  -> (ccols -> ck)
+  -> RelationThrough pcols jcols ccols child k link
+  where {
+    k: Core.PgType + Eq,
+    link: Core.PgType,
+    pk: ToSql k,
+    jpk: ToSql k,
+    jck: ToSql link,
+    ck: ToSql link,
+    ccols: Generic ccols_rep,
+    ccols_rep: Selectable child_rep,
+    child: Generic child_rep,
+  }
+has_many_through join_table child_table parent_key join_parent_fk join_child_fk child_key = {
+  let def = RelationDef {
+    parent_key: fun pc -> Core.as_sql (parent_key pc),
+    load_children: fun conn keys filter -> {
+      let QueryStep run = (fun () -> {
+        let join_cols = from! join_table
+        let child_cols = inner_join! child_table (fun cols ->
+          Core.eq_col (join_child_fk join_cols) (child_key cols))
+        let key_pred = Core.in_ (join_parent_fk join_cols) keys
+        where_! (case filter {
+          Nothing -> key_pred
+          Just predicate -> and_ [key_pred, predicate child_cols]
+        })
+        (join_cols, child_cols)
+      }) () with collect_query
+      let ((join_cols, child_cols), state) = run empty_state
+      let pair_projection = Core.project_pair (Core.col_projection (Core.as_sql (join_parent_fk join_cols))) (Core.project child_cols)
+      case all conn (prepare pair_projection state) {
+        Err err -> Err err
+        Ok pairs -> Ok (group_pairs pairs)
+      }
+    },
+  }
+  RelationThrough def
+}
 
 #@ Define a belongs-to relation: the parent holds the foreign key pointing at the
 #@ child's key (e.g. a post's `author_id` → a user's `id`). Consume with `preload`
@@ -1291,6 +1351,12 @@ pub trait Preloadable rel pcols ccols out | rel -> pcols ccols out {
 impl Preloadable pcols ccols (List child) for (Relation pcols ccols child k) where {k: Eq} needs {QueryBuild} {
   run_preload relation parent filter = case relation {
     Relation def -> register_relation def parent (fun kids -> kids) filter
+  }
+}
+
+impl Preloadable pcols ccols (List child) for (RelationThrough pcols jcols ccols child k link) where {k: Eq} needs {QueryBuild} {
+  run_preload relation parent filter = case relation {
+    RelationThrough def -> register_relation def parent (fun kids -> kids) filter
   }
 }
 
