@@ -32,18 +32,9 @@ Most examples assume this import set:
 
 ```saga
 import Kraken.Db (QueryBuild, Repo, select)
-import Kraken.Core
 import Kraken.Query
 import SagaPgo (Connection)
 ```
-
-`import Kraken.Db (...)` still gives qualified access as `Db`. The explicit
-names are brought into local scope because query signatures mention
-`QueryBuild` / `Repo`, and query bodies return `select`.
-
-`Kraken.Core` and `Kraken.Query` are temporary implementation imports needed
-for schema derives and derived impl lookup with current Saga compiler behavior.
-The long-term goal is that user code only needs `Kraken.Db`.
 
 ## Define a table
 
@@ -65,17 +56,17 @@ record Users {
   id: Db.Generated Int,
   name: Db.Col String,
   age: Db.Col Int,
-} deriving (Core.Selectable User)
+} deriving (Selectable User)
 ```
 
 `Db.Generated a` is a readable column that the database usually fills in.
-`Core.Selectable User` says that selecting the whole `Users` scope decodes a
+`Selectable User` says that selecting the whole `Users` scope decodes a
 `User`.
 
 Map the column record to the SQL table:
 
 ```saga
-impl Core.ColumnSet for Users {
+impl ColumnSet for Users {
   columns source = Users {
     id: Db.generated "id" source,
     name: Db.col "name" source,
@@ -155,7 +146,7 @@ The decoded row type is:
 { user: User, title: String, age_text: String }
 ```
 
-Whole-row selections use the table's `Core.Selectable` derive. Scalar fields use
+Whole-row selections use the table's `Selectable` derive. Scalar fields use
 their column or SQL expression type. This gives query-local result shapes without
 defining a new named record for every query.
 

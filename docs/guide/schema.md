@@ -23,7 +23,7 @@ record User {
 ```
 
 No derive is required just to name the data shape. Query decoding is connected
-by the column record's `Core.Selectable User` derive.
+by the column record's `Selectable User` derive.
 
 ## Column records
 
@@ -34,7 +34,7 @@ record Users {
   id: Db.Generated Int,
   name: Db.Col String,
   age: Db.Col Int,
-} deriving (Core.Selectable User)
+} deriving (Selectable User)
 ```
 
 Use `Db.Col a` for normal columns and `Db.Generated a` for columns the database
@@ -42,7 +42,7 @@ normally fills in, such as serial ids.
 
 The read derive does one job:
 
-- `Core.Selectable User`: selecting `u` decodes a `User`.
+- `Selectable User`: selecting `u` decodes a `User`.
 
 That is enough for reads:
 
@@ -52,7 +52,7 @@ select u  # User
 
 ## Write derives
 
-For inserts, add `Core.Insertable <Name>` and `Core.ColumnNameMap` to the column
+For inserts, add `Insertable <Name>` and `ColumnNameMap` to the column
 record:
 
 ```saga
@@ -61,17 +61,17 @@ record Users {
   name: Db.Col String,
   age: Db.Col Int,
 } deriving (
-  Core.Selectable User,
-  Core.Insertable UsersInsert,
-  Core.ColumnNameMap,
+  Selectable User,
+  Insertable UsersInsert,
+  ColumnNameMap,
 )
 ```
 
 These write derives do two jobs:
 
-- `Core.Insertable UsersInsert`: creates an insert input record from the column
+- `Insertable UsersInsert`: creates an insert input record from the column
   record.
-- `Core.ColumnNameMap`: lets writes translate Saga field labels to actual SQL
+- `ColumnNameMap`: lets writes translate Saga field labels to actual SQL
   column names.
 
 The generated `UsersInsert` shape maps `Generated Int` to `Db.Writable Int` and
@@ -87,7 +87,7 @@ UsersInsert {
 
 Use `Db.auto` to omit a generated column, or `Db.provide value` to force it.
 
-For save-style `Db.update_all`, also derive `Core.InsertRow` on the domain
+For save-style `Db.update_all`, also derive `InsertRow` on the domain
 record:
 
 ```saga
@@ -95,7 +95,7 @@ record User {
   id: Int,
   name: String,
   age: Int,
-} deriving (Core.InsertRow)
+} deriving (InsertRow)
 ```
 
 ## ColumnSet
@@ -103,7 +103,7 @@ record User {
 `ColumnSet` builds the column record for a SQL source alias:
 
 ```saga
-impl Core.ColumnSet for Users {
+impl ColumnSet for Users {
   columns source = Users {
     id: Db.generated "id" source,
     name: Db.col "name" source,
@@ -147,9 +147,9 @@ record Accounts {
   id: Db.Generated Int,
   email: Db.Col String,
   status: Db.Col AccountStatus,
-} deriving (Core.Selectable Account)
+} deriving (Selectable Account)
 
-impl Core.ColumnSet for Accounts {
+impl ColumnSet for Accounts {
   columns source = Accounts {
     id: Db.generated "id" source,
     email: Db.col "email_address" source,
@@ -236,13 +236,13 @@ record Accounts {
   id: Db.Generated Int,
   email: Db.Col String,
   status: Db.Col AccountStatus,
-} deriving (Core.Selectable Account)
+} deriving (Selectable Account)
 ```
 
 The `ColumnSet` maps `status` to the actual SQL column:
 
 ```saga
-impl Core.ColumnSet for Accounts {
+impl ColumnSet for Accounts {
   columns source = Accounts {
     id: Db.generated "id" source,
     email: Db.col "email" source,
@@ -320,8 +320,7 @@ your Saga type.
 
 ## Module surface
 
-Use the import pattern from [Getting started](getting-started.md). The important
-distinction is that application code uses `Db.*` from `Kraken.Db`, while current
-schema derives refer to `Core.*` from `Kraken.Core`. The `Core` import is
-expected to disappear once facade re-exported traits and their derived impls
-behave identically to direct imports.
+Use the import pattern from [Getting started](getting-started.md). Application
+code uses `Db.*` from `Kraken.Db`; the schema derives (`Selectable`,
+`Insertable`, `ColumnNameMap`, `InsertRow`) and `ColumnSet` resolve through the
+same `Kraken.Db` import and are written unqualified.

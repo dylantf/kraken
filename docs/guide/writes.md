@@ -11,7 +11,7 @@ with `RETURNING` produce `Db.Prepared row` and run with `Db.all`, `Db.one`, or
 
 ## Insert
 
-Use the insert shape synthesized by `Core.Insertable`:
+Use the insert shape synthesized by `Insertable`:
 
 ```saga
 pub fun insert_user_query : Unit -> Db.Prepared Unit
