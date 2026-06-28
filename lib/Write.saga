@@ -4,8 +4,9 @@ import Kraken.Core (
   Table,
   Col,
   Generated,
-  Writable,
-  Auto,
+  DefaultValue,
+  GeneratedValue,
+  UseDefault,
   Provide,
   Expr,
   PgType,
@@ -50,8 +51,12 @@ record UpdateState {
 }
 
 pub type InsertCell =
-  | Bind String Value
+  | Bind String InsertValue
   | Skip
+
+type InsertValue =
+  | InsertParam Value
+  | InsertDefault
 
 opaque type Writer cols input = Writer (cols -> input -> List InsertCell)
 
@@ -59,22 +64,28 @@ pub fun writer : (cols -> input -> List InsertCell) -> Writer cols input
 writer encode = Writer encode
 
 pub fun set : Col a -> a -> InsertCell where {a: PgType}
-set column value = Bind (col_name column) (encode_value value)
+set column value = Bind (col_name column) (InsertParam (encode_value value))
 
-pub fun set_w : Generated a -> Writable a -> InsertCell where {a: PgType}
-set_w column value = case value {
-  Auto -> Skip
-  Provide inner -> Bind (generated_name column) (encode_value inner)
+pub fun set_default : Col a -> DefaultValue a -> InsertCell where {a: PgType}
+set_default column value = case value {
+  UseDefault -> Bind (col_name column) InsertDefault
+  Provide inner -> Bind (col_name column) (InsertParam (encode_value inner))
 }
 
-fun run_writer : Writer cols input -> cols -> input -> List (String, Value)
+pub fun set_generated : Generated a -> GeneratedValue a -> InsertCell where {a: PgType}
+set_generated column value = case value {
+  UseDefault -> Bind (generated_name column) InsertDefault
+  Provide inner -> Bind (generated_name column) (InsertParam (encode_value inner))
+}
+
+fun run_writer : Writer cols input -> cols -> input -> List (String, InsertValue)
 run_writer writer_value cols input = {
   let Writer encode = writer_value
   let cells = encode cols input
   bound_cells cells
 }
 
-fun bound_cells : List InsertCell -> List (String, Value)
+fun bound_cells : List InsertCell -> List (String, InsertValue)
 bound_cells cells = case cells {
   [] -> []
   cell :: rest -> case cell {
@@ -209,19 +220,25 @@ comma_join names = case names {
   name :: rest -> name <> ", " <> comma_join rest
 }
 
-fun value_placeholder_parts : List Value -> List SqlPart
+fun insert_value_parts : InsertValue -> List SqlPart
+insert_value_parts value = case value {
+  InsertParam param -> [Param param]
+  InsertDefault -> [Text "DEFAULT"]
+}
+
+fun value_placeholder_parts : List InsertValue -> List SqlPart
 value_placeholder_parts vals = case vals {
   [] -> []
-  [value] -> [Param value]
+  [value] -> insert_value_parts value
   value :: rest -> {
-    let head = [Param value, Text ", "]
+    let head = List.append (insert_value_parts value) [Text ", "]
     let tail = value_placeholder_parts rest
     List.append head tail
   }
 }
 
 # One row's worth of placeholders wrapped in parens: `($1, $2, …)`.
-fun value_group_parts : List Value -> List SqlPart
+fun value_group_parts : List InsertValue -> List SqlPart
 value_group_parts vals = {
   let inner = value_placeholder_parts vals
   let opened = List.append [Text "("] inner
@@ -229,7 +246,7 @@ value_group_parts vals = {
 }
 
 # Comma-join one parenthesized placeholder group per row: `(…), (…), …`.
-fun value_groups_parts : List (List Value) -> List SqlPart
+fun value_groups_parts : List (List InsertValue) -> List SqlPart
 value_groups_parts rows = case rows {
   [] -> []
   [vals] -> value_group_parts vals
@@ -241,7 +258,7 @@ value_groups_parts rows = case rows {
 
 # --- Operations ---
 
-fun insert_parts : Table cols -> List (String, Value) -> List SqlPart
+fun insert_parts : Table cols -> List (String, InsertValue) -> List SqlPart
 insert_parts table_value pairs = {
   let names =
     List.map (fun pair -> {
@@ -269,7 +286,7 @@ insert_parts table_value pairs = {
 # value encodes every row, so `insert_pairs` yields a stable field order.
 fun insert_all_parts : Table cols
   -> List String
-  -> List (List Value)
+  -> List (List InsertValue)
   -> List SqlPart
 insert_all_parts table_value names rows = {
   let header = "INSERT INTO "
@@ -281,13 +298,13 @@ insert_all_parts table_value names rows = {
   List.append prefix (value_groups_parts rows)
 }
 
-fun insert_pairs : Table cols -> Writer cols input -> input -> List (String, Value)
+fun insert_pairs : Table cols -> Writer cols input -> input -> List (String, InsertValue)
 insert_pairs table_value writer_value value = {
   let cols = table_cols (table_name table_value) table_value
   run_writer writer_value cols value
 }
 
-fun pair_names : List (String, Value) -> List String
+fun pair_names : List (String, InsertValue) -> List String
 pair_names pairs =
   List.map (fun pair -> {
     let (name, _v) = pair
@@ -301,11 +318,10 @@ names_equal a b = case (a, b) {
   _ -> False
 }
 
-# Every row in a multi-row INSERT shares one column list, so each row must set the
-# same columns. They can differ only via a `Writable` column omitted on `Db.auto`
-# but bound on `Db.provide` — mixing those across rows is the one way to get a
-# ragged batch, so we reject it with a clear message rather than emit broken SQL.
-fun all_names_match : List String -> List (List (String, Value)) -> Bool
+# Every row in a multi-row INSERT shares one column list, so each row must mention
+# the same columns. Use `Db.default` / `Db.auto` to render a per-row SQL DEFAULT
+# without changing that column list.
+fun all_names_match : List String -> List (List (String, InsertValue)) -> Bool
 all_names_match names rows_pairs = case rows_pairs {
   [] -> True
   pairs :: rest ->
@@ -330,7 +346,7 @@ insert_all_parts_of table_value writer_value values = {
     first_pairs :: _ -> {
       let names = pair_names first_pairs
       if all_names_match names rows_pairs then ()
-      else panic "Db.insert_all: rows set different columns (a generated column is Db.auto in some rows and Db.provide in others); a multi-row INSERT needs one shared column list — make the auto/provide choice consistent across the batch"
+      else panic "Db.insert_all: rows set different columns; a multi-row INSERT needs one shared column list (use Db.default/Db.auto for per-row DEFAULT values instead of omitting the column)"
       let row_values =
         fun pairs ->
           List.map (fun pair -> {
@@ -441,7 +457,7 @@ conflict_update_parts target_names set_names = case set_names {
 
 # Full `INSERT ... ON CONFLICT (<target>) DO NOTHING` statement parts.
 fun do_nothing_parts : Table cols
-  -> List (String, Value)
+  -> List (String, InsertValue)
   -> List String
   -> List SqlPart
 do_nothing_parts table_value pairs target_names = {
@@ -453,7 +469,7 @@ do_nothing_parts table_value pairs target_names = {
 
 # Full `INSERT ... ON CONFLICT (<target>) DO UPDATE SET <rest> = EXCLUDED.<rest>`.
 fun upsert_parts : Table cols
-  -> List (String, Value)
+  -> List (String, InsertValue)
   -> List String
   -> List SqlPart
 upsert_parts table_value pairs target_names = {
@@ -571,7 +587,7 @@ set_expr_parts sets = case sets {
 
 # `INSERT … ON CONFLICT <target> DO UPDATE SET <custom assignments>`.
 fun upsert_set_parts : Table cols
-  -> List (String, Value)
+  -> List (String, InsertValue)
   -> ConflictTarget
   -> List SetExpr
   -> List SqlPart
@@ -665,8 +681,8 @@ contains_name names target = case names {
 
 # Split (name, value) pairs into (set columns, key columns) by the key names.
 fun partition_by_key : List String
-  -> List (String, Value)
-  -> (List (String, Value), List (String, Value))
+  -> List (String, InsertValue)
+  -> (List (String, InsertValue), List (String, InsertValue))
 partition_by_key key_names pairs = case pairs {
   [] -> ([], [])
   pair :: rest -> {
@@ -677,28 +693,35 @@ partition_by_key key_names pairs = case pairs {
   }
 }
 
-fun pair_to_assignment : (String, Value) -> Assignment
-pair_to_assignment pair = {
-  let (name, value) = pair
-  Assignment { column: name, value: value }
+fun bound_update_value : String -> InsertValue -> Value
+bound_update_value name value = case value {
+  InsertParam param -> param
+  InsertDefault ->
+    panic ("Db.update_all: writer produced DEFAULT for column " <> name <> "; update_all requires concrete values")
 }
 
-fun key_conditions : List (String, Value) -> List SqlPart
+fun pair_to_assignment : (String, InsertValue) -> Assignment
+pair_to_assignment pair = {
+  let (name, value) = pair
+  Assignment { column: name, value: bound_update_value name value }
+}
+
+fun key_conditions : List (String, InsertValue) -> List SqlPart
 key_conditions pairs = case pairs {
   [] -> []
   [pair] -> {
     let (name, value) = pair
-    [Text (name <> " = "), Param value]
+    [Text (name <> " = "), Param (bound_update_value name value)]
   }
   pair :: rest -> {
     let (name, value) = pair
-    let head = [Text (name <> " = "), Param value, Text " AND "]
+    let head = [Text (name <> " = "), Param (bound_update_value name value), Text " AND "]
     let tail = key_conditions rest
     List.append head tail
   }
 }
 
-fun key_where_parts : List (String, Value) -> List SqlPart
+fun key_where_parts : List (String, InsertValue) -> List SqlPart
 key_where_parts pairs = case pairs {
   [] ->
     panic "Db.update_all: table has no primary_key (declare one in its ColumnSet impl)"

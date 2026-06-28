@@ -1,7 +1,8 @@
 module Kraken.Query
 
-import Std.Dynamic (Dynamic, DecodeError)
 import Std.Dict as Dicts
+
+import Std.Dynamic (Dynamic, DecodeError)
 import Kraken.Core (
   Table,
   Nullable,
@@ -155,7 +156,6 @@ noop_prepared = Prepared {
 pub type DbError =
   | QueryFailed QueryError
   | DecodeFailed DecodeError
-  #@ `exactly_one` got a row count other than 1 (the `Int` is the actual count).
   | ExpectedOneRow Int
   deriving (Debug)
 
@@ -267,7 +267,10 @@ bind_table_source table_value state = {
     Just name -> name
     Nothing -> state.alias_prefix <> show state.next_alias
   }
-  let source = Source { ref: NamedSource (Core.table_name table_value), alias: alias }
+  let source = Source {
+    ref: NamedSource (Core.table_name table_value),
+    alias: alias,
+  }
   (source, { state | next_alias: state.next_alias + 1 })
 }
 
@@ -298,7 +301,9 @@ handler collect_query for QueryBuild {
       let source = Source { ref: SubquerySource dt.frag, alias: alias }
       let scope = dt.make_scope alias
       let QueryStep run_rest = resume scope
-      run_rest (set_from_source ({ state | next_alias: state.next_alias + 1 }) source)
+      run_rest (set_from_source ({ state |
+        next_alias: state.next_alias + 1,
+      }) source)
     })
   }
 
@@ -346,7 +351,7 @@ handler collect_query for QueryBuild {
 
   relation_count _unit = {
     QueryStep (fun state -> {
-      let QueryStep run_rest = resume (List.length state.relations)
+      let QueryStep run_rest = resume List.length state.relations
       run_rest state
     })
   }
@@ -413,7 +418,6 @@ handler collect_query for QueryBuild {
       run_rest ({ state | offset_count: Just count })
     })
   }
-
   return value = QueryStep (fun state -> (value, state))
 }
 
@@ -421,7 +425,7 @@ handler collect_query for QueryBuild {
 #@ builder closure's *return* is required to be a projection. `Select` is opaque, so
 #@ `select` is the only way to produce one — a query body therefore cannot forget to
 #@ select, return a bare record, or have an early selection silently shadowed.
-pub opaque type Select a = Select (Projection a)
+opaque type Select a = Select (Projection a)
 
 #@ Name a query's result shape. The `!` verbs (`from!`, `where_!`, …) build the
 #@ query; `select` names what comes back, and its value's type determines the row
@@ -456,7 +460,7 @@ query make = {
 #@     full_join_query employees departments
 #@       (fun e d -> Db.eq_col e.dept_id d.id)
 #@       (fun (emp, dept) -> select (
-#@         Db.project EmployeeDepartment {
+#@         build Selection EmployeeDepartment {
 #@           employee: Db.read_nullable emp employee_row,
 #@           department: Db.read_nullable dept department_row,
 #@         }))
@@ -474,7 +478,7 @@ full_join_query table_a table_b on_fn body = {
   let state3 = set_from_source state2 source_a
   let state4 = { state3 | joins: List.append state3.joins [join] }
   let scopes = (Core.as_nullable cols_a, Core.as_nullable cols_b)
-  let QueryStep run = (body scopes) with collect_query
+  let QueryStep run = body scopes with collect_query
   let (Select projection, state) = run state4
   prepare projection state
 }
@@ -499,10 +503,7 @@ pub fun from_subquery_as : (String -> scope)
 from_subquery_as make_scope make = {
   let (Select projection, sub_state) = run_subquery make
   let frag = select_frag (Core.projection_selections projection) sub_state
-  bind_derived! (DerivedTable {
-    frag: frag,
-    make_scope: make_scope,
-  })
+  bind_derived! (DerivedTable { frag: frag, make_scope: make_scope })
 }
 
 #@ Define a named CTE and get back a `Table` handle for it. The builder closure is
@@ -529,18 +530,15 @@ pub fun cte_as : String
 cte_as name make_scope make = {
   let (Select projection, sub_state) = run_subquery make
   let frag = select_frag (Core.projection_selections projection) sub_state
-  define_cte! (DerivedCte {
-    name: name,
-    frag: frag,
-    make_scope: make_scope,
-  })
+  define_cte! (DerivedCte { name: name, frag: frag, make_scope: make_scope })
 }
 
 #@ Map a prepared query's decoded rows through `transform`. The SQL and parameters
 #@ are unchanged; only the decoded result type changes. Useful for turning an
+#@ Map a decoded prepared row into another shape. Useful for adapting an
 #@ anonymous projection record into a named domain type.
-pub fun into : (row -> out) -> Prepared row -> Prepared out
-into transform prepared = Prepared {
+pub fun map_prepared : (row -> out) -> Prepared row -> Prepared out
+map_prepared transform prepared = Prepared {
   sql: prepared.sql,
   params: prepared.params,
   decode: fun data row ->
@@ -576,7 +574,8 @@ render_frag frag state =
 fun render_source_into : Source -> RenderState -> RenderState
 render_source_into source state = case source.ref {
   NamedSource name ->
-    render_text (if name == source.alias then name else name <> " AS " <> source.alias) state
+    render_text (if name == source.alias then name
+    else name <> " AS " <> source.alias) state
   SubquerySource frag ->
     state
     |> render_text "("
@@ -759,13 +758,14 @@ render_from_onward source state st =
 pub fun number_parts : List SqlPart -> (String, List Value)
 number_parts parts = {
   let step =
-    fun acc part -> {
-      let (pieces, params, idx) = acc
-      case part {
-        Text text -> (text :: pieces, params, idx)
-        Param value -> (("$" <> show idx) :: pieces, value :: params, idx + 1)
+    fun acc part ->
+      {
+        let (pieces, params, idx) = acc
+        case part {
+          Text text -> (text :: pieces, params, idx)
+          Param value -> ("$" <> show idx :: pieces, value :: params, idx + 1)
+        }
       }
-    }
   let (rev_pieces, rev_params, _idx) = List.foldl step ([], [], 1) parts
   (String.join "" (List.reverse rev_pieces), List.reverse rev_params)
 }
@@ -782,7 +782,10 @@ render_cte_defs ctes st = case ctes {
   pair :: rest -> {
     let (name, frag) = pair
     let next =
-      st |> render_text (name <> " AS (") |> render_frag frag |> render_text "), "
+      st
+      |> render_text (name <> " AS (")
+      |> render_frag frag
+      |> render_text "), "
     render_cte_defs rest next
   }
 }
@@ -791,7 +794,8 @@ render_cte_defs ctes st = case ctes {
 fun render_with : QueryState -> RenderState -> RenderState
 render_with state st = case state.ctes {
   [] -> st
-  _ -> st |> render_text "WITH " |> render_cte_defs state.ctes |> render_text " "
+  _ ->
+    st |> render_text "WITH " |> render_cte_defs state.ctes |> render_text " "
 }
 
 # Render a full `SELECT <list> FROM …` as a deferred fragment (no `$n` numbering).
@@ -972,7 +976,7 @@ scalar_subquery make = Core.sql_from_frag (scalar_subquery_frag make)
 #@ when the subquery provably yields one non-null row.
 #@
 #@     select (
-#@       Db.project UserMaybePostTitle {
+#@       build Selection {
 #@         id: Db.read u.id,
 #@         a_title: Db.read (Db.scalar_subquery_maybe (fun () -> {
 #@           let p = from! posts
@@ -981,7 +985,8 @@ scalar_subquery make = Core.sql_from_frag (scalar_subquery_frag make)
 #@           p.title
 #@         })),
 #@       })
-pub fun scalar_subquery_maybe : (Unit -> col needs {QueryBuild}) -> Core.Sql (Maybe a)
+pub fun scalar_subquery_maybe : (Unit -> col needs {QueryBuild})
+  -> Core.Sql (Maybe a)
   needs {QueryBuild}
   where {col: ToSql a, a: Core.PgType}
 scalar_subquery_maybe make = Core.sql_from_frag (scalar_subquery_frag make)
@@ -1004,7 +1009,8 @@ run conn prepared =
 #@ second pass resolves each relation slot to its matching children. This is the
 #@ classic preload — one query per relation level, never N+1.
 pub fun all : Connection -> Prepared a -> Result (List a) DbError needs {Repo}
-all conn prepared = if prepared.noop then Ok []
+all conn prepared =
+  if prepared.noop then Ok []
   else case execute! conn prepared {
     Err err -> Err (QueryFailed err)
     Ok returned -> decode_returned conn prepared returned.rows
@@ -1014,7 +1020,10 @@ all conn prepared = if prepared.noop then Ok []
 # rows*. `all` passes the whole result; `one` / `exactly_one` pass only the row they
 # keep, so a relation query through them loads children for that one parent — not the
 # whole result set — and the discarded rows are never decoded.
-fun decode_returned : Connection -> Prepared a -> List Dynamic -> Result (List a) DbError
+fun decode_returned : Connection
+  -> Prepared a
+  -> List Dynamic
+  -> Result (List a) DbError
   needs {Repo}
 decode_returned conn prepared rows = case prepared.relations {
   [] -> decode_rows prepared.decode Core.empty_rel_data rows
@@ -1027,7 +1036,8 @@ decode_returned conn prepared rows = case prepared.relations {
       Err err -> Err (DecodeFailed err)
       Ok (_value, slots) -> case load_rel_entries conn prepared.relations rows slots {
         Err err -> Err err
-        Ok entries -> decode_rows prepared.decode (Core.rel_data_of entries) rows
+        Ok entries ->
+          decode_rows prepared.decode (Core.rel_data_of entries) rows
       }
     }
   }
@@ -1039,7 +1049,8 @@ decode_returned conn prepared rows = case prepared.relations {
 #@ itself still runs unbounded — add `limit! 1` if you want the database to stop at
 #@ one row too.)
 pub fun one : Connection -> Prepared a -> Result (Maybe a) DbError needs {Repo}
-one conn prepared = if prepared.noop then Ok Nothing
+one conn prepared =
+  if prepared.noop then Ok Nothing
   else case execute! conn prepared {
     Err err -> Err (QueryFailed err)
     Ok returned -> case returned.rows {
@@ -1058,7 +1069,8 @@ one conn prepared = if prepared.noop then Ok Nothing
 #@ by primary key, an aggregate, a `RETURNING` from a single-row write). The row count
 #@ is checked before decoding, so a wrong count never loads relations or decodes rows.
 pub fun exactly_one : Connection -> Prepared a -> Result a DbError needs {Repo}
-exactly_one conn prepared = if prepared.noop then Err (ExpectedOneRow 0)
+exactly_one conn prepared =
+  if prepared.noop then Err (ExpectedOneRow 0)
   else case execute! conn prepared {
     Err err -> Err (QueryFailed err)
     Ok returned -> case returned.rows {
@@ -1080,19 +1092,21 @@ exactly_one conn prepared = if prepared.noop then Err (ExpectedOneRow 0)
 #@ and the batched child query is generated for you.
 #@
 #@     authored_posts = Db.has_many posts posts_row (fun u -> u.id) (fun p -> p.author_id)
-opaque type Relation pcols ccols child k = Relation (RelationDef pcols ccols child k)
+opaque type Relation pcols ccols child k =
+  | Relation (RelationDef pcols ccols child k)
 
 #@ A to-many relation through a join table. It consumes exactly like `Relation`
 #@ (`preload` → `List child`), but its type also records the join table columns and
 #@ the target-link key type.
 opaque type RelationThrough pcols jcols ccols child k link =
-  RelationThrough (RelationDef pcols ccols child k)
+  | RelationThrough (RelationDef pcols ccols child k)
 
 #@ A to-one relation: the same join as `Relation`, built with `belongs_to` (the FK is
 #@ on the parent) or `has_one` (the FK is on the child, ≤1 per parent), and consumed
 #@ with `preload` → `Maybe child`. A distinct type so the to-one result shape follows
 #@ the relation automatically (and a to-many can't be mis-consumed as one).
-opaque type RelationOne pcols ccols child k = RelationOne (RelationDef pcols ccols child k)
+opaque type RelationOne pcols ccols child k =
+  | RelationOne (RelationDef pcols ccols child k)
 
 record RelationDef pcols ccols child k {
   # The parent's key column as a `Sql k` (injected into the parent SELECT and read
@@ -1107,8 +1121,7 @@ record RelationDef pcols ccols child k {
 # Group `(fk, child)` pairs by FK, preserving each child's order within its group
 # (foldr + prepend keeps the first child first). The value type is the bare builtin
 # `Dict` — qualifying it (`Dicts.Dict`) misresolves to a phantom type that won't unify.
-fun group_pairs : List (k, child) -> Dict k (List child)
-  where {k: Eq}
+fun group_pairs : List (k, child) -> Dict k (List child) where {k: Eq}
 group_pairs pairs =
   List.foldr (fun pair dict -> {
     let (fk, child) = pair
@@ -1128,33 +1141,34 @@ fun relation_def : Table ccols
   -> (pcols -> pk)
   -> (ccols -> ck)
   -> RelationDef pcols ccols child k
-  where {
-    k: Core.PgType + Eq,
-    pk: ToSql k,
-    ck: ToSql k,
-  }
+  where {k: Core.PgType + Eq, pk: ToSql k, ck: ToSql k}
 relation_def child_table child_projection parent_key child_key = RelationDef {
   parent_key: fun pc -> Core.as_sql (parent_key pc),
-  load_children: fun conn keys filter -> {
-    # Build the child query selecting (matching key, child row), paired manually
-    # from two first-class projections. An optional `filter` predicate is `AND`-ed
-    # into the `WHERE` to scope the children.
-    let QueryStep run = (fun () -> {
-      let cols = from! child_table
-      let key_pred = Core.in_ (child_key cols) keys
-      where_! (case filter {
-        Nothing -> key_pred
-        Just predicate -> and_ [key_pred, predicate cols]
-      })
-      cols
-    }) () with collect_query
-    let (cols, state) = run empty_state
-    let pair_projection = Core.project_pair (Core.col_projection (Core.as_sql (child_key cols))) (child_projection cols)
-    case all conn (prepare pair_projection state) {
-      Err err -> Err err
-      Ok pairs -> Ok (group_pairs pairs)
-    }
-  },
+  load_children: fun conn keys filter ->
+    {
+      # Build the child query selecting (matching key, child row), paired manually
+      # from two first-class projections. An optional `filter` predicate is `AND`-ed
+      # into the `WHERE` to scope the children.
+      let QueryStep run =
+        ((fun () ->
+          {
+            let cols = from! child_table
+            let key_pred = Core.in_ (child_key cols) keys
+            where_! (case filter {
+              Nothing -> key_pred
+              Just predicate -> and_ [key_pred, predicate cols]
+            })
+            cols
+          }) ()
+          with collect_query)
+      let (cols, state) = run empty_state
+      let pair_projection =
+        Core.project_pair (Core.col_projection (Core.as_sql (child_key cols))) (child_projection cols)
+      case all conn (prepare pair_projection state) {
+        Err err -> Err err
+        Ok pairs -> Ok (group_pairs pairs)
+      }
+    },
 }
 
 #@ Define a has-many relation: a parent-key column matched to the child's foreign-key
@@ -1167,11 +1181,7 @@ pub fun has_many : Table ccols
   -> (pcols -> pk)
   -> (ccols -> ck)
   -> Relation pcols ccols child k
-  where {
-    k: Core.PgType + Eq,
-    pk: ToSql k,
-    ck: ToSql k,
-  }
+  where {k: Core.PgType + Eq, pk: ToSql k, ck: ToSql k}
 has_many child_table child_projection parent_key child_fk =
   Relation (relation_def child_table child_projection parent_key child_fk)
 
@@ -1193,36 +1203,35 @@ pub fun has_many_through : Table jcols
   -> (jcols -> jck)
   -> (ccols -> ck)
   -> RelationThrough pcols jcols ccols child k link
-  where {
-    k: Core.PgType + Eq,
-    link: Core.PgType,
-    pk: ToSql k,
-    jpk: ToSql k,
-    jck: ToSql link,
-    ck: ToSql link,
-  }
+  where {k: Core.PgType + Eq, link: Core.PgType, pk: ToSql k, jpk: ToSql k, jck: ToSql link, ck: ToSql link}
 has_many_through join_table child_table child_projection parent_key join_parent_fk join_child_fk child_key = {
   let def = RelationDef {
     parent_key: fun pc -> Core.as_sql (parent_key pc),
-    load_children: fun conn keys filter -> {
-      let QueryStep run = (fun () -> {
-        let join_cols = from! join_table
-        let child_cols = inner_join! child_table (fun cols ->
-          Core.eq_col (join_child_fk join_cols) (child_key cols))
-        let key_pred = Core.in_ (join_parent_fk join_cols) keys
-        where_! (case filter {
-          Nothing -> key_pred
-          Just predicate -> and_ [key_pred, predicate child_cols]
-        })
-        (join_cols, child_cols)
-      }) () with collect_query
-      let ((join_cols, child_cols), state) = run empty_state
-      let pair_projection = Core.project_pair (Core.col_projection (Core.as_sql (join_parent_fk join_cols))) (child_projection child_cols)
-      case all conn (prepare pair_projection state) {
-        Err err -> Err err
-        Ok pairs -> Ok (group_pairs pairs)
-      }
-    },
+    load_children: fun conn keys filter ->
+      {
+          let QueryStep run =
+            ((fun () ->
+              {
+                let join_cols = from! join_table
+                let child_cols =
+                  inner_join! child_table (fun cols ->
+                  Core.eq_col (join_child_fk join_cols) (child_key cols))
+              let key_pred = Core.in_ (join_parent_fk join_cols) keys
+              where_! (case filter {
+                Nothing -> key_pred
+                Just predicate -> and_ [key_pred, predicate child_cols]
+                })
+                (join_cols, child_cols)
+              }) ()
+            with collect_query)
+        let ((join_cols, child_cols), state) = run empty_state
+        let pair_projection =
+          Core.project_pair (Core.col_projection (Core.as_sql (join_parent_fk join_cols))) (child_projection child_cols)
+        case all conn (prepare pair_projection state) {
+          Err err -> Err err
+          Ok pairs -> Ok (group_pairs pairs)
+        }
+      },
   }
   RelationThrough def
 }
@@ -1237,11 +1246,7 @@ pub fun belongs_to : Table ccols
   -> (pcols -> pk)
   -> (ccols -> ck)
   -> RelationOne pcols ccols child k
-  where {
-    k: Core.PgType + Eq,
-    pk: ToSql k,
-    ck: ToSql k,
-  }
+  where {k: Core.PgType + Eq, pk: ToSql k, ck: ToSql k}
 belongs_to child_table child_projection parent_key child_key =
   RelationOne (relation_def child_table child_projection parent_key child_key)
 
@@ -1252,11 +1257,7 @@ pub fun has_one : Table ccols
   -> (pcols -> pk)
   -> (ccols -> ck)
   -> RelationOne pcols ccols child k
-  where {
-    k: Core.PgType + Eq,
-    pk: ToSql k,
-    ck: ToSql k,
-  }
+  where {k: Core.PgType + Eq, pk: ToSql k, ck: ToSql k}
 has_one child_table child_projection parent_key child_fk =
   RelationOne (relation_def child_table child_projection parent_key child_fk)
 
@@ -1279,35 +1280,33 @@ register_relation def pcols finish filter = {
   let read_key = Core.col_decoder key_col
   push_relation! (RelSpec {
     index: index,
-    # Read the parent keys *typed* from the raw rows (the normal column decoder, not
-    # an unsafe cast), run the typed child loader, and erase only the grouped `Dict`.
-    load: fun conn rows offset -> case extract_keys read_key offset rows {
-      Err err -> Err err
-      Ok keys -> case def.load_children conn keys filter {
+    load: fun conn rows offset ->
+      case extract_keys read_key offset rows {
         Err err -> Err err
-        Ok grouped -> Ok (erase grouped)
-      }
-    },
+        Ok keys -> case def.load_children conn keys filter {
+          Err err -> Err err
+          Ok grouped -> Ok (erase grouped)
+        }
+      },
   })
   # Pass 1 (empty data): just locate this slot — its index and key-column offset.
   # Pass 2 (data populated): read the parent key typed, un-erase this relation's
   # grouped map, look up the children, and shape them with `finish`. `unerase` here is
   # the inverse of the `erase` above — same `Dict parent_key (List child)`.
-  Core.make_preloaded key_item (fun data offset row ->
-    case Core.rel_data_get index data {
-      Nothing -> Ok (finish [], [Core.RelSlot index offset])
-      Just grouped_dyn -> case read_key offset row {
-        Err err -> Err err
-        Ok key -> {
-          let grouped = unerase grouped_dyn
-          let kids = case Dicts.get key grouped {
-            Just xs -> xs
-            Nothing -> []
-          }
-          Ok (finish kids, [Core.RelSlot index offset])
+  Core.make_preloaded key_item (fun data offset row -> case Core.rel_data_get index data {
+    Nothing -> Ok (finish [], [Core.RelSlot index offset])
+    Just grouped_dyn -> case read_key offset row {
+      Err err -> Err err
+      Ok key -> {
+        let grouped = unerase grouped_dyn
+        let kids = case Dicts.get key grouped {
+          Just xs -> xs
+          Nothing -> []
         }
+        Ok (finish kids, [Core.RelSlot index offset])
       }
-    })
+    }
+  })
 }
 
 fun first_or_none : List a -> Maybe a
@@ -1325,11 +1324,13 @@ first_or_none items = case items {
 #@     let u = from! users
 #@     let posts = preload authored_posts u      -- Preloaded (List Post)
 #@     select (
-#@       Db.project UserWithPosts {
+#@       build Selection {
 #@         user: users_row u,
 #@         posts: Db.read_preloaded posts,
 #@       })
-pub fun preload : Relation pcols ccols child k -> pcols -> Preloaded (List child)
+pub fun preload : Relation pcols ccols child k
+  -> pcols
+  -> Preloaded (List child)
   needs {QueryBuild}
   where {k: Eq}
 preload relation parent = case relation {
@@ -1346,7 +1347,9 @@ preload_through relation parent = case relation {
 }
 
 #@ Pull a to-one relation into the current query, yielding `Maybe child`.
-pub fun preload_one : RelationOne pcols ccols child k -> pcols -> Preloaded (Maybe child)
+pub fun preload_one : RelationOne pcols ccols child k
+  -> pcols
+  -> Preloaded (Maybe child)
   needs {QueryBuild}
   where {k: Eq}
 preload_one relation parent = case relation {
@@ -1359,7 +1362,7 @@ preload_one relation parent = case relation {
 #@
 #@     let posts = preload_where authored_posts u (fun p -> Db.eq p.published True)
 #@     select (
-#@       Db.project UserWithPosts {
+#@       build Selection {
 #@         user: users_row u,
 #@         posts: Db.read_preloaded posts,
 #@       })
@@ -1370,7 +1373,8 @@ pub fun preload_where : Relation pcols ccols child k
   needs {QueryBuild}
   where {k: Eq}
 preload_where relation parent predicate = case relation {
-  Relation def -> register_relation def parent (fun kids -> kids) (Just predicate)
+  Relation def ->
+    register_relation def parent (fun kids -> kids) (Just predicate)
 }
 
 pub fun preload_through_where : RelationThrough pcols jcols ccols child k link
@@ -1380,7 +1384,8 @@ pub fun preload_through_where : RelationThrough pcols jcols ccols child k link
   needs {QueryBuild}
   where {k: Eq}
 preload_through_where relation parent predicate = case relation {
-  RelationThrough def -> register_relation def parent (fun kids -> kids) (Just predicate)
+  RelationThrough def ->
+    register_relation def parent (fun kids -> kids) (Just predicate)
 }
 
 pub fun preload_one_where : RelationOne pcols ccols child k
@@ -1417,7 +1422,8 @@ extract_keys read offset rows = case rows {
 fun offset_for : Int -> List RelSlot -> Maybe Int
 offset_for index slots = case slots {
   [] -> Nothing
-  RelSlot i off :: rest -> if i == index then Just off else offset_for index rest
+  RelSlot i off :: rest ->
+    if i == index then Just off else offset_for index rest
 }
 
 # For each relation, load + group its children (one batched query via `load`, reading
@@ -1454,8 +1460,7 @@ pub fun transaction : Connection
   -> (Unit -> Result a e needs {Repo, Rollback e})
   -> Result a (TransactionError e)
   needs {Transaction}
-transaction conn body =
-  Pgo.transaction conn (fun () -> body () with pg_repo)
+transaction conn body = Pgo.transaction conn (fun () -> body () with pg_repo)
 
 # Decode every row with the given relation data (the second pass when relations are
 # present, or the only pass with `empty_rel_data` when there are none). The relation

@@ -357,18 +357,26 @@ opaque type Col a = Col ColumnInfo
 #@ convention.
 opaque type Generated a = Generated ColumnInfo
 
-#@ The value of a DB-generated column in an insert input. `Auto` lets the database
-#@ assign it (the column is omitted from the INSERT); `Provide v` forces a value.
-pub type Writable a =
-  | Auto
+#@ The insert value for a column that may use its table default. `UseDefault`
+#@ renders SQL `DEFAULT`; `Provide v` binds an explicit value. This is different
+#@ from `Maybe`: `Nothing` binds SQL NULL, while `UseDefault` asks the database to
+#@ compute the column default.
+pub type DefaultValue a =
+  | UseDefault
   | Provide a
 
-#@ Let the database assign a generated column (the common case).
-pub fun auto : Writable a
-auto = Auto
+pub type alias GeneratedValue a = DefaultValue a
 
-#@ Force a specific value into a normally-generated column.
-pub fun provide : a -> Writable a
+#@ Use the table's default for this column.
+pub fun default : DefaultValue a
+default = UseDefault
+
+#@ Let the database assign a generated column (the common case).
+pub fun auto : DefaultValue a
+auto = UseDefault
+
+#@ Force a specific value into a defaulted or normally-generated column.
+pub fun provide : a -> DefaultValue a
 provide value = Provide value
 
 pub fun table : String -> Table cols where {cols: ColumnSet}
@@ -651,10 +659,20 @@ map transform projection = {
   })
 }
 
+pub type Selection = Selection
+
+pub fun selection : Selection
+selection = Selection
+
+pub record builder Selection {
+  start: projection_into,
+  field: projection_field,
+}
+
 #@ Start building a projection for a constructor. This is the explicit primitive
-#@ used by `Db.project Record { ... }`; most query code should prefer that syntax.
-pub fun project_into : (a -> b) -> Projection (a -> b)
-project_into constructor =
+#@ used by `build Selection Record { ... }`.
+pub fun projection_into : (a -> b) -> Projection (a -> b)
+projection_into constructor =
   Projection (ProjectionDef {
     selections: [],
     width: 0,
@@ -664,12 +682,12 @@ project_into constructor =
 #@ Feed one projected value into a projected constructor. The constructor projection
 #@ is the piped value:
 #@
-#@     Db.project User {
+#@     build Selection User {
 #@       id: Db.read u.id,
 #@       name: Db.read u.name,
 #@     }
-pub fun project_with : Projection a -> Projection (a -> b) -> Projection b
-project_with arg ctor = {
+pub fun projection_with : Projection a -> Projection (a -> b) -> Projection b
+projection_with arg ctor = {
   let Projection arg_def = arg
   let Projection ctor_def = ctor
   Projection (ProjectionDef {
@@ -687,6 +705,10 @@ project_with arg ctor = {
       },
   })
 }
+
+pub fun projection_field : String -> Projection a -> Projection (a -> b) -> Projection b
+projection_field alias arg ctor =
+  projection_with (projection_relabel alias arg) ctor
 
 fun raw_frag : String -> SqlFrag
 raw_frag text = SqlFrag { parts: [Text text] }
@@ -1360,10 +1382,10 @@ fun prefix_items : String -> List SelectItem -> List SelectItem
 prefix_items prefix items = List.map (prefix_item prefix) items
 
 #@ Relabel a projection for a record field. This is the explicit primitive used by
-#@ `Db.project Record { field: projection }`: single-column fields take the field
+#@ `build Selection Record { field: projection }`: single-column fields take the field
 #@ label directly, while multi-column fields get prefixed labels like `user_id`.
-pub fun relabel_projection : String -> Projection a -> Projection a
-relabel_projection alias projection = {
+pub fun projection_relabel : String -> Projection a -> Projection a
+projection_relabel alias projection = {
   let Projection def = projection
   if def.width
     == 1 then Projection ({ def |
@@ -1420,7 +1442,7 @@ pub fun as_sql : input -> Sql a where {input: ToSql a}
 as_sql input = to_sql input
 
 #@ Project any SQL-like value (`Col`, `Generated`, or `Sql`) as a single decoded
-#@ column. This is the explicit leaf used by `project_into` / `project_with`.
+#@ column. This is the explicit leaf used by `projection_into` / `projection_with`.
 pub fun read : input -> Projection a where {input: ToSql a}
 read input = sql_projection (to_sql input)
 

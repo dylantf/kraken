@@ -465,26 +465,44 @@ the column handles (which already carry their `ColumnInfo`):
 
 ```saga
 opaque type Writer cols ins = Writer (cols -> ins -> List InsertCell)
-type InsertCell = Bind String Value | Skip   -- Skip = omitted (a Writable Auto)
+type InsertCell = Bind String InsertValue | Skip
+type InsertValue = InsertParam Value | InsertDefault
 
 pub fun writer : (cols -> ins -> List InsertCell) -> Writer cols ins
 pub fun set   : Sql a -> a          -> InsertCell where {a: PgType}  -- always binds; name from the column leaf
-pub fun set_w : Sql a -> Writable a -> InsertCell where {a: PgType}  -- Auto → Skip, Provide v → Bind
+pub fun set_default : Sql a -> DefaultValue a -> InsertCell where {a: PgType}  -- default → DEFAULT, provide v → Bind
+pub fun set_generated : Sql a -> GeneratedValue a -> InsertCell where {a: PgType}  -- auto → DEFAULT, provide v → Bind
 ```
 
-Per table — hand-write the insert record (the only "synthesis" replacement, ~3
-lines) and the writer (~5 lines), mirroring `users_row`:
+Per table — hand-write the input shape (often an anonymous record alias) and the
+writer, mirroring `users_row`. In the common case, DB-generated columns are just
+omitted from the input:
 
 ```saga
-record UsersInsert { id: Db.Writable Int, name: String, age: Int }
+type alias NewUser = { name: String, age: Int }
 
-fun users_writer : Db.Writer Users UsersInsert
-users_writer = Db.writer (fun c r -> [
-  Db.set_w c.id   r.id,     -- generated column: Db.auto omits, Db.provide binds
-  Db.set   c.name r.name,
-  Db.set   c.age  r.age,
+fun users_insert_writer : Db.Writer Users NewUser
+users_insert_writer = Db.writer (fun c r -> [
+  Db.set c.name r.name,
+  Db.set c.age r.age,
 ])
 ```
+
+If one input shape deliberately needs "let the DB use its default" and "force
+this value" modes, use `DefaultValue a` plus `Db.default` / `Db.provide`:
+
+```saga
+type alias NewUser = { name: String, nickname: Db.DefaultValue (Maybe String) }
+
+fun users_insert_writer : Db.Writer Users NewUser
+users_insert_writer = Db.writer (fun c r -> [
+  Db.set c.name r.name,
+  Db.set_default c.nickname r.nickname,
+])
+```
+
+Here `Db.default` renders SQL `DEFAULT`, while `Db.provide Nothing` binds SQL
+`NULL`; `Maybe` alone never means "use the column default".
 
 `insert` and friends drop *all three* trait constraints and take the writer; the
 types are pinned by the `Writer cols ins` value, exactly as the row type was
@@ -495,7 +513,7 @@ pub fun insert : Table cols -> Writer cols ins -> ins -> Prepared Unit
 insert table_value w value = {
   let cols  = insert_cols table_value          -- ColumnSet, unaliased (INSERT has no table alias)
   let cells = run_writer w cols value
-  finish (insert_parts table_value (bound_cells cells))   -- drop Skips, keep (sql_name, value)
+  finish (insert_parts table_value (bound_cells cells))   -- keep params and DEFAULT cells
 }
 ```
 
@@ -524,15 +542,13 @@ projection callback returns a `Projection row` like any other select.
 This pins down the `Col`/`Sql` question left open under "Expression operands":
 the column record's fields are uniform `Sql a` that carry a column-origin marker
 in the leaf. Reads project them (`users_row` via `read`/`sql_projection`),
-predicates use them as operands (no `ToSql`), and `set`/`set_w`/`Db.ref`/`Db.key`
+predicates use them as operands (no `ToSql`), and `set`/`set_generated`/`Db.ref`/`Db.key`
 recover the SQL name from the leaf. Consequently **`Col a` and `Generated a` as
 distinct column-record field types are no longer needed** — `Generated`'s only
-purpose was telling synthesis to emit a `Writable` field, and the hand-written
-insert record now declares `Writable a` directly. `Writable` itself stays (a
-plain `Auto | Provide a` ADT with `Db.auto` / `Db.provide`). The only knob left:
-if keeping `Col`/`Generated` as documentation markers is preferred, they become
-transparent aliases coerced to `Sql a` in `users_row` — at the cost of a second
-field-type form on the read path.
+remaining purpose is type-checking writes to generated columns (`set` cannot
+target them; `set_generated` can). `DefaultValue` stays as the explicit
+`UseDefault | Provide a` ADT (`Db.default` / `Db.auto` / `Db.provide`), but most
+insert inputs do not need to mention it.
 
 ### Symmetry
 
@@ -541,7 +557,7 @@ The whole per-table schema becomes symmetric and fully hand-written, no derives:
 | Direction | Artifact | Type |
 | --- | --- | --- |
 | read | `users_row` | `Users -> Projection User` |
-| write (insert) | `UsersInsert` + `users_writer` | `Writer Users UsersInsert` |
+| write (insert) | `NewUser` + `users_insert_writer` | `Writer Users NewUser` |
 | write (save) | `users_save_writer` (if used) | `Writer Users User` |
 | names/PK | `ColumnSet` impl | (already hand-written) |
 
@@ -564,10 +580,7 @@ Kraken (`lib/Core.saga`, `lib/Write.saga`):
 - The write-side derives and their traits: `Insertable` (+ `synthesizes via`
   record synthesis), `InsertField`/`InsertFields`, `InsertRow`, `ColumnNameMap`/
   `ColumnNameFields`, `column_name_map` — all replaced by a per-table `Writer`
-  value (see "Writes"). `Writable` (the `Auto | Provide` ADT) stays.
-- `Col a` / `Generated a` as distinct column-record field types (fields become
-  uniform `Sql a` with leaf-level column identity); `Generated`'s role moves into
-  the hand-written insert record's `Writable a` fields.
+  value (see "Writes"). `DefaultValue` (the `UseDefault | Provide` ADT) stays.
 - `KnownSymbol`/`Proxy` usage.
 
 Compiler (`saga`), once kraken and saga_json no longer use it:
