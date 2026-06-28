@@ -1,7 +1,6 @@
 module Kraken.Query
 
 import Std.Dynamic (Dynamic, DecodeError)
-import Std.Generic (Generic)
 import Std.Dict as Dicts
 import Kraken.Core (
   Table,
@@ -10,12 +9,8 @@ import Kraken.Core (
   Order,
   Group,
   Projection,
-  Selectable,
   ToSql,
   frag_of,
-  DerivedScope,
-  derived_columns,
-  selection_items,
   SelectItem,
   SqlFrag,
   SqlPart,
@@ -426,24 +421,22 @@ handler collect_query for QueryBuild {
 #@ builder closure's *return* is required to be a projection. `Select` is opaque, so
 #@ `select` is the only way to produce one — a query body therefore cannot forget to
 #@ select, return a bare record, or have an early selection silently shadowed.
-pub opaque type Select a = Select a
+pub opaque type Select a = Select (Projection a)
 
 #@ Name a query's result shape. The `!` verbs (`from!`, `where_!`, …) build the
 #@ query; `select` names what comes back, and its value's type determines the row
 #@ type `all`/`one` decode. It is the closing expression of a `query` /
 #@ `from_subquery` / `cte` / full-join body — pure, not an effect.
-pub fun select : a -> Select a
-select value = Select value
+pub fun select : Projection a -> Select a
+select projection = Select projection
 
 #@ Build a `Prepared` query from a builder closure. The closure performs
 #@ `QueryBuild` operations (`from!`, `inner_join!`, …) and *returns* a `select (…)`;
 #@ the type selected determines the row type that `all`/`one` will decode.
-pub fun query : (Unit -> Select selection needs {QueryBuild}) -> Prepared row
-  where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
+pub fun query : (Unit -> Select row needs {QueryBuild}) -> Prepared row
 query make = {
   let QueryStep run_query = make () with collect_query
-  let (Select selection, state) = run_query empty_state
-  let projection: Projection row = Core.project selection
+  let (Select projection, state) = run_query empty_state
   prepare projection state
 }
 
@@ -462,13 +455,16 @@ query make = {
 #@
 #@     full_join_query employees departments
 #@       (fun e d -> Db.eq_col e.dept_id d.id)
-#@       (fun emp dept -> { select ({ employee: emp, department: dept }) })
+#@       (fun (emp, dept) -> select (
+#@         Db.project EmployeeDepartment {
+#@           employee: Db.read_nullable emp employee_row,
+#@           department: Db.read_nullable dept department_row,
+#@         }))
 pub fun full_join_query : Table colsA
   -> Table colsB
   -> (colsA -> colsB -> Expr)
-  -> ((Nullable colsA, Nullable colsB) -> Select selection needs {QueryBuild})
+  -> ((Nullable colsA, Nullable colsB) -> Select row needs {QueryBuild})
   -> Prepared row
-  where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
 full_join_query table_a table_b on_fn body = {
   let (source_a, state1) = bind_table_source table_a empty_state
   let (source_b, state2) = bind_table_source table_b state1
@@ -479,74 +475,64 @@ full_join_query table_a table_b on_fn body = {
   let state4 = { state3 | joins: List.append state3.joins [join] }
   let scopes = (Core.as_nullable cols_a, Core.as_nullable cols_b)
   let QueryStep run = (body scopes) with collect_query
-  let (Select selection, state) = run state4
-  let projection: Projection row = Core.project selection
+  let (Select projection, state) = run state4
   prepare projection state
 }
 
-#@ Use a subquery as a derived table in `FROM`. The builder closure is the same
-#@ `from!`/`where_!`/`select` DSL under a nested handler; each `select` label
-#@ becomes a column of the derived table, returned as a scope you dot into in the
-#@ outer query:
+#@ Use a subquery as a derived table in `FROM`. Until projection literals can
+#@ synthesize scopes, pass a scope builder for the derived table's alias.
 #@
-#@     let t = from_subquery (fun () -> {
+#@     let t = from_subquery_as post_count_cols (fun () -> {
 #@       let p = from! posts
 #@       group_by! [Db.group p.author_id]
-#@       select ({ author_id: p.author_id, posts: Db.count_star })
+#@       select (post_count_projection p)
 #@     })
 #@     where_! (Db.gt t.posts 5)
-#@     select ({ author: t.author_id, posts: t.posts })
+#@     select (post_count_projection t)
 #@
 #@ The subquery's params are numbered in sequence by the outer query, and its own
 #@ tables get an `s`-prefixed alias so they never clash with the outer `t`-aliases.
-pub fun from_subquery : (Unit -> Select selection needs {QueryBuild}) -> scope
+pub fun from_subquery_as : (String -> scope)
+  -> (Unit -> Select row needs {QueryBuild})
+  -> scope
   needs {QueryBuild}
-  where {
-    selection: Generic sel_rep,
-    sel_rep: Selectable row_rep + DerivedScope scope_rep,
-    scope: Generic scope_rep,
-  }
-from_subquery make = {
-  let (Select selection, sub_state) = run_subquery make
-  let frag = select_frag (selection_items selection) sub_state
+from_subquery_as make_scope make = {
+  let (Select projection, sub_state) = run_subquery make
+  let frag = select_frag (Core.projection_selections projection) sub_state
   bind_derived! (DerivedTable {
     frag: frag,
-    make_scope: fun alias -> derived_columns selection alias,
+    make_scope: make_scope,
   })
 }
 
 #@ Define a named CTE and get back a `Table` handle for it. The builder closure is
-#@ the same `from!`/`select` DSL as `from_subquery`; each `select` label becomes a
-#@ column of the CTE. Unlike `from_subquery`, the body is hoisted into a leading
-#@ `WITH <name> AS (…)` and the handle is referenced by name — so it can be used in
-#@ several places (e.g. `from!` it and also `inner_join!` it):
+#@ the same `from!`/`select` DSL as `from_subquery_as`; the body is hoisted into a
+#@ leading `WITH <name> AS (…)` and the handle is referenced by name.
 #@
-#@     let counts = cte "post_counts" (fun () -> {
+#@     let counts = cte_as "post_counts" post_count_cols (fun () -> {
 #@       let p = from! posts
 #@       group_by! [Db.group p.author_id]
-#@       select ({ author_id: p.author_id, posts: Db.count_star })
+#@       select (post_count_projection p)
 #@     })
 #@     let c = from! counts
 #@     where_! (Db.gt c.posts 5)
-#@     select ({ author: c.author_id, posts: c.posts })
+#@     select (post_count_projection c)
 #@
 #@ Renders `WITH post_counts AS (…) SELECT … FROM post_counts AS t0 WHERE …`. The
 #@ CTE's params are numbered in sequence (the `WITH` is rendered first), and its own
 #@ tables get an `s`-prefixed alias so they never clash with the outer `t`-aliases.
-pub fun cte : String -> (Unit -> Select selection needs {QueryBuild}) -> Table scope
+pub fun cte_as : String
+  -> (String -> scope)
+  -> (Unit -> Select row needs {QueryBuild})
+  -> Table scope
   needs {QueryBuild}
-  where {
-    selection: Generic sel_rep,
-    sel_rep: Selectable row_rep + DerivedScope scope_rep,
-    scope: Generic scope_rep,
-  }
-cte name make = {
-  let (Select selection, sub_state) = run_subquery make
-  let frag = select_frag (selection_items selection) sub_state
+cte_as name make_scope make = {
+  let (Select projection, sub_state) = run_subquery make
+  let frag = select_frag (Core.projection_selections projection) sub_state
   define_cte! (DerivedCte {
     name: name,
     frag: frag,
-    make_scope: fun alias -> derived_columns selection alias,
+    make_scope: make_scope,
   })
 }
 
@@ -985,15 +971,16 @@ scalar_subquery make = Core.sql_from_frag (scalar_subquery_frag make)
 #@ instead of failing). This is the safe default; reach for `scalar_subquery` only
 #@ when the subquery provably yields one non-null row.
 #@
-#@     select ({
-#@       id: u.id,
-#@       a_title: Db.scalar_subquery_maybe (fun () -> {
-#@         let p = from! posts
-#@         where_! (Db.eq_col p.author_id u.id)
-#@         limit! 1
-#@         p.title
-#@       }),
-#@     })   # { id: Int, a_title: Maybe String }
+#@     select (
+#@       Db.project UserMaybePostTitle {
+#@         id: Db.read u.id,
+#@         a_title: Db.read (Db.scalar_subquery_maybe (fun () -> {
+#@           let p = from! posts
+#@           where_! (Db.eq_col p.author_id u.id)
+#@           limit! 1
+#@           p.title
+#@         })),
+#@       })
 pub fun scalar_subquery_maybe : (Unit -> col needs {QueryBuild}) -> Core.Sql (Maybe a)
   needs {QueryBuild}
   where {col: ToSql a, a: Core.PgType}
@@ -1092,7 +1079,7 @@ exactly_one conn prepared = if prepared.noop then Err (ExpectedOneRow 0)
 #@ (over the parent's and child's column records), so keys are named exactly once
 #@ and the batched child query is generated for you.
 #@
-#@     authored_posts = Db.has_many posts (fun u -> u.id) (fun p -> p.author_id)
+#@     authored_posts = Db.has_many posts posts_row (fun u -> u.id) (fun p -> p.author_id)
 opaque type Relation pcols ccols child k = Relation (RelationDef pcols ccols child k)
 
 #@ A to-many relation through a join table. It consumes exactly like `Relation`
@@ -1137,6 +1124,7 @@ group_pairs pairs =
 # groups by it. `has_many` / `belongs_to` / `has_one` all build this; they differ only
 # in the wrapper type (and so in how the result is consumed).
 fun relation_def : Table ccols
+  -> (ccols -> Projection child)
   -> (pcols -> pk)
   -> (ccols -> ck)
   -> RelationDef pcols ccols child k
@@ -1144,19 +1132,13 @@ fun relation_def : Table ccols
     k: Core.PgType + Eq,
     pk: ToSql k,
     ck: ToSql k,
-    ccols: Generic ccols_rep,
-    ccols_rep: Selectable child_rep,
-    child: Generic child_rep,
   }
-relation_def child_table parent_key child_key = RelationDef {
+relation_def child_table child_projection parent_key child_key = RelationDef {
   parent_key: fun pc -> Core.as_sql (parent_key pc),
   load_children: fun conn keys filter -> {
-    # Build the child query selecting (matching key, child row): the row is a generic
-    # select over `cols` alone (a single type variable, so its `Generic`/`Selectable`
-    # constraints can be surfaced on this signature), paired manually with the key
-    # column's projection. Selecting a `(Col k, cols)` value directly is impossible —
-    # a `fun` can't carry a `Generic` constraint over an applied/anonymous type. An
-    # optional `filter` predicate is `AND`-ed into the `WHERE` to scope the children.
+    # Build the child query selecting (matching key, child row), paired manually
+    # from two first-class projections. An optional `filter` predicate is `AND`-ed
+    # into the `WHERE` to scope the children.
     let QueryStep run = (fun () -> {
       let cols = from! child_table
       let key_pred = Core.in_ (child_key cols) keys
@@ -1167,7 +1149,7 @@ relation_def child_table parent_key child_key = RelationDef {
       cols
     }) () with collect_query
     let (cols, state) = run empty_state
-    let pair_projection = Core.project_pair (Core.col_projection (Core.as_sql (child_key cols))) (Core.project cols)
+    let pair_projection = Core.project_pair (Core.col_projection (Core.as_sql (child_key cols))) (child_projection cols)
     case all conn (prepare pair_projection state) {
       Err err -> Err err
       Ok pairs -> Ok (group_pairs pairs)
@@ -1181,6 +1163,7 @@ relation_def child_table parent_key child_key = RelationDef {
 #@ result; nested relations on the child load too, since the child query runs through
 #@ the ordinary `all`. Consume with `preload` → `List child`.
 pub fun has_many : Table ccols
+  -> (ccols -> Projection child)
   -> (pcols -> pk)
   -> (ccols -> ck)
   -> Relation pcols ccols child k
@@ -1188,11 +1171,9 @@ pub fun has_many : Table ccols
     k: Core.PgType + Eq,
     pk: ToSql k,
     ck: ToSql k,
-    ccols: Generic ccols_rep,
-    ccols_rep: Selectable child_rep,
-    child: Generic child_rep,
   }
-has_many child_table parent_key child_fk = Relation (relation_def child_table parent_key child_fk)
+has_many child_table child_projection parent_key child_fk =
+  Relation (relation_def child_table child_projection parent_key child_fk)
 
 #@ Define a many-to-many relation through a join table. The generated child query
 #@ selects each target child paired with the join row's parent foreign key:
@@ -1206,6 +1187,7 @@ has_many child_table parent_key child_fk = Relation (relation_def child_table pa
 #@ relation with the parent/child tables and join-key accessors swapped.
 pub fun has_many_through : Table jcols
   -> Table ccols
+  -> (ccols -> Projection child)
   -> (pcols -> pk)
   -> (jcols -> jpk)
   -> (jcols -> jck)
@@ -1218,11 +1200,8 @@ pub fun has_many_through : Table jcols
     jpk: ToSql k,
     jck: ToSql link,
     ck: ToSql link,
-    ccols: Generic ccols_rep,
-    ccols_rep: Selectable child_rep,
-    child: Generic child_rep,
   }
-has_many_through join_table child_table parent_key join_parent_fk join_child_fk child_key = {
+has_many_through join_table child_table child_projection parent_key join_parent_fk join_child_fk child_key = {
   let def = RelationDef {
     parent_key: fun pc -> Core.as_sql (parent_key pc),
     load_children: fun conn keys filter -> {
@@ -1238,7 +1217,7 @@ has_many_through join_table child_table parent_key join_parent_fk join_child_fk 
         (join_cols, child_cols)
       }) () with collect_query
       let ((join_cols, child_cols), state) = run empty_state
-      let pair_projection = Core.project_pair (Core.col_projection (Core.as_sql (join_parent_fk join_cols))) (Core.project child_cols)
+      let pair_projection = Core.project_pair (Core.col_projection (Core.as_sql (join_parent_fk join_cols))) (child_projection child_cols)
       case all conn (prepare pair_projection state) {
         Err err -> Err err
         Ok pairs -> Ok (group_pairs pairs)
@@ -1252,8 +1231,9 @@ has_many_through join_table child_table parent_key join_parent_fk join_child_fk 
 #@ child's key (e.g. a post's `author_id` → a user's `id`). Consume with `preload`
 #@ → `Maybe child`.
 #@
-#@     post_author = Db.belongs_to users (fun p -> p.author_id) (fun u -> u.id)
+#@     post_author = Db.belongs_to users users_row (fun p -> p.author_id) (fun u -> u.id)
 pub fun belongs_to : Table ccols
+  -> (ccols -> Projection child)
   -> (pcols -> pk)
   -> (ccols -> ck)
   -> RelationOne pcols ccols child k
@@ -1261,15 +1241,14 @@ pub fun belongs_to : Table ccols
     k: Core.PgType + Eq,
     pk: ToSql k,
     ck: ToSql k,
-    ccols: Generic ccols_rep,
-    ccols_rep: Selectable child_rep,
-    child: Generic child_rep,
   }
-belongs_to child_table parent_key child_key = RelationOne (relation_def child_table parent_key child_key)
+belongs_to child_table child_projection parent_key child_key =
+  RelationOne (relation_def child_table child_projection parent_key child_key)
 
 #@ Define a has-one relation: like `has_many` (the child holds the foreign key) but at
 #@ most one child per parent. Consume with `preload` → `Maybe child`.
 pub fun has_one : Table ccols
+  -> (ccols -> Projection child)
   -> (pcols -> pk)
   -> (ccols -> ck)
   -> RelationOne pcols ccols child k
@@ -1277,11 +1256,9 @@ pub fun has_one : Table ccols
     k: Core.PgType + Eq,
     pk: ToSql k,
     ck: ToSql k,
-    ccols: Generic ccols_rep,
-    ccols_rep: Selectable child_rep,
-    child: Generic child_rep,
   }
-has_one child_table parent_key child_fk = RelationOne (relation_def child_table parent_key child_fk)
+has_one child_table child_projection parent_key child_fk =
+  RelationOne (relation_def child_table child_projection parent_key child_fk)
 
 # The shared preload engine: register the relation's load spec and build a `Preloaded`
 # whose decode resolves the grouped children through `finish` — `identity` for a
@@ -1339,34 +1316,6 @@ first_or_none items = case items {
   item :: _ -> Just item
 }
 
-# Relations carry their own cardinality, so a single `preload` does the right thing:
-# the relation *type* (`Relation` vs `RelationOne`) determines the output shape via the
-# `rel -> …` functional dependency. The user never picks a to-many vs to-one variant —
-# `has_many` → `List child`, `belongs_to` / `has_one` → `Maybe child`. The instance
-# does the registration directly, shaping the grouped children with `identity` (to-many)
-# or `first_or_none` (to-one).
-pub trait Preloadable rel pcols ccols out | rel -> pcols ccols out {
-  fun run_preload : rel -> pcols -> Maybe (ccols -> Expr) -> Preloaded out needs {QueryBuild}
-}
-
-impl Preloadable pcols ccols (List child) for (Relation pcols ccols child k) where {k: Eq} needs {QueryBuild} {
-  run_preload relation parent filter = case relation {
-    Relation def -> register_relation def parent (fun kids -> kids) filter
-  }
-}
-
-impl Preloadable pcols ccols (List child) for (RelationThrough pcols jcols ccols child k link) where {k: Eq} needs {QueryBuild} {
-  run_preload relation parent filter = case relation {
-    RelationThrough def -> register_relation def parent (fun kids -> kids) filter
-  }
-}
-
-impl Preloadable pcols ccols (Maybe child) for (RelationOne pcols ccols child k) where {k: Eq} needs {QueryBuild} {
-  run_preload relation parent filter = case relation {
-    RelationOne def -> register_relation def parent first_or_none filter
-  }
-}
-
 #@ Pull a relation into the current query as a `select` field. The relation's declared
 #@ kind picks the result shape — `has_many` → `List child`, `belongs_to`/`has_one` →
 #@ `Maybe child` — so there's nothing to choose at the call site. The parent-key column
@@ -1375,26 +1324,74 @@ impl Preloadable pcols ccols (Maybe child) for (RelationOne pcols ccols child k)
 #@
 #@     let u = from! users
 #@     let posts = preload authored_posts u      -- Preloaded (List Post)
-#@     select ({ user: u, posts: posts })
-#@
-#@     let p = from! posts
-#@     let author = preload post_author p        -- Preloaded (Maybe User)
-#@     select ({ post: p, author: author })
-pub fun preload : rel -> pcols -> Preloaded out
+#@     select (
+#@       Db.project UserWithPosts {
+#@         user: users_row u,
+#@         posts: Db.read_preloaded posts,
+#@       })
+pub fun preload : Relation pcols ccols child k -> pcols -> Preloaded (List child)
   needs {QueryBuild}
-  where {rel: Preloadable pcols ccols out}
-preload relation parent = run_preload relation parent Nothing
+  where {k: Eq}
+preload relation parent = case relation {
+  Relation def -> register_relation def parent (fun kids -> kids) Nothing
+}
+
+pub fun preload_through : RelationThrough pcols jcols ccols child k link
+  -> pcols
+  -> Preloaded (List child)
+  needs {QueryBuild}
+  where {k: Eq}
+preload_through relation parent = case relation {
+  RelationThrough def -> register_relation def parent (fun kids -> kids) Nothing
+}
+
+#@ Pull a to-one relation into the current query, yielding `Maybe child`.
+pub fun preload_one : RelationOne pcols ccols child k -> pcols -> Preloaded (Maybe child)
+  needs {QueryBuild}
+  where {k: Eq}
+preload_one relation parent = case relation {
+  RelationOne def -> register_relation def parent first_or_none Nothing
+}
 
 #@ Like `preload`, but scopes the loaded children with a predicate over the child's
 #@ columns — `AND`-ed into the generated child query's `WHERE`. Only matching children
 #@ are loaded and stitched; parents with none get `[]` (or `Nothing` for a to-one).
 #@
 #@     let posts = preload_where authored_posts u (fun p -> Db.eq p.published True)
-#@     select ({ user: u, posts: posts })       -- each user's *published* posts
-pub fun preload_where : rel -> pcols -> (ccols -> Expr) -> Preloaded out
+#@     select (
+#@       Db.project UserWithPosts {
+#@         user: users_row u,
+#@         posts: Db.read_preloaded posts,
+#@       })
+pub fun preload_where : Relation pcols ccols child k
+  -> pcols
+  -> (ccols -> Expr)
+  -> Preloaded (List child)
   needs {QueryBuild}
-  where {rel: Preloadable pcols ccols out}
-preload_where relation parent predicate = run_preload relation parent (Just predicate)
+  where {k: Eq}
+preload_where relation parent predicate = case relation {
+  Relation def -> register_relation def parent (fun kids -> kids) (Just predicate)
+}
+
+pub fun preload_through_where : RelationThrough pcols jcols ccols child k link
+  -> pcols
+  -> (ccols -> Expr)
+  -> Preloaded (List child)
+  needs {QueryBuild}
+  where {k: Eq}
+preload_through_where relation parent predicate = case relation {
+  RelationThrough def -> register_relation def parent (fun kids -> kids) (Just predicate)
+}
+
+pub fun preload_one_where : RelationOne pcols ccols child k
+  -> pcols
+  -> (ccols -> Expr)
+  -> Preloaded (Maybe child)
+  needs {QueryBuild}
+  where {k: Eq}
+preload_one_where relation parent predicate = case relation {
+  RelationOne def -> register_relation def parent first_or_none (Just predicate)
+}
 
 # Read one relation's parent keys (typed) from the raw result rows at `offset`, using
 # the relation's own column decoder. This is ordinary positional decoding — the keys

@@ -1,6 +1,5 @@
 module Kraken.Core
 
-import Std.Base (Proxy, KnownSymbol)
 import Std.DateTime (Date, Time, NaiveDateTime)
 import Std.Dict as Dicts
 import Std.Dynamic (
@@ -17,7 +16,6 @@ import Std.Dynamic (
   optional,
   from_erlang
 )
-import Std.Generic (Generic, Leaf, Labeled, And, Record)
 import SagaJson as Json
 import SagaJson.Codec as JsonCodec (ToJson, FromJson)
 import SagaPgo (Connection, Postgres, QueryError, Returned)
@@ -202,8 +200,8 @@ enum_text_decode mapping = decode_via (fun label -> case lookup_value mapping la
   Nothing -> Err ("Db.enum_text_decode: unknown enum label: " <> label)
 })
 
-#@ A phantom carrier for a (`Star`-kinded) type, so a cast can name its target type
-#@ without having a value of it. (`Std.Base.Proxy` is `Symbol`-kinded only.)
+#@ A phantom carrier for a type, so a cast can name its target type without having
+#@ a value of it.
 pub type TypeTag a = TypeTag
 
 #@ The Postgres type name a Saga type casts to (`x::<name>`). Only types you cast
@@ -361,8 +359,6 @@ opaque type Generated a = Generated ColumnInfo
 
 #@ The value of a DB-generated column in an insert input. `Auto` lets the database
 #@ assign it (the column is omitted from the INSERT); `Provide v` forces a value.
-#@ A `deriving (Db.Insertable …)` insert type maps each `Generated a` schema column
-#@ to a `Writable a` field.
 pub type Writable a =
   | Auto
   | Provide a
@@ -374,23 +370,6 @@ auto = Auto
 #@ Force a specific value into a normally-generated column.
 pub fun provide : a -> Writable a
 provide value = Provide value
-
-#@ The per-field type map that drives insert-type synthesis: it rewrites each
-#@ schema column type to its insert-input field type. The method-less impls below
-#@ ARE the rewrite table — a plain `Col a` field binds its value directly, a
-#@ `Generated a` field becomes `Writable a` (so it can be omitted with `Db.auto`).
-pub trait InsertField col ins | col -> ins {}
-impl InsertField a for Col a {}
-impl InsertField (Writable a) for Generated a {}
-
-#@ Links a table's column record to its generated insert-shape type. Emitted by
-#@ `deriving (Db.Insertable <Name>)` on the column record; consumed by `Db.insert`
-#@ to fix the accepted input type from the table (`cols` determines `ins`). The
-#@ `synthesizes` clause tells the compiler to create the insert record by mapping
-#@ each column field through `InsertField` and to attach `deriving (InsertRow)` so
-#@ Kraken can encode it.
-pub trait Insertable cols ins | cols -> ins
-  synthesizes via InsertField deriving (InsertRow)
 
 pub fun table : String -> Table cols where {cols: ColumnSet}
 table name =
@@ -461,6 +440,11 @@ pub fun col_name : Col a -> String
 col_name column = {
   let Col info = column
   info.name
+}
+
+pub fun generated_name : Generated a -> String
+generated_name generated = case generated {
+  Generated info -> info.name
 }
 
 # --- Upsert `DO UPDATE` vocabulary (Tier 7 follow-ups) ---
@@ -621,7 +605,7 @@ opaque type Projection a = Projection (ProjectionDef a)
 #@ how the relation is consumed (`List child` for a to-many `preload`, `Maybe child`
 #@ for a to-one `preload_one`). Built by the query layer; selecting it contributes
 #@ the parent-key column to the SELECT and a deferred decode that resolves children
-#@ from the executor-supplied `RelData`. See `make_preloaded` and `Selectable out`.
+#@ from the executor-supplied `RelData`.
 opaque type Preloaded out = Preloaded (PreloadedDef out)
 
 record PreloadedDef out {
@@ -641,34 +625,17 @@ pub fun make_preloaded : SelectItem
 make_preloaded key_item resolve =
   Preloaded (PreloadedDef { key_item: key_item, resolve: resolve })
 
-pub trait Selectable selection row | selection -> row {
-  fun to_projection : selection -> Projection row
-}
-
-pub trait ToSql input a | input -> a {
+pub trait ToSql input a {
   fun to_sql : input -> Sql a
 }
 
-pub trait ToArraySql input a | input -> a {
+pub trait ToArraySql input a {
   fun to_array_sql : input -> Sql (Array a)
 }
 
-pub trait ToJsonbSql input a | input -> a {
+pub trait ToJsonbSql input a {
   fun to_jsonb_sql : input -> Sql (Jsonb a)
 }
-
-pub fun project : selection -> Projection row
-  where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
-project selection =
-  to_projection (to selection)
-  |> map from
-
-#@ The `SelectItem`s a selection renders to, without committing to the decoded row
-#@ type. Used to render a subquery's `SELECT` list (a derived table decodes through
-#@ the *outer* query, so the subquery's own row type is never needed).
-pub fun selection_items : selection -> List SelectItem
-  where {selection: Generic selection_rep, selection_rep: Selectable row_rep}
-selection_items selection = projection_selections (to_projection (to selection))
 
 pub fun map : (a -> b) -> Projection a -> Projection b
 map transform projection = {
@@ -680,6 +647,43 @@ map transform projection = {
       case def.decode_at data offset row {
         Err err -> Err err
         Ok (value, reqs) -> Ok (transform value, reqs)
+      },
+  })
+}
+
+#@ Start building a projection for a constructor. This is the explicit primitive
+#@ used by `Db.project Record { ... }`; most query code should prefer that syntax.
+pub fun project_into : (a -> b) -> Projection (a -> b)
+project_into constructor =
+  Projection (ProjectionDef {
+    selections: [],
+    width: 0,
+    decode_at: fun _data _offset _row -> Ok (constructor, []),
+  })
+
+#@ Feed one projected value into a projected constructor. The constructor projection
+#@ is the piped value:
+#@
+#@     Db.project User {
+#@       id: Db.read u.id,
+#@       name: Db.read u.name,
+#@     }
+pub fun project_with : Projection a -> Projection (a -> b) -> Projection b
+project_with arg ctor = {
+  let Projection arg_def = arg
+  let Projection ctor_def = ctor
+  Projection (ProjectionDef {
+    selections: List.append ctor_def.selections arg_def.selections,
+    width: ctor_def.width + arg_def.width,
+    decode_at: fun data offset row ->
+      case ctor_def.decode_at data offset row {
+        Err err -> Err err
+        Ok (constructor, ctor_reqs) ->
+          case arg_def.decode_at data (offset + ctor_def.width) row {
+            Err err -> Err err
+            Ok (value, arg_reqs) ->
+              Ok (constructor value, List.append ctor_reqs arg_reqs)
+          }
       },
   })
 }
@@ -1355,7 +1359,10 @@ prefix_item prefix item =
 fun prefix_items : String -> List SelectItem -> List SelectItem
 prefix_items prefix items = List.map (prefix_item prefix) items
 
-fun relabel_projection : String -> Projection a -> Projection a
+#@ Relabel a projection for a record field. This is the explicit primitive used by
+#@ `Db.project Record { field: projection }`: single-column fields take the field
+#@ label directly, while multi-column fields get prefixed labels like `user_id`.
+pub fun relabel_projection : String -> Projection a -> Projection a
 relabel_projection alias projection = {
   let Projection def = projection
   if def.width
@@ -1412,6 +1419,30 @@ make_projection selections width decoder =
 pub fun as_sql : input -> Sql a where {input: ToSql a}
 as_sql input = to_sql input
 
+#@ Project any SQL-like value (`Col`, `Generated`, or `Sql`) as a single decoded
+#@ column. This is the explicit leaf used by `project_into` / `project_with`.
+pub fun read : input -> Projection a where {input: ToSql a}
+read input = sql_projection (to_sql input)
+
+#@ Project an already-built SQL expression. Alias is supplied by the surrounding
+#@ projection construction or by the generated select item.
+pub fun read_sql : Sql a -> Projection a
+read_sql sql_value = sql_projection sql_value
+
+#@ Project a nullable scope through a whole-row projection. This keeps the left
+#@ join all-NULL sentinel in one named operation instead of making callers unwrap
+#@ a scope directly at a `select` site.
+pub fun read_nullable : Nullable cols -> (cols -> Projection a) -> Projection (Maybe a)
+read_nullable scope project_scope =
+  nullable_row (project_scope (unwrap_cols scope))
+
+#@ Project a preloaded relation field. It contributes the hidden parent-key column
+#@ and decodes through the relation data stitched in by the query executor.
+pub fun read_preloaded : Preloaded out -> Projection out
+read_preloaded preloaded = case preloaded {
+  Preloaded def -> make_projection [def.key_item] 1 def.resolve
+}
+
 #@ A `SelectItem` selecting a single `Sql` value under the given alias. Exposed so
 #@ the query layer can inject a relation's parent-key column into the SELECT.
 pub fun col_select_item : String -> Sql a -> SelectItem
@@ -1429,9 +1460,7 @@ col_decoder sql_value = case sql_value {
 }
 
 #@ A single-column `Projection` for a `Sql` value. Exposed so the query layer can
-#@ pair a relation's foreign-key column alongside the child row without a generic
-#@ select over an anonymous pair (whose `Generic` constraint can't be surfaced on a
-#@ `fun`).
+#@ pair a relation's foreign-key column alongside the child row.
 pub fun col_projection : Sql a -> Projection a
 col_projection sql_value = sql_projection sql_value
 
@@ -1450,39 +1479,6 @@ pub fun decode_projection : Projection a
 decode_projection projection data row = {
   let Projection def = projection
   def.decode_at data 0 row
-}
-
-impl Selectable a for Col a where {a: PgType} {
-  to_projection column = field_projection column
-}
-
-# Generated columns read back exactly like normal columns.
-impl Selectable a for Generated a where {a: PgType} {
-  to_projection column = field_projection (generated_as_col column)
-}
-
-# Lifts any selectable scope to its `Maybe` form. Because nullability lives on
-# the scope rather than on individual columns, this single generic instance
-# covers every table's left-joined selection — no per-table impl is needed.
-impl Selectable (Maybe out) for Nullable s where {s: Selectable out} {
-  to_projection scope = case scope {
-    Nullable inner -> nullable_row (to_projection inner)
-  }
-}
-
-impl Selectable a for Sql a {
-  to_projection sql_value = sql_projection sql_value
-}
-
-# A preloaded relation contributes exactly one selected column (its parent key,
-# width 1) and decodes to `out` (its resolver's shape) from the executor-loaded
-# `RelData`. The functional dep `Preloaded out -> out` is what lets a `select` field
-# of `Preloaded (List Post)` infer `List Post`, or `Preloaded (Maybe Post)` infer
-# `Maybe Post`.
-impl Selectable out for Preloaded out {
-  to_projection preloaded = case preloaded {
-    Preloaded def -> make_projection [def.key_item] 1 def.resolve
-  }
 }
 
 impl ToSql a for Col a where {a: PgType} {
@@ -1513,286 +1509,6 @@ impl ToJsonbSql a for (Col (Jsonb a)) where {a: ToJson + FromJson} {
 impl ToJsonbSql a for (Sql (Jsonb a)) where {a: ToJson + FromJson} {
   to_jsonb_sql sql_value = sql_value
 }
-
-impl Selectable (Leaf row) for Leaf selection where {selection: Selectable row} {
-  to_projection selection = case selection {
-    Leaf value ->
-      to_projection value
-      |> map Leaf
-  }
-}
-
-impl Selectable (Labeled n out) for Labeled n field
-  where {n: KnownSymbol, Selectable field out}
-{
-  to_projection selection = case selection {
-    Labeled field ->
-      to_projection field
-      |> relabel_projection (symbol_name (Proxy : Proxy n))
-      |> map Labeled
-  }
-}
-
-impl Selectable (And left_out right_out) for And left right
-  where {Selectable left left_out, Selectable right right_out}
-{
-  to_projection selection = case selection {
-    And left right ->
-      zip_projection (to_projection left) (to_projection right)
-      |> map (fun selected -> {
-        let (left_value, right_value) = selected
-        And left_value right_value
-      })
-  }
-}
-
-impl Selectable (Record out) for Record fields
-  where {Selectable fields out}
-{
-  to_projection selection = case selection {
-    Record name fields ->
-      to_projection fields
-      |> map (fun out -> Record name out)
-  }
-}
-
-# --- Derived tables (subquery in FROM) ---
-#
-# A derived table's columns are whatever the subquery selected. `derived_columns`
-# turns the subquery's selection (a record of `Sql`/`Col` values) into a column
-# scope — a record of `Col a` named by each select label and sourced at the derived
-# table's alias — so the outer query can dot into it (`t.total`, `is_null t.id`).
-
-# What a selected value exposes as a derived-table column: always a `Col` of the
-# same element type (the value itself is irrelevant — only its type matters).
-pub trait DerivedField value out | value -> out {}
-impl DerivedField (Col a) for Col a {}
-impl DerivedField (Col a) for Sql a {}
-impl DerivedField (Col a) for Generated a {}
-
-# A selection leaf becomes a `Col` leaf of the same element type, named by its
-# label and sourced at the derived table's alias. (Separate from `DerivedScope` so
-# the `for` head stays a constructor over bare vars, which is all Saga accepts.)
-pub trait DerivedLeaf rep_in rep_out | rep_in -> rep_out {
-  fun derived_leaf : rep_in -> String -> String -> rep_out
-}
-impl DerivedLeaf (Leaf out_col) for Leaf value where {value: DerivedField out_col} {
-  derived_leaf _leaf alias name = Leaf (col name alias)
-}
-
-# Generic walk that rewrites a selection's representation into the column scope's
-# representation, threading the derived table's alias down to each labeled leaf.
-pub trait DerivedScope rep_in rep_out | rep_in -> rep_out {
-  fun build_scope : rep_in -> String -> rep_out
-}
-
-impl DerivedScope (Record out) for Record fields where {fields: DerivedScope out} {
-  build_scope rep alias = case rep {
-    Record name fields -> Record name (build_scope fields alias)
-  }
-}
-
-impl DerivedScope (And lo ro) for And li ri where {li: DerivedScope lo, ri: DerivedScope ro} {
-  build_scope rep alias = case rep {
-    And l r -> And (build_scope l alias) (build_scope r alias)
-  }
-}
-
-impl DerivedScope (Labeled n out) for Labeled n field where {n: KnownSymbol, field: DerivedLeaf out} {
-  build_scope rep alias = case rep {
-    Labeled inner ->
-      Labeled (derived_leaf inner alias (symbol_name (Proxy : Proxy n)))
-  }
-}
-
-#@ Build a derived-table column scope from the subquery's selection value and the
-#@ alias assigned to the derived table. Each labeled selection becomes a `Col`
-#@ named by its label and qualified by `alias`.
-pub fun derived_columns : selection -> String -> scope
-  where {selection: Generic sel_rep, sel_rep: DerivedScope scope_rep, scope: Generic scope_rep}
-derived_columns selection alias = from (build_scope (to selection) alias)
-
-#@ Encode one insert column value: `Just param` to bind it, `Nothing` to omit the
-#@ column (let the database supply it). Plain column types always bind; `Writable`
-#@ (a generated column) omits on `Auto` and binds on `Provide`.
-#@
-#@ Instances are keyed per column-type head (no blanket over `PgType`, since Saga
-#@ requires impl targets to be named or tuple types). A column type not listed here
-#@ is not insertable unless the user adds its own `InsertCol` impl.
-pub trait InsertCol a {
-  fun insert_col : a -> Maybe Value
-}
-
-impl InsertCol for Int {
-  insert_col v = Just (encode_value v)
-}
-impl InsertCol for Float {
-  insert_col v = Just (encode_value v)
-}
-impl InsertCol for String {
-  insert_col v = Just (encode_value v)
-}
-impl InsertCol for Bool {
-  insert_col v = Just (encode_value v)
-}
-impl InsertCol for T.Uuid {
-  insert_col v = Just (encode_value v)
-}
-impl InsertCol for Date {
-  insert_col v = Just (encode_value v)
-}
-impl InsertCol for NaiveDateTime {
-  insert_col v = Just (encode_value v)
-}
-impl InsertCol for Time {
-  insert_col v = Just (encode_value v)
-}
-
-impl InsertCol for Array a where {a: PgType} {
-  insert_col v = Just (encode_value v)
-}
-
-impl InsertCol for Jsonb a where {a: ToJson + FromJson} {
-  insert_col v = Just (encode_value v)
-}
-
-impl InsertCol for Maybe a where {a: PgType} {
-  insert_col v = Just (encode_value v)
-}
-
-impl InsertCol for Writable a where {a: PgType} {
-  insert_col w = case w {
-    Auto -> Nothing
-    Provide value -> Just (encode_value value)
-  }
-}
-
-# Unwrap a `Leaf` and encode its value (or omit it).
-pub trait EncodeLeaf rep {
-  fun encode_leaf : rep -> Maybe Value
-}
-
-impl EncodeLeaf for Leaf a where {a: InsertCol} {
-  encode_leaf leaf = case leaf {
-    Leaf value -> insert_col value
-  }
-}
-
-#@ Encode a whole record to an ordered list of `(column_name, parameter)` pairs.
-#@ Column names are taken from the record's field labels, in declaration order.
-#@ This is the write-direction counterpart of `Selectable`: derive it on a domain
-#@ record (`deriving (Db.InsertRow)`) and `Db.insert` uses it to build the column
-#@ list and bound values.
-pub trait InsertRow a {
-  fun insert_row : a -> List (String, Value)
-}
-
-# Field-level walk over the Generic representation, mirroring the `ToJsonFields`
-# split in saga_json.
-trait InsertFields a {
-  fun insert_fields : a -> List (String, Value)
-}
-
-impl InsertRow for Record a where {a: InsertFields} {
-  insert_row rep = case rep {
-    Record _name inner -> insert_fields inner
-  }
-}
-
-impl InsertFields for And l r where {l: InsertFields, r: InsertFields} {
-  insert_fields rep = case rep {
-    And l r -> {
-      let left = insert_fields l
-      let right = insert_fields r
-      List.append left right
-    }
-  }
-}
-
-impl InsertFields for Labeled n a where {n: KnownSymbol, a: EncodeLeaf} {
-  insert_fields rep = case rep {
-    Labeled inner -> case encode_leaf inner {
-      Nothing -> []
-      Just value -> [(symbol_name (Proxy : Proxy n), value)]
-    }
-  }
-}
-
-# --- Field-label -> SQL-column-name map (honors `ColumnSet` renames) ---
-#
-# The insert/DML paths emit values keyed by the Saga *field label*, but the actual
-# SQL column name lives in each `Col`/`Generated`'s `ColumnInfo` (set by the
-# `ColumnSet` impl, which may rename — e.g. field `location` -> column
-# `location_name`). Walking a table's column record yields `(field_label,
-# column_name)` pairs, which the DML layer uses to translate labels to real names.
-
-# A single column leaf's declared SQL name.
-trait ColumnNamed c {
-  fun column_named : c -> String
-}
-
-impl ColumnNamed for Col a {
-  column_named column = case column {
-    Col info -> info.name
-  }
-}
-
-impl ColumnNamed for Generated a {
-  column_named column = case column {
-    Generated info -> info.name
-  }
-}
-
-# Unwrap a `Leaf` and read its column name.
-trait ColumnNameLeaf rep {
-  fun column_name_leaf : rep -> String
-}
-
-impl ColumnNameLeaf for Leaf a where {a: ColumnNamed} {
-  column_name_leaf leaf = case leaf {
-    Leaf value -> column_named value
-  }
-}
-
-# Field-level walk over the column record's Generic rep, mirroring `InsertFields`.
-trait ColumnNameFields a {
-  fun column_name_fields : a -> List (String, String)
-}
-
-impl ColumnNameFields for And l r where {l: ColumnNameFields, r: ColumnNameFields} {
-  column_name_fields rep = case rep {
-    And l r -> {
-      let left = column_name_fields l
-      let right = column_name_fields r
-      List.append left right
-    }
-  }
-}
-
-impl ColumnNameFields for Labeled n a where {n: KnownSymbol, a: ColumnNameLeaf} {
-  column_name_fields rep = case rep {
-    Labeled inner -> [(symbol_name (Proxy : Proxy n), column_name_leaf inner)]
-  }
-}
-
-pub trait ColumnNameMap a {
-  fun column_name_map_rep : a -> List (String, String)
-}
-
-impl ColumnNameMap for Record a where {a: ColumnNameFields} {
-  column_name_map_rep rep = case rep {
-    Record _name inner -> column_name_fields inner
-  }
-}
-
-#@ Recover `(field_label, sql_column_name)` pairs from a table's column record,
-#@ honoring `ColumnSet` renames. The DML layer uses this to translate the
-#@ field-labelled output of `insert_row` to real SQL column names. Attach
-#@ `deriving (Db.ColumnNameMap)` to the column record (like `Db.InsertRow` on the
-#@ domain record) to make the bridge available.
-pub fun column_name_map : cols -> List (String, String)
-  where {cols: ColumnNameMap}
-column_name_map cols = column_name_map_rep cols
 
 pub fun asc : input -> Order where {input: ToSql a, a: PgType}
 asc input = Order (OrderItem { expr: value_frag input, direction: "ASC" })

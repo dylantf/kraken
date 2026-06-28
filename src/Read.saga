@@ -4,7 +4,9 @@ import Std.IO (Stdio)
 import Kraken.Core
 import Kraken.Db (QueryBuild, Repo, select)
 import Kraken.Query
+import SagaJson as Json
 import SagaJson.Codec (ToJson, FromJson)
+import SagaJson.Codec as JsonCodec
 import SagaPgo (Connection)
 
 # Domain types
@@ -13,12 +15,50 @@ pub record User {
   id: Int,
   name: String,
   age: Int,
-} deriving (Core.InsertRow)
+}
+
+pub record UsersInsert {
+  id: Db.Writable Int,
+  name: String,
+  age: Int,
+}
 
 pub record Metadata {
   source: String,
   featured: Bool,
-} deriving (ToJson, FromJson)
+}
+
+impl ToJson for Metadata {
+  to_json opts value =
+    JsonCodec.object [
+      ("source", to_json opts value.source),
+      ("featured", to_json opts value.featured),
+    ]
+}
+
+fun missing_json_field : String -> Result a Json.Error
+missing_json_field name =
+  Err (Json.InvalidShape ("field '" <> name <> "'") "missing" [name])
+
+impl FromJson for Metadata {
+  from_json opts bytes = case JsonCodec.parse_object_raw bytes {
+    Err err -> Err err
+    Ok (pairs, rest) -> case JsonCodec.lookup_raw "source" pairs {
+      Nothing -> missing_json_field "source"
+      Just source_bytes -> case from_json opts source_bytes {
+        Err err -> Err err
+        Ok (source, _source_rest) -> case JsonCodec.lookup_raw "featured" pairs {
+          Nothing -> missing_json_field "featured"
+          Just featured_bytes -> case from_json opts featured_bytes {
+            Err err -> Err err
+            Ok (featured, _featured_rest) ->
+              Ok (Metadata { source: source, featured: featured }, rest)
+          }
+        }
+      }
+    }
+  }
+}
 
 pub record Post {
   id: Int,
@@ -29,13 +69,101 @@ pub record Post {
   metadata: Db.Jsonb Metadata,
 }
 
+pub record UserNameAge {
+  name: String,
+  age: Int,
+}
+
+pub record UserTitle {
+  user: User,
+  title: String,
+}
+
+pub record UserPost {
+  user: User,
+  post: Maybe Post,
+}
+
+pub record UserIdName {
+  id: Int,
+  name: String,
+}
+
+pub record AgeOnly {
+  age: Int,
+}
+
+pub record UserAgeText {
+  id: Int,
+  age_text: String,
+}
+
+pub record AuthorPostCount {
+  author_id: Int,
+  posts: Int,
+}
+
+pub record AuthorPostCountCols {
+  author_id: Db.Col Int,
+  posts: Db.Col Int,
+}
+
+pub record UserReport {
+  id: Int,
+  upper_name: String,
+  age_next: Int,
+}
+
+pub record UserTier {
+  id: Int,
+  label: String,
+  tier: String,
+}
+
+pub record UserPostTitle {
+  id: Int,
+  title: String,
+}
+
+pub record UserTotalPosts {
+  id: Int,
+  total_posts: Int,
+}
+
+pub record UserMaybePostTitle {
+  id: Int,
+  a_title: Maybe String,
+}
+
+pub record UserWithPosts {
+  user: User,
+  posts: List Post,
+}
+
+pub record PostWithAuthor {
+  post: Post,
+  author: Maybe User,
+}
+
+pub record UserFullJoinPost {
+  user: Maybe User,
+  post: Maybe Post,
+}
+
+pub record RankedUser {
+  id: Int,
+  age: Int,
+  age_rank: Int,
+  peers: Int,
+}
+
 # Schema
 
 pub record Users {
   id: Db.Generated Int,
   name: Db.Col String,
   age: Db.Col Int,
-} deriving (Core.Selectable User, Core.Insertable UsersInsert, Core.ColumnNameMap)
+}
 
 pub record Posts {
   id: Db.Generated Int,
@@ -44,7 +172,7 @@ pub record Posts {
   published: Db.Col Bool,
   tags: Db.Col (Db.Array String),
   metadata: Db.Col (Db.Jsonb Metadata),
-} deriving (Core.Selectable Post)
+}
 
 impl Core.ColumnSet for Users {
   columns source = Users {
@@ -71,6 +199,72 @@ users = Db.table "users"
 
 pub fun posts : Db.Table Posts
 posts = Db.table "posts"
+
+pub fun users_insert_writer : Db.Writer Users UsersInsert
+users_insert_writer = Db.writer (fun c r -> [
+  Db.set_w c.id r.id,
+  Db.set c.name r.name,
+  Db.set c.age r.age,
+])
+
+pub fun users_save_writer : Db.Writer Users User
+users_save_writer = Db.writer (fun c r -> [
+  Db.set_w c.id (Db.provide r.id),
+  Db.set c.name r.name,
+  Db.set c.age r.age,
+])
+
+pub fun users_row : Users -> Db.Projection User
+users_row u =
+  Db.project User {
+    id: Db.read u.id,
+    name: Db.read u.name,
+    age: Db.read u.age,
+  }
+
+pub fun posts_row : Posts -> Db.Projection Post
+posts_row p =
+  Db.project Post {
+    id: Db.read p.id,
+    author_id: Db.read p.author_id,
+    title: Db.read p.title,
+    published: Db.read p.published,
+    tags: Db.read p.tags,
+    metadata: Db.read p.metadata,
+  }
+
+pub fun user_id_name : Users -> Db.Projection UserIdName
+user_id_name u =
+  Db.project UserIdName {
+    id: Db.read u.id,
+    name: Db.read u.name,
+  }
+
+pub fun user_name_age : Users -> Db.Projection UserNameAge
+user_name_age u =
+  Db.project UserNameAge {
+    name: Db.read u.name,
+    age: Db.read u.age,
+  }
+
+pub fun age_only : Users -> Db.Projection AgeOnly
+age_only u =
+  Db.project AgeOnly {
+    age: Db.read u.age,
+  }
+
+pub fun author_post_count_cols : String -> AuthorPostCountCols
+author_post_count_cols alias = AuthorPostCountCols {
+  author_id: Db.col "author_id" alias,
+  posts: Db.col "posts" alias,
+}
+
+pub fun author_post_count_projection : AuthorPostCountCols -> Db.Projection AuthorPostCount
+author_post_count_projection c =
+  Db.project AuthorPostCount {
+    author_id: Db.read c.author_id,
+    posts: Db.read c.posts,
+  }
 
 # Custom column type via a codec ------------------------------------------------
 #
@@ -113,7 +307,7 @@ pub record Accounts {
   id: Db.Generated Int,
   email: Db.Col String,
   status: Db.Col AccountStatus,
-} deriving (Core.Selectable Account)
+}
 
 impl Core.ColumnSet for Accounts {
   columns source = Accounts {
@@ -126,33 +320,47 @@ impl Core.ColumnSet for Accounts {
 pub fun accounts : Db.Table Accounts
 accounts = Db.table "accounts"
 
+pub fun accounts_row : Accounts -> Db.Projection Account
+accounts_row a =
+  Db.project Account {
+    id: Db.read a.id,
+    email: Db.read a.email,
+    status: Db.read a.status,
+  }
+
 # Queries
 
 # Codec round-trip: `Db.eq a.status Active` *encodes* the enum into a bound param,
-# and `select (a)` *decodes* the `status` column back into `AccountStatus`.
+# and `select (accounts_row a)` *decodes* the `status` column back into
+# `AccountStatus`.
 pub fun active_accounts_query : Unit -> Db.Prepared Account
 active_accounts_query () = Db.query (fun () -> {
   let a = from! accounts
   where_! (Db.eq a.status Active)
   order_by! [Db.asc a.id]
-  select a
+  select (accounts_row a)
 })
 
 # Plain scalars from a non-null scope: bare dotting, inferred non-null
-pub fun users_query : Unit -> Db.Prepared { id: Int, name: String, age: Int }
+pub fun users_query : Unit -> Db.Prepared User
 users_query () = Db.query (fun () -> {
   let u = from! users
   where_! (Db.gt u.age 18)
   order_by! [Db.asc u.id]
   limit! 20
-  select ({ id: u.id, name: u.name, age: u.age })
+  select (users_row u)
 })
 
 # Cast: render the numeric age as text (`(t0.age)::text`) alongside the id.
-pub fun users_age_text_query : Unit -> Db.Prepared { id: Int, age_text: String }
+pub fun users_age_text_query : Unit -> Db.Prepared UserAgeText
 users_age_text_query () = Db.query (fun () -> {
   let u = from! users
-  select ({ id: u.id, age_text: Db.as_text u.age })
+  select (
+    Db.project UserAgeText {
+      id: Db.read u.id,
+      age_text: Db.read (Db.as_text u.age),
+    }
+  )
 })
 
 # SPIKE: dynamic query — optional filters chosen at runtime. The closure is
@@ -160,7 +368,7 @@ users_age_text_query () = Db.query (fun () -> {
 pub fun search_users_query : Maybe Int
   -> Maybe String
   -> Bool
-  -> Db.Prepared { id: Int, name: String, age: Int }
+  -> Db.Prepared User
 search_users_query min_age name_like newest_first = Db.query (fun () -> {
   let u = from! users
   case min_age {
@@ -172,78 +380,93 @@ search_users_query min_age name_like newest_first = Db.query (fun () -> {
     Nothing -> ()
   }
   if newest_first then order_by! [Db.desc u.id] else order_by! [Db.asc u.id]
-  select ({ id: u.id, name: u.name, age: u.age })
+  select (users_row u)
 })
 
 # SELECT DISTINCT: distinct (age) rows across all users.
-pub fun distinct_ages_query : Unit -> Db.Prepared { age: Int }
+pub fun distinct_ages_query : Unit -> Db.Prepared AgeOnly
 distinct_ages_query () = Db.query (fun () -> {
   let u = from! users
   distinct! ()
   order_by! [Db.asc u.age]
-  select ({ age: u.age })
+  select (age_only u)
 })
 
 # SELECT DISTINCT ON: the newest (highest id) user per age — DISTINCT ON the age,
 # with ORDER BY age, id DESC choosing which row of each age wins.
 pub fun newest_user_per_age_query : Unit
-  -> Db.Prepared { id: Int, name: String, age: Int }
+  -> Db.Prepared User
 newest_user_per_age_query () = Db.query (fun () -> {
   let u = from! users
   distinct_on! [Db.group u.age]
   order_by! [Db.asc u.age, Db.desc u.id]
-  select ({ id: u.id, name: u.name, age: u.age })
+  select (users_row u)
 })
 
 # Whole-row required + a scalar, both from inner joins
-pub fun user_posts_query : Unit -> Db.Prepared { user: User, title: String }
+pub fun user_posts_query : Unit -> Db.Prepared UserTitle
 user_posts_query () = Db.query (fun () -> {
   let u = from! users
   let p = inner_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
   where_! (Db.eq p.published True)
   order_by! [Db.desc p.id]
-  select ({ user: u, title: p.title })
+  select (
+    Db.project UserTitle {
+      user: users_row u,
+      title: Db.read p.title,
+    }
+  )
 })
 
 pub fun users_with_optional_posts_query : Unit
-  -> Db.Prepared { user: User, post: Maybe Post }
+  -> Db.Prepared UserPost
 users_with_optional_posts_query () = Db.query (fun () -> {
   let u = from! users
   let p =
     left_join! posts (fun ps ->
       Db.and_ [Db.eq_col ps.author_id u.id, Db.eq ps.published True])
   order_by! [Db.asc u.id]
-  select ({ user: u, post: p })
+  select (
+    Db.project UserPost {
+      user: users_row u,
+      post: Db.read_nullable p posts_row,
+    }
+  )
 })
 
 # Force Nothing path
 pub fun unmatched_posts_query : Unit
-  -> Db.Prepared { user: User, post: Maybe Post }
+  -> Db.Prepared UserPost
 unmatched_posts_query () = Db.query (fun () -> {
   let u = from! users
   let p =
     left_join! posts (fun ps ->
       Db.and_ [Db.eq_col ps.author_id u.id, Db.eq ps.id (-1)])
   order_by! [Db.asc u.id]
-  select ({ user: u, post: p })
+  select (
+    Db.project UserPost {
+      user: users_row u,
+      post: Db.read_nullable p posts_row,
+    }
+  )
 })
 
 # Example anti-join - needs unwrap to get around nullable col
 pub fun users_without_posts_query : Unit
-  -> Db.Prepared { id: Int, name: String }
+  -> Db.Prepared UserIdName
 users_without_posts_query () = Db.query (fun () -> {
   let u = from! users
   let p = left_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
   where_! (Db.is_null (Db.unwrap_cols p).id)
   order_by! [Db.asc u.id]
-  select ({ id: u.id, name: u.name })
+  select (user_id_name u)
 })
 
 # Correlated EXISTS subquery: users who have at least one published post. The inner
 # closure is the same DSL under a nested QueryBuild handler; it references the outer
 # `u.id` directly for correlation.
 pub fun users_with_published_posts_query : Unit
-  -> Db.Prepared { id: Int, name: String }
+  -> Db.Prepared UserIdName
 users_with_published_posts_query () = Db.query (fun () -> {
   let u = from! users
   where_! (Db.exists (fun () -> {
@@ -251,7 +474,7 @@ users_with_published_posts_query () = Db.query (fun () -> {
     where_! (Db.and_ [Db.eq_col p.author_id u.id, Db.eq p.published True])
   }))
   order_by! [Db.asc u.id]
-  select ({ id: u.id, name: u.name })
+  select (user_id_name u)
 })
 
 # Nested correlated subqueries: users who authored at least two distinct posts —
@@ -260,7 +483,7 @@ users_with_published_posts_query () = Db.query (fun () -> {
 # p2 must get distinct aliases, otherwise `p.id` in the inner subquery silently
 # resolves to p2's alias and the query is wrong.
 pub fun users_with_two_posts_query : Unit
-  -> Db.Prepared { id: Int, name: String }
+  -> Db.Prepared UserIdName
 users_with_two_posts_query () = Db.query (fun () -> {
   let u = from! users
   where_! (Db.exists (fun () -> {
@@ -277,12 +500,12 @@ users_with_two_posts_query () = Db.query (fun () -> {
     ])
   }))
   order_by! [Db.asc u.id]
-  select ({ id: u.id, name: u.name })
+  select (user_id_name u)
 })
 
 # IN (subquery): users who authored a published post. The subquery closure returns
 # the column to match against `u.id` (no select); their types must agree.
-pub fun users_in_published_query : Unit -> Db.Prepared { id: Int, name: String }
+pub fun users_in_published_query : Unit -> Db.Prepared UserIdName
 users_in_published_query () = Db.query (fun () -> {
   let u = from! users
   where_! (Db.in_subquery u.id (fun () -> {
@@ -291,111 +514,139 @@ users_in_published_query () = Db.query (fun () -> {
     p.author_id
   }))
   order_by! [Db.asc u.id]
-  select ({ id: u.id, name: u.name })
+  select (user_id_name u)
 })
 
 # Derived table: a subquery in FROM that aggregates post counts per author, which
 # the outer query then dots into (`t.posts`) and filters on. `from_subquery`'s
 # select labels (`author_id`, `posts`) become the derived table's columns.
 pub fun prolific_authors_query : Unit
-  -> Db.Prepared { author_id: Int, posts: Int }
+  -> Db.Prepared AuthorPostCount
 prolific_authors_query () = Db.query (fun () -> {
-  let t = Db.from_subquery (fun () -> {
+  let t = Db.from_subquery_as author_post_count_cols (fun () -> {
     let p = from! posts
     group_by! [Db.group p.author_id]
-    select ({ author_id: p.author_id, posts: Db.count_star })
+    select (
+      Db.project AuthorPostCount {
+        author_id: Db.read p.author_id,
+        posts: Db.read Db.count_star,
+      }
+    )
   })
   where_! (Db.gt t.posts 5)
   order_by! [Db.desc t.posts]
-  select ({ author_id: t.author_id, posts: t.posts })
+  select (author_post_count_projection t)
 })
 
 # Tier 5 SQL functions: string fn + arithmetic in a select.
 pub fun user_report_query : Unit
-  -> Db.Prepared { id: Int, upper_name: String, age_next: Int }
+  -> Db.Prepared UserReport
 user_report_query () = Db.query (fun () -> {
   let u = from! users
-  select ({ id: u.id, upper_name: Db.upper u.name, age_next: Db.add u.age 1 })
+  select (
+    Db.project UserReport {
+      id: Db.read u.id,
+      upper_name: Db.read (Db.upper u.name),
+      age_next: Db.read (Db.add u.age 1),
+    }
+  )
 })
 
 # CASE WHEN + CONCAT + NOT: bucket users by age, label with a prefix.
 pub fun user_tier_query : Unit
-  -> Db.Prepared { id: Int, label: String, tier: String }
+  -> Db.Prepared UserTier
 user_tier_query () = Db.query (fun () -> {
   let u = from! users
   where_! (Db.not_ (Db.eq u.age 0))
-  select ({
-    id: u.id,
-    label: Db.concat [Db.sql (Db.lit "user:"), Db.sql u.name],
-    tier: (Db.case_when [
-      (Db.gte u.age 65, Db.sql (Db.lit "senior")),
-      (Db.gte u.age 18, Db.sql (Db.lit "adult")),
-    ] (Db.sql (Db.lit "minor")) : Db.Sql String),
-  })
+  let tier: Db.Sql String = Db.case_when [
+    (Db.gte u.age 65, Db.sql (Db.lit "senior")),
+    (Db.gte u.age 18, Db.sql (Db.lit "adult")),
+  ] (Db.sql (Db.lit "minor"))
+  select (
+    Db.project UserTier {
+      id: Db.read u.id,
+      label: Db.read (Db.concat [Db.sql (Db.lit "user:"), Db.sql u.name]),
+      tier: Db.read tier,
+    }
+  )
 })
 
 # COALESCE off a left join: recover a non-null scalar the Nullable scope won't let
 # you select directly — unwrap to the plain column, default it.
-pub fun user_post_title_query : Unit -> Db.Prepared { id: Int, title: String }
+pub fun user_post_title_query : Unit -> Db.Prepared UserPostTitle
 user_post_title_query () = Db.query (fun () -> {
   let u = from! users
   let p = left_join! posts (fun ps -> Db.eq_col ps.author_id u.id)
-  select ({ id: u.id, title: Db.coalesce (Db.unwrap_cols p).title "(none)" })
+  select (
+    Db.project UserPostTitle {
+      id: Db.read u.id,
+      title: Db.read (Db.coalesce (Db.unwrap_cols p).title "(none)"),
+    }
+  )
 })
 
 # CTE: factor the per-author post counts into a named WITH, then select from it.
 pub fun prolific_authors_cte_query : Unit
-  -> Db.Prepared { author_id: Int, posts: Int }
+  -> Db.Prepared AuthorPostCount
 prolific_authors_cte_query () = Db.query (fun () -> {
-  let counts = Db.cte "post_counts" (fun () -> {
+  let counts = Db.cte_as "post_counts" author_post_count_cols (fun () -> {
     let p = from! posts
     group_by! [Db.group p.author_id]
-    select ({ author_id: p.author_id, posts: Db.count_star })
+    select (
+      Db.project AuthorPostCount {
+        author_id: Db.read p.author_id,
+        posts: Db.read Db.count_star,
+      }
+    )
   })
   let c = from! counts
   where_! (Db.gt c.posts 5)
   order_by! [Db.desc c.posts]
-  select ({ author_id: c.author_id, posts: c.posts })
+  select (author_post_count_projection c)
 })
 
 # Scalar subquery in SELECT: each user plus the total post count as a value. The
-# closure's returned column (`count_star : Sql Int`) pins the type via the `ToSql`
-# fundep, so no annotation is needed.
+# closure's returned column (`count_star : Sql Int`) pins the type, so no annotation
+# is needed.
 pub fun users_with_total_posts_query : Unit
-  -> Db.Prepared { id: Int, total_posts: Int }
+  -> Db.Prepared UserTotalPosts
 users_with_total_posts_query () = Db.query (fun () -> {
   let u = from! users
-  select ({
-    id: u.id,
-    total_posts: Db.scalar_subquery (fun () -> {
-      let _ = from! posts
-      Db.count_star
-    }),
-  })
+  select (
+    Db.project UserTotalPosts {
+      id: Db.read u.id,
+      total_posts: Db.read (Db.scalar_subquery (fun () -> {
+        let _ = from! posts
+        Db.count_star
+      })),
+    }
+  )
 })
 
 # Scalar subquery that can match zero rows: each user with the title of one of their
 # posts (limit 1), or Nothing if they have none. `scalar_subquery_maybe` types the
 # empty-result case as `Maybe String` instead of failing to decode at runtime.
 pub fun users_with_a_post_title_query : Unit
-  -> Db.Prepared { id: Int, a_title: Maybe String }
+  -> Db.Prepared UserMaybePostTitle
 users_with_a_post_title_query () = Db.query (fun () -> {
   let u = from! users
-  select ({
-    id: u.id,
-    a_title: Db.scalar_subquery_maybe (fun () -> {
-      let p = from! posts
-      where_! (Db.eq_col p.author_id u.id)
-      limit! 1
-      p.title
-    }),
-  })
+  select (
+    Db.project UserMaybePostTitle {
+      id: Db.read u.id,
+      a_title: Db.read (Db.scalar_subquery_maybe (fun () -> {
+        let p = from! posts
+        where_! (Db.eq_col p.author_id u.id)
+        limit! 1
+        p.title
+      })),
+    }
+  )
 })
 
 # Scalar subquery in a comparison: here `gt_sql` against `u.age` pins the subquery's
 # type, so no annotation is needed.
 pub fun users_over_post_count_query : Unit
-  -> Db.Prepared { id: Int, name: String }
+  -> Db.Prepared UserIdName
 users_over_post_count_query () = Db.query (fun () -> {
   let u = from! users
   where_! (Db.gt_sql u.age (Db.scalar_subquery (fun () -> {
@@ -403,7 +654,7 @@ users_over_post_count_query () = Db.query (fun () -> {
     Db.count_star
   })))
   order_by! [Db.asc u.id]
-  select ({ id: u.id, name: u.name })
+  select (user_id_name u)
 })
 
 # --- Relation loading: declare the relation in the query, get nested results ---
@@ -412,60 +663,75 @@ users_over_post_count_query () = Db.query (fun () -> {
 # parent `users.id` -> child `posts.author_id`. Both are column accessors, so the FK is
 # named once and the batched child query is generated.
 pub fun authored_posts : Db.Relation Users Posts Post Int
-authored_posts = Db.has_many posts (fun u -> u.id) (fun p -> p.author_id)
+authored_posts = Db.has_many posts posts_row (fun u -> u.id) (fun p -> p.author_id)
 
 # Load each user with their posts as one query expression: `preload` pulls the
 # relation into the `select`, and `Db.all` runs the parent query plus one batched
 # child query (not N+1), stitching the nested `{ user, posts }` rows.
 pub fun users_with_posts_query : Unit
-  -> Db.Prepared { user: User, posts: List Post }
+  -> Db.Prepared UserWithPosts
 users_with_posts_query () = Db.query (fun () -> {
   let u = from! users
   let posts = Db.preload authored_posts u
   order_by! [Db.asc u.id]
-  select ({ user: u, posts: posts })
+  select (
+    Db.project UserWithPosts {
+      user: users_row u,
+      posts: Db.read_preloaded posts,
+    }
+  )
 })
 
 pub fun load_users_with_posts : Connection
-  -> Result (List { user: User, posts: List Post }) Db.DbError
+  -> Result (List UserWithPosts) Db.DbError
   needs {Repo}
 load_users_with_posts conn = Db.all conn (users_with_posts_query ())
 
 # A belongs-to relation: a post points at its author via `posts.author_id` -> `users.id`.
 # Consumed with `preload`, it yields `Maybe User` (the author, if present).
 pub fun post_author : Db.RelationOne Posts Users User Int
-post_author = Db.belongs_to users (fun p -> p.author_id) (fun u -> u.id)
+post_author = Db.belongs_to users users_row (fun p -> p.author_id) (fun u -> u.id)
 
 # Each post with its author in one query expression (parent query + one batched child
 # query). The to-one relation makes the `author` field `Maybe User`.
 pub fun posts_with_author_query : Unit
-  -> Db.Prepared { post: Post, author: Maybe User }
+  -> Db.Prepared PostWithAuthor
 posts_with_author_query () = Db.query (fun () -> {
   let p = from! posts
-  let author = Db.preload post_author p
+  let author = Db.preload_one post_author p
   order_by! [Db.asc p.id]
-  select ({ post: p, author: author })
+  select (
+    Db.project PostWithAuthor {
+      post: posts_row p,
+      author: Db.read_preloaded author,
+    }
+  )
 })
 
 pub fun load_posts_with_author : Connection
-  -> Result (List { post: Post, author: Maybe User }) Db.DbError
+  -> Result (List PostWithAuthor) Db.DbError
   needs {Repo}
 load_posts_with_author conn = Db.all conn (posts_with_author_query ())
 
 # Filterable preload: each user with only their *published* posts. The predicate is a
 # `(Posts -> Expr)` `AND`-ed into the generated child query's `WHERE`.
 pub fun users_with_published_posts_only_query : Unit
-  -> Db.Prepared { user: User, posts: List Post }
+  -> Db.Prepared UserWithPosts
 users_with_published_posts_only_query () = Db.query (fun () -> {
   let u = from! users
   let posts =
     Db.preload_where authored_posts u (fun p -> Db.eq p.published True)
   order_by! [Db.asc u.id]
-  select ({ user: u, posts: posts })
+  select (
+    Db.project UserWithPosts {
+      user: users_row u,
+      posts: Db.read_preloaded posts,
+    }
+  )
 })
 
 pub fun load_users_with_published_posts : Connection
-  -> Result (List { user: User, posts: List Post }) Db.DbError
+  -> Result (List UserWithPosts) Db.DbError
   needs {Repo}
 load_users_with_published_posts conn =
   Db.all conn (users_with_published_posts_only_query ())
@@ -474,66 +740,65 @@ load_users_with_published_posts conn =
 # so the row is all-Maybe (user-only rows, post-only rows, and matched rows all
 # appear). The ON sees both tables' plain columns; the body gets both as Nullable.
 pub fun users_full_join_posts_query : Unit
-  -> Db.Prepared { user: Maybe User, post: Maybe Post }
+  -> Db.Prepared UserFullJoinPost
 users_full_join_posts_query () = Db.full_join_query users posts (fun u p -> Db.eq_col p.author_id u.id) (fun (user_scope, post_scope) -> {
-  select ({ user: user_scope, post: post_scope })
+  select (
+    Db.project UserFullJoinPost {
+      user: Db.read_nullable user_scope users_row,
+      post: Db.read_nullable post_scope posts_row,
+    }
+  )
 })
 
 # Window functions: rank by age (ROW_NUMBER over ORDER BY), and a partitioned
 # windowed count (peers = users sharing the same age).
 pub fun ranked_users_query : Unit
-  -> Db.Prepared { id: Int, age: Int, age_rank: Int, peers: Int }
+  -> Db.Prepared RankedUser
 ranked_users_query () = Db.query (fun () -> {
   let u = from! users
-  select ({
-    id: u.id,
-    age: u.age,
-    age_rank: Db.row_number (Db.order_window [Db.desc u.age] Db.window),
-    peers: Db.over Db.count_star (Db.partition_by [Db.group u.age] Db.window),
-  })
+  select (
+    Db.project RankedUser {
+      id: Db.read u.id,
+      age: Db.read u.age,
+      age_rank: Db.read (Db.row_number (Db.order_window [Db.desc u.age] Db.window)),
+      peers: Db.read (Db.over Db.count_star (Db.partition_by [Db.group u.age] Db.window)),
+    }
+  )
 })
 
 pub fun load_ranked_users : Connection
-  -> Result (List {
-    id: Int,
-    age: Int,
-    age_rank: Int,
-    peers: Int,
-  }) Db.DbError
+  -> Result (List RankedUser) Db.DbError
   needs {Repo}
 load_ranked_users conn = Db.all conn (ranked_users_query ())
 
 pub fun load_full_join : Connection
-  -> Result (List { user: Maybe User, post: Maybe Post }) Db.DbError
+  -> Result (List UserFullJoinPost) Db.DbError
   needs {Repo}
 load_full_join conn = Db.all conn (users_full_join_posts_query ())
 
 # Loaders
 
 pub fun load_users : Connection
-  -> Result (List { id: Int, name: String, age: Int }) Db.DbError
+  -> Result (List User) Db.DbError
   needs {Repo}
 load_users conn = Db.all conn (users_query ())
 
 pub fun load_optional_posts : Connection
-  -> Result (List { user: User, post: Maybe Post }) Db.DbError
+  -> Result (List UserPost) Db.DbError
   needs {Repo}
 load_optional_posts conn = Db.all conn (users_with_optional_posts_query ())
 
 pub fun load_unmatched_posts : Connection
-  -> Result (List { user: User, post: Maybe Post }) Db.DbError
+  -> Result (List UserPost) Db.DbError
   needs {Repo}
 load_unmatched_posts conn = Db.all conn (unmatched_posts_query ())
 
 pub fun load_users_without_posts : Connection
-  -> Result (List { id: Int, name: String }) Db.DbError
+  -> Result (List UserIdName) Db.DbError
   needs {Repo}
 load_users_without_posts conn = Db.all conn (users_without_posts_query ())
 
-pub fun print_users_without_posts : Result (List {
-  id: Int,
-  name: String,
-}) Db.DbError
+pub fun print_users_without_posts : Result (List UserIdName) Db.DbError
   -> Unit
   needs {Stdio}
 print_users_without_posts result = case result {
@@ -544,10 +809,7 @@ print_users_without_posts result = case result {
   Err err -> println ("query failed: " <> debug err)
 }
 
-pub fun print_optional_posts : Result (List {
-  user: User,
-  post: Maybe Post,
-}) Db.DbError
+pub fun print_optional_posts : Result (List UserPost) Db.DbError
   -> Unit
   needs {Stdio}
 print_optional_posts result = case result {
@@ -582,31 +844,31 @@ print_rows result fmt = case result {
 }
 
 pub fun load_user_report : Connection
-  -> Result (List { id: Int, upper_name: String, age_next: Int }) Db.DbError
+  -> Result (List UserReport) Db.DbError
   needs {Repo}
 load_user_report conn = Db.all conn (user_report_query ())
 
 pub fun load_user_tiers : Connection
-  -> Result (List { id: Int, label: String, tier: String }) Db.DbError
+  -> Result (List UserTier) Db.DbError
   needs {Repo}
 load_user_tiers conn = Db.all conn (user_tier_query ())
 
 pub fun load_user_post_titles : Connection
-  -> Result (List { id: Int, title: String }) Db.DbError
+  -> Result (List UserPostTitle) Db.DbError
   needs {Repo}
 load_user_post_titles conn = Db.all conn (user_post_title_query ())
 
 pub fun load_prolific_authors_cte : Connection
-  -> Result (List { author_id: Int, posts: Int }) Db.DbError
+  -> Result (List AuthorPostCount) Db.DbError
   needs {Repo}
 load_prolific_authors_cte conn = Db.all conn (prolific_authors_cte_query ())
 
 pub fun load_users_with_total_posts : Connection
-  -> Result (List { id: Int, total_posts: Int }) Db.DbError
+  -> Result (List UserTotalPosts) Db.DbError
   needs {Repo}
 load_users_with_total_posts conn = Db.all conn (users_with_total_posts_query ())
 
 pub fun load_users_over_post_count : Connection
-  -> Result (List { id: Int, name: String }) Db.DbError
+  -> Result (List UserIdName) Db.DbError
   needs {Repo}
 load_users_over_post_count conn = Db.all conn (users_over_post_count_query ())
