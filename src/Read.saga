@@ -6,9 +6,9 @@ import Kraken.Core
 import Kraken.Db (QueryBuild, Repo, Selection, select)
 import Kraken.Query
 import SagaJson as Json
-import SagaJson.Codec (ToJson, FromJson)
-import SagaJson.Codec as JsonCodec
 import SagaJson.Decode as JsonDecode
+import SagaJson.Decode (FromJson)
+import SagaJson.Encode as JsonEncode (ToJson)
 import SagaPgo (Connection)
 
 # Domain types
@@ -27,10 +27,10 @@ pub record Metadata {
 }
 
 impl ToJson for Metadata {
-  to_json opts value =
-    JsonCodec.object [
-      ("source", to_json opts value.source),
-      ("featured", to_json opts value.featured),
+  to_json value =
+    JsonEncode.object [
+      ("source", to_json value.source),
+      ("featured", to_json value.featured),
     ]
 }
 
@@ -40,14 +40,8 @@ metadata_decoder json = Metadata {
   featured: JsonDecode.at "featured" JsonDecode.bool json,
 }
 
-impl FromJson for Metadata {
-  from_json _opts bytes = case JsonCodec.parse_value bytes {
-    Err err -> Err err
-    Ok (value, rest) -> case Json.run metadata_decoder (Json.from_value value) {
-      Err err -> Err err
-      Ok metadata -> Ok (metadata, rest)
-    }
-  }
+impl FromJson for Metadata needs {Fail Json.Error} {
+  from_json json = metadata_decoder json
 }
 
 pub record Post {

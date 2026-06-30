@@ -17,7 +17,8 @@ import Std.Dynamic (
   from_erlang
 )
 import SagaJson as Json
-import SagaJson.Codec as JsonCodec (ToJson, FromJson)
+import SagaJson.Decode (FromJson, deserialize)
+import SagaJson.Encode (ToJson, serialize)
 import SagaPgo (Connection, Postgres, QueryError, Returned)
 import SagaPgo as Pgo
 import SagaPgo.Types (Value)
@@ -109,11 +110,11 @@ impl PgType for Array a where {a: PgType} {
 
 impl PgType for Jsonb a where {a: ToJson + FromJson} {
   encode_pg json_value = case json_value {
-    Jsonb value -> T.pg_text (JsonCodec.serialize value)
+    Jsonb value -> T.pg_text (serialize value)
   }
   decode_pg = Decoder (fun data -> case decode string data {
     Err err -> Err err
-    Ok text -> case JsonCodec.deserialize text {
+    Ok text -> case deserialize text {
       Ok value -> Ok (Jsonb value)
       Err err -> Err (json_error_to_decode_error err)
     }
@@ -696,17 +697,20 @@ projection_with arg ctor = {
     decode_at: fun data offset row ->
       case ctor_def.decode_at data offset row {
         Err err -> Err err
-        Ok (constructor, ctor_reqs) ->
-          case arg_def.decode_at data (offset + ctor_def.width) row {
-            Err err -> Err err
-            Ok (value, arg_reqs) ->
-              Ok (constructor value, List.append ctor_reqs arg_reqs)
-          }
+        Ok (constructor, ctor_reqs) -> case arg_def.decode_at data (offset
+          + ctor_def.width) row {
+          Err err -> Err err
+          Ok (value, arg_reqs) ->
+            Ok (constructor value, List.append ctor_reqs arg_reqs)
+        }
       },
   })
 }
 
-pub fun projection_field : String -> Projection a -> Projection (a -> b) -> Projection b
+pub fun projection_field : String
+  -> Projection a
+  -> Projection (a -> b)
+  -> Projection b
 projection_field alias arg ctor =
   projection_with (projection_relabel alias arg) ctor
 
@@ -1454,7 +1458,9 @@ read_sql sql_value = sql_projection sql_value
 #@ Project a nullable scope through a whole-row projection. This keeps the left
 #@ join all-NULL sentinel in one named operation instead of making callers unwrap
 #@ a scope directly at a `select` site.
-pub fun read_nullable : Nullable cols -> (cols -> Projection a) -> Projection (Maybe a)
+pub fun read_nullable : Nullable cols
+  -> (cols -> Projection a)
+  -> Projection (Maybe a)
 read_nullable scope project_scope =
   nullable_row (project_scope (unwrap_cols scope))
 
