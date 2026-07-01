@@ -190,9 +190,12 @@ pub record Accounts {
 impl Core.ColumnSet for Accounts {
   columns source = Accounts {
     id: Db.generated "id" source,
-    email: Db.col "email" source,
+    email: Db.col "email_address" source,
     status: Db.col "status" source,
   }
+  column_names a = [
+    Db.column_name "email" a.email,
+  ]
 }
 
 pub fun accounts : Db.Table Accounts

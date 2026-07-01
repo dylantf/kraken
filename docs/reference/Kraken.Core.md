@@ -272,6 +272,7 @@ The Postgres type name a Saga type casts to (`x::<name>`). Only types you cast
 ```saga
 trait ColumnSet cols {
   fun columns : String -> cols
+  fun column_names : cols -> List (String, String)
   fun primary_key : cols -> PrimaryKey
 }
 ```
@@ -454,6 +455,16 @@ fun ref_name : ColRef -> String
 ```
 
 The column name a `ColRef` points to (e.g. for an `ON CONFLICT` target).
+
+### column_name
+
+```saga
+fun column_name : String -> c -> (String, String) where {c: AsColRef}
+```
+
+Pair a Saga field label with the SQL column name from a typed column handle.
+Use this in `ColumnSet.column_names` when the Saga field and SQL column differ:
+`column_names a = [column_name "email" a.email]`.
 
 ### default
 

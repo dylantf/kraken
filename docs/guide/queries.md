@@ -10,7 +10,11 @@ users_query () = Db.query (fun () -> {
   where_! (Db.gt u.age 18)
   order_by! [Db.asc u.id]
   limit! 20
-  select ({ id: u.id, name: u.name, age: u.age })
+  select build Selection {
+    id: Db.read u.id,
+    name: Db.read u.name,
+    age: Db.read u.age,
+  }
 })
 ```
 
@@ -38,19 +42,25 @@ u.age
 Select individual columns:
 
 ```saga
-select ({ id: u.id, name: u.name })
+select build Selection {
+  id: Db.read u.id,
+  name: Db.read u.name,
+}
 ```
 
 Select a whole row:
 
 ```saga
-select u
+select (users_row u)
 ```
 
 Mix whole rows and scalar fields:
 
 ```saga
-select ({ user: u, title: p.title })
+select build Selection {
+  user: users_row u,
+  title: Db.read p.title,
+}
 ```
 
 The aliases come from the selection labels. Whole rows are prefixed by the label

@@ -282,6 +282,12 @@ opaque type Table cols =
 pub trait ColumnSet cols {
   #@ Build the column record for a given table alias (maps fields to SQL names).
   fun columns : String -> cols
+  #@ Map Saga record-builder field labels to SQL column names. The default is an
+  #@ empty override map, meaning labels are used as SQL names. Override this when
+  #@ a Saga field differs from its database column, using `column_name` so the SQL
+  #@ name still comes from the column handle.
+  fun column_names : cols -> List (String, String)
+  column_names _cols = []
   #@ The table's primary key, used by `Db.update_all` to build its `WHERE`.
   #@ Defaults to `NoKey`; override it for tables you save whole entities into.
   fun primary_key : cols -> PrimaryKey
@@ -348,6 +354,12 @@ primary_key_columns pk = case pk {
 #@ The column name a `ColRef` points to (e.g. for an `ON CONFLICT` target).
 pub fun ref_name : ColRef -> String
 ref_name reference = col_ref_name reference
+
+#@ Pair a Saga field label with the SQL column name from a typed column handle.
+#@ Use this in `ColumnSet.column_names` when the Saga field and SQL column differ:
+#@ `column_names a = [column_name "email" a.email]`.
+pub fun column_name : String -> c -> (String, String) where {c: AsColRef}
+column_name label column = (label, ref_name (as_col_ref column))
 
 opaque type Col a = Col ColumnInfo
 

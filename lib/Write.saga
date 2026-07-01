@@ -58,6 +58,60 @@ type InsertValue =
   | InsertParam Value
   | InsertDefault
 
+type InsertField =
+  | InsertFieldParam Value
+  | InsertFieldDefault
+
+opaque type InsertInput slot = InsertInput InsertField
+
+opaque type InsertFields row = InsertFields (List (String, InsertValue))
+
+pub type Insert = Insert
+
+pub fun insert_value : a -> InsertInput (Col a) where {a: PgType}
+insert_value value = InsertInput (InsertFieldParam (encode_value value))
+
+pub fun insert_default : InsertInput (Col a)
+insert_default = InsertInput InsertFieldDefault
+
+pub fun insert_auto : InsertInput (Generated a)
+insert_auto = InsertInput InsertFieldDefault
+
+pub fun insert_generated : GeneratedValue a -> InsertInput (Generated a)
+  where {a: PgType}
+insert_generated value = case value {
+  UseDefault -> InsertInput InsertFieldDefault
+  Provide inner -> InsertInput (InsertFieldParam (encode_value inner))
+}
+
+pub record builder Insert {
+  start: insert_into,
+  field: insert_field,
+}
+
+pub fun insert_into : row -> InsertFields row
+insert_into _constructor = InsertFields []
+
+fun insert_field_value : InsertField -> InsertValue
+insert_field_value field = case field {
+  InsertFieldParam value -> InsertParam value
+  InsertFieldDefault -> InsertDefault
+}
+
+fun insert_input_value : InsertInput slot -> InsertValue
+insert_input_value input = case input {
+  InsertInput field -> insert_field_value field
+}
+
+pub fun insert_field : String
+  -> InsertInput slot
+  -> InsertFields (slot -> row)
+  -> InsertFields row
+insert_field name value fields = case fields {
+  InsertFields pairs ->
+    InsertFields (List.append pairs [(name, insert_input_value value)])
+}
+
 opaque type Writer cols input = Writer (cols -> input -> List InsertCell)
 
 pub fun writer : (cols -> input -> List InsertCell) -> Writer cols input
@@ -304,6 +358,45 @@ insert_pairs table_value writer_value value = {
   run_writer writer_value cols value
 }
 
+fun insert_fields_pairs : InsertFields row -> List (String, InsertValue)
+insert_fields_pairs fields = case fields {
+  InsertFields pairs -> pairs
+}
+
+fun lookup_column_name : List (String, String) -> String -> Maybe String
+lookup_column_name mappings label = case mappings {
+  [] -> Nothing
+  (field, sql_name) :: rest ->
+    if field == label then Just sql_name else lookup_column_name rest label
+}
+
+fun remap_insert_pair : List (String, String)
+  -> (String, InsertValue)
+  -> (String, InsertValue)
+remap_insert_pair mappings pair = {
+  let (label, value) = pair
+  let name = case lookup_column_name mappings label {
+    Just sql_name -> sql_name
+    Nothing -> label
+  }
+  (name, value)
+}
+
+fun remap_insert_pairs : List (String, String)
+  -> List (String, InsertValue)
+  -> List (String, InsertValue)
+remap_insert_pairs mappings pairs =
+  List.map (remap_insert_pair mappings) pairs
+
+fun insert_record_pairs : Table cols
+  -> InsertFields row
+  -> List (String, InsertValue)
+  where {cols: ColumnSet}
+insert_record_pairs table_value fields = {
+  let cols = table_cols (table_name table_value) table_value
+  remap_insert_pairs (column_names cols) (insert_fields_pairs fields)
+}
+
 fun pair_names : List (String, InsertValue) -> List String
 pair_names pairs =
   List.map (fun pair -> {
@@ -359,11 +452,52 @@ insert_all_parts_of table_value writer_value values = {
   }
 }
 
+fun insert_all_record_parts_of : Table cols
+  -> List (InsertFields row)
+  -> List SqlPart
+  where {cols: ColumnSet}
+insert_all_record_parts_of table_value values = {
+  let rows_pairs = List.map (insert_record_pairs table_value) values
+  case rows_pairs {
+    [] ->
+      panic "Db.insert_all_records: empty row list (guard the call and insert nothing when the batch is empty)"
+    first_pairs :: _ -> {
+      let names = pair_names first_pairs
+      if all_names_match names rows_pairs then ()
+      else panic "Db.insert_all_records: rows set different columns; a multi-row INSERT needs one shared column list (use Db.insert_default/Db.insert_auto for per-row DEFAULT values instead of omitting the column)"
+      let row_values =
+        fun pairs ->
+          List.map (fun pair -> {
+            let (_n, v) = pair
+            v
+          }) pairs
+      let rows_vals = List.map row_values rows_pairs
+      insert_all_parts table_value names rows_vals
+    }
+  }
+}
+
 #@ Build an INSERT statement using a table-specific writer. Column names come
 #@ from the writer's column handles; `Skip` cells are omitted.
 pub fun insert : Table cols -> Writer cols input -> input -> Prepared Unit
 insert table_value writer_value value =
   finish (insert_parts table_value (insert_pairs table_value writer_value value))
+
+#@ Build an INSERT from an anonymous record builder:
+#@
+#@     Db.insert_record users build Db.Insert Users {
+#@       id: Db.insert_auto,
+#@       name: Db.insert_value "Carol",
+#@       age: Db.insert_value 31,
+#@     }
+#@
+#@ Use the table's column record (`Users` here) as the `Db.InsertFields` shape to
+#@ make the compiler check that every field is present. Field labels map to SQL
+#@ names via `ColumnSet.column_names` (identity by default).
+pub fun insert_record : Table cols -> InsertFields row -> Prepared Unit
+  where {cols: ColumnSet}
+insert_record table_value fields =
+  finish (insert_parts table_value (insert_record_pairs table_value fields))
 
 #@ Like `insert`, but appends a `RETURNING` clause built from the projection
 #@ callback (the table's columns are passed in, exactly like `select`). The result
@@ -375,6 +509,19 @@ pub fun insert_returning : Table cols
   -> Prepared row
 insert_returning table_value writer_value value project = {
   let body = insert_parts table_value (insert_pairs table_value writer_value value)
+  let alias = table_name table_value
+  let cols = table_cols alias table_value
+  finish_returning body (project cols)
+}
+
+#@ Like `insert_record`, but appends a `RETURNING` clause.
+pub fun insert_record_returning : Table cols
+  -> InsertFields insert_row
+  -> (cols -> Projection row)
+  -> Prepared row
+  where {cols: ColumnSet}
+insert_record_returning table_value fields project = {
+  let body = insert_parts table_value (insert_record_pairs table_value fields)
   let alias = table_name table_value
   let cols = table_cols alias table_value
   finish_returning body (project cols)
@@ -397,6 +544,18 @@ insert_all table_value writer_value values = case values {
   _ -> finish (insert_all_parts_of table_value writer_value values)
 }
 
+#@ Bulk insert for the record-builder insert path. Each row must have the same
+#@ field set; use `insert_default` / `insert_auto` when a row should ask Postgres
+#@ for a default without changing the shared column list.
+pub fun insert_all_records : Table cols
+  -> List (InsertFields row)
+  -> Prepared Unit
+  where {cols: ColumnSet}
+insert_all_records table_value values = case values {
+  [] -> noop_prepared
+  _ -> finish (insert_all_record_parts_of table_value values)
+}
+
 #@ Like `insert_all`, but appends a `RETURNING` clause built from the projection
 #@ callback (the table's columns, exactly like `select`). Yields a `Prepared row`
 #@ with one row per inserted row; run it with `Db.all`. An empty list is a no-op
@@ -410,6 +569,22 @@ insert_all_returning table_value writer_value values project = case values {
   [] -> noop_prepared
   _ -> {
     let body = insert_all_parts_of table_value writer_value values
+    let alias = table_name table_value
+    let cols = table_cols alias table_value
+    finish_returning body (project cols)
+  }
+}
+
+#@ Like `insert_all_records`, but appends a `RETURNING` clause.
+pub fun insert_all_records_returning : Table cols
+  -> List (InsertFields insert_row)
+  -> (cols -> Projection row)
+  -> Prepared row
+  where {cols: ColumnSet}
+insert_all_records_returning table_value values project = case values {
+  [] -> noop_prepared
+  _ -> {
+    let body = insert_all_record_parts_of table_value values
     let alias = table_name table_value
     let cols = table_cols alias table_value
     finish_returning body (project cols)
@@ -504,6 +679,17 @@ insert_on_conflict_do_nothing table_value writer_value value target = {
   finish (do_nothing_parts table_value (insert_pairs table_value writer_value value) target_names)
 }
 
+#@ Record-builder variant of `insert_on_conflict_do_nothing`.
+pub fun insert_record_on_conflict_do_nothing : Table cols
+  -> InsertFields row
+  -> (cols -> List ColRef)
+  -> Prepared Unit
+  where {cols: ColumnSet}
+insert_record_on_conflict_do_nothing table_value fields target = {
+  let target_names = target_names_of table_value target
+  finish (do_nothing_parts table_value (insert_record_pairs table_value fields) target_names)
+}
+
 #@ Upsert: `INSERT ... ON CONFLICT (<target>) DO UPDATE SET <rest> = EXCLUDED.<rest>`.
 #@ On a collision on the target columns, overwrite every *other* inserted column
 #@ with the value from this insert. The target callback names the conflict columns
@@ -517,6 +703,17 @@ pub fun upsert : Table cols
 upsert table_value writer_value value target = {
   let target_names = target_names_of table_value target
   finish (upsert_parts table_value (insert_pairs table_value writer_value value) target_names)
+}
+
+#@ Record-builder variant of `upsert`.
+pub fun upsert_record : Table cols
+  -> InsertFields row
+  -> (cols -> List ColRef)
+  -> Prepared Unit
+  where {cols: ColumnSet}
+upsert_record table_value fields target = {
+  let target_names = target_names_of table_value target
+  finish (upsert_parts table_value (insert_record_pairs table_value fields) target_names)
 }
 
 #@ Like `insert_on_conflict_do_nothing`, but appends a `RETURNING` clause. Note a
@@ -537,6 +734,22 @@ insert_on_conflict_do_nothing_returning table_value writer_value value target pr
   finish_returning body (project cols)
 }
 
+#@ Record-builder returning variant of `insert_on_conflict_do_nothing`.
+pub fun insert_record_on_conflict_do_nothing_returning : Table cols
+  -> InsertFields insert_row
+  -> (cols -> List ColRef)
+  -> (cols -> Projection row)
+  -> Prepared row
+  where {cols: ColumnSet}
+insert_record_on_conflict_do_nothing_returning table_value fields target project = {
+  let alias = table_name table_value
+  let cols = table_cols alias table_value
+  let target_names = List.map ref_name (target cols)
+  let body =
+    do_nothing_parts table_value (insert_record_pairs table_value fields) target_names
+  finish_returning body (project cols)
+}
+
 #@ Like `upsert`, but appends a `RETURNING` clause built from the projection
 #@ callback. Both the inserted and the updated row are returned, so `Db.one`
 #@ always yields the resulting row.
@@ -552,6 +765,22 @@ upsert_returning table_value writer_value value target project = {
   let target_names = List.map ref_name (target cols)
   let body =
     upsert_parts table_value (insert_pairs table_value writer_value value) target_names
+  finish_returning body (project cols)
+}
+
+#@ Record-builder returning variant of `upsert`.
+pub fun upsert_record_returning : Table cols
+  -> InsertFields insert_row
+  -> (cols -> List ColRef)
+  -> (cols -> Projection row)
+  -> Prepared row
+  where {cols: ColumnSet}
+upsert_record_returning table_value fields target project = {
+  let alias = table_name table_value
+  let cols = table_cols alias table_value
+  let target_names = List.map ref_name (target cols)
+  let body =
+    upsert_parts table_value (insert_record_pairs table_value fields) target_names
   finish_returning body (project cols)
 }
 
@@ -619,6 +848,21 @@ upsert_set table_value writer_value value target set_fn = {
   finish parts
 }
 
+#@ Record-builder variant of `upsert_set`.
+pub fun upsert_record_set : Table cols
+  -> InsertFields row
+  -> (cols -> ConflictTarget)
+  -> (cols -> List SetExpr)
+  -> Prepared Unit
+  where {cols: ColumnSet}
+upsert_record_set table_value fields target set_fn = {
+  let alias = table_name table_value
+  let cols = table_cols alias table_value
+  let parts =
+    upsert_set_parts table_value (insert_record_pairs table_value fields) (target cols) (set_fn cols)
+  finish parts
+}
+
 #@ Like `upsert_set`, but appends a `RETURNING` clause built from the projection
 #@ callback. Yields the resulting row (inserted or updated) via `Db.one`.
 pub fun upsert_set_returning : Table cols
@@ -633,6 +877,22 @@ upsert_set_returning table_value writer_value value target set_fn project = {
   let cols = table_cols alias table_value
   let body =
     upsert_set_parts table_value (insert_pairs table_value writer_value value) (target cols) (set_fn cols)
+  finish_returning body (project cols)
+}
+
+#@ Record-builder returning variant of `upsert_set`.
+pub fun upsert_record_set_returning : Table cols
+  -> InsertFields insert_row
+  -> (cols -> ConflictTarget)
+  -> (cols -> List SetExpr)
+  -> (cols -> Projection row)
+  -> Prepared row
+  where {cols: ColumnSet}
+upsert_record_set_returning table_value fields target set_fn project = {
+  let alias = table_name table_value
+  let cols = table_cols alias table_value
+  let body =
+    upsert_set_parts table_value (insert_record_pairs table_value fields) (target cols) (set_fn cols)
   finish_returning body (project cols)
 }
 
