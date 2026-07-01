@@ -55,12 +55,22 @@ opaque type Relation pcols ccols child k
 ```
 
 A to-many relation: a parent column matched to a child column. Build with
-`has_many`, consume with `preload` → `List child` (or `preload_where` to scope the
-loaded children). Both accessors are *column* accessors (over the parent's and
-child's column records `pcols` / `ccols`), so the foreign key is named exactly once
-and the batched child query (`WHERE child_key IN (keys)`) is generated for you.
+`has_many` or `has_many_through`, consume with `preload` → `List child` (or
+`preload_where` to scope the loaded children). Accessors are *column* accessors
+(over the parent's and child's column records), so keys are named exactly once
+and the batched child query is generated for you.
 
-authored_posts = Db.has_many posts (fun u -> u.id) (fun p -> p.author_id)
+authored_posts = Db.has_many posts posts_row (fun u -> u.id) (fun p -> p.author_id)
+
+### RelationThrough
+
+```saga
+opaque type RelationThrough pcols jcols ccols child k link
+```
+
+A to-many relation through a join table. It consumes exactly like `Relation`
+(`preload` → `List child`), but its type also records the join table columns and
+the target-link key type.
 
 ### RelationOne
 
@@ -72,16 +82,6 @@ A to-one relation: the same join as `Relation`, built with `belongs_to` (the FK 
 on the parent) or `has_one` (the FK is on the child, ≤1 per parent), and consumed
 with `preload` → `Maybe child`. A distinct type so the to-one result shape follows
 the relation automatically (and a to-many can't be mis-consumed as one).
-
-## Traits
-
-### Preloadable
-
-```saga
-trait Preloadable rel pcols ccols out | rel -> pcols ccols out {
-  fun run_preload : rel -> pcols -> Maybe (ccols -> Expr) -> Preloaded out needs {QueryBuild}
-}
-```
 
 ## Effects
 
@@ -149,7 +149,7 @@ Its `decode` is never invoked (there are no rows), so it just reports an error.
 ### select
 
 ```saga
-fun select : a -> Select a
+fun select : Projection a -> Select a
 ```
 
 Name a query's result shape. The `!` verbs (`from!`, `where_!`, …) build the
@@ -160,7 +160,7 @@ type `all`/`one` decode. It is the closing expression of a `query` /
 ### query
 
 ```saga
-fun query : Unit -> Select selection needs {QueryBuild} -> Prepared row where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
+fun query : Unit -> Select row needs {QueryBuild} -> Prepared row
 ```
 
 Build a `Prepared` query from a builder closure. The closure performs
@@ -170,7 +170,7 @@ the type selected determines the row type that `all`/`one` will decode.
 ### full_join_query
 
 ```saga
-fun full_join_query : Table colsA -> Table colsB -> colsA -> colsB -> Expr -> (Nullable colsA, Nullable colsB) -> Select selection needs {QueryBuild} -> Prepared row where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
+fun full_join_query : Table colsA -> Table colsB -> colsA -> colsB -> Expr -> (Nullable colsA, Nullable colsB) -> Select row needs {QueryBuild} -> Prepared row
 ```
 
 Build a FULL OUTER JOIN query between two tables. A full join is symmetric (no
@@ -188,63 +188,64 @@ scope's columns in further predicates via `Db.unwrap_cols`.
 
 full_join_query employees departments
 (fun e d -> Db.eq_col e.dept_id d.id)
-(fun emp dept -> { select ({ employee: emp, department: dept }) })
+(fun (emp, dept) -> select (
+build Selection EmployeeDepartment {
+employee: Db.read_nullable emp employee_row,
+department: Db.read_nullable dept department_row,
+}))
 
-### from_subquery
+### from_subquery_as
 
 ```saga
-fun from_subquery : Unit -> Select selection needs {QueryBuild} -> scope needs {QueryBuild} where {selection: Generic sel_rep, sel_rep: Selectable row_rep + DerivedScope scope_rep, scope: Generic scope_rep}
+fun from_subquery_as : String -> scope -> Unit -> Select row needs {QueryBuild} -> scope needs {QueryBuild}
 ```
 
-Use a subquery as a derived table in `FROM`. The builder closure is the same
-`from!`/`where_!`/`select` DSL under a nested handler; each `select` label
-becomes a column of the derived table, returned as a scope you dot into in the
-outer query:
+Use a subquery as a derived table in `FROM`. Until projection literals can
+synthesize scopes, pass a scope builder for the derived table's alias.
 
-let t = from_subquery (fun () -> {
+let t = from_subquery_as post_count_cols (fun () -> {
 let p = from! posts
 group_by! [Db.group p.author_id]
-select ({ author_id: p.author_id, posts: Db.count_star })
+select (post_count_projection p)
 })
 where_! (Db.gt t.posts 5)
-select ({ author: t.author_id, posts: t.posts })
+select (post_count_projection t)
 
 The subquery's params are numbered in sequence by the outer query, and its own
 tables get an `s`-prefixed alias so they never clash with the outer `t`-aliases.
 
-### cte
+### cte_as
 
 ```saga
-fun cte : String -> Unit -> Select selection needs {QueryBuild} -> Table scope needs {QueryBuild} where {selection: Generic sel_rep, sel_rep: Selectable row_rep + DerivedScope scope_rep, scope: Generic scope_rep}
+fun cte_as : String -> String -> scope -> Unit -> Select row needs {QueryBuild} -> Table scope needs {QueryBuild}
 ```
 
 Define a named CTE and get back a `Table` handle for it. The builder closure is
-the same `from!`/`select` DSL as `from_subquery`; each `select` label becomes a
-column of the CTE. Unlike `from_subquery`, the body is hoisted into a leading
-`WITH <name> AS (…)` and the handle is referenced by name — so it can be used in
-several places (e.g. `from!` it and also `inner_join!` it):
+the same `from!`/`select` DSL as `from_subquery_as`; the body is hoisted into a
+leading `WITH <name> AS (…)` and the handle is referenced by name.
 
-let counts = cte "post_counts" (fun () -> {
+let counts = cte_as "post_counts" post_count_cols (fun () -> {
 let p = from! posts
 group_by! [Db.group p.author_id]
-select ({ author_id: p.author_id, posts: Db.count_star })
+select (post_count_projection p)
 })
 let c = from! counts
 where_! (Db.gt c.posts 5)
-select ({ author: c.author_id, posts: c.posts })
+select (post_count_projection c)
 
 Renders `WITH post_counts AS (…) SELECT … FROM post_counts AS t0 WHERE …`. The
 CTE's params are numbered in sequence (the `WITH` is rendered first), and its own
 tables get an `s`-prefixed alias so they never clash with the outer `t`-aliases.
 
-### into
+### map_prepared
 
 ```saga
-fun into : row -> out -> Prepared row -> Prepared out
+fun map_prepared : row -> out -> Prepared row -> Prepared out
 ```
 
 Map a prepared query's decoded rows through `transform`. The SQL and parameters
 are unchanged; only the decoded result type changes. Useful for turning an
+Map a decoded prepared row into another shape. Useful for adapting an
 anonymous projection record into a named domain type.
 
 ### number_parts
@@ -331,15 +332,16 @@ when the subquery can return zero rows (an empty result decodes to `Nothing`
 instead of failing). This is the safe default; reach for `scalar_subquery` only
 when the subquery provably yields one non-null row.
 
-select ({
-id: u.id,
-a_title: Db.scalar_subquery_maybe (fun () -> {
+select (
+build Selection {
+id: Db.read u.id,
+a_title: Db.read (Db.scalar_subquery_maybe (fun () -> {
 let p = from! posts
 where_! (Db.eq_col p.author_id u.id)
 limit! 1
 p.title
-}),
-})   # { id: Int, a_title: Maybe String }
+})),
+})
 
 ### run
 
@@ -392,7 +394,7 @@ is checked before decoding, so a wrong count never loads relations or decodes ro
 ### has_many
 
 ```saga
-fun has_many : Table ccols -> pcols -> pk -> ccols -> ck -> Relation pcols ccols child k where {k: Core.PgType + Eq, pk: ToSql k, ck: ToSql k, ccols: Generic ccols_rep, ccols_rep: Selectable child_rep, child: Generic child_rep}
+fun has_many : Table ccols -> ccols -> Projection child -> pcols -> pk -> ccols -> ck -> Relation pcols ccols child k where {k: Core.PgType + Eq, pk: ToSql k, ck: ToSql k}
 ```
 
 Define a has-many relation: a parent-key column matched to the child's foreign-key
@@ -401,22 +403,39 @@ column. The generated child query selects each child paired with its FK
 result; nested relations on the child load too, since the child query runs through
 the ordinary `all`. Consume with `preload` → `List child`.
 
+### has_many_through
+
+```saga
+fun has_many_through : Table jcols -> Table ccols -> ccols -> Projection child -> pcols -> pk -> jcols -> jpk -> jcols -> jck -> ccols -> ck -> RelationThrough pcols jcols ccols child k link where {k: Core.PgType + Eq, link: Core.PgType, pk: ToSql k, jpk: ToSql k, jck: ToSql link, ck: ToSql link}
+```
+
+Define a many-to-many relation through a join table. The generated child query
+selects each target child paired with the join row's parent foreign key:
+
+SELECT join_parent_fk, child.*
+FROM join_table
+INNER JOIN child_table ON join_child_fk = child_key
+WHERE join_parent_fk IN (...)
+
+Consume with `preload` → `List child`. Define the inverse direction as another
+relation with the parent/child tables and join-key accessors swapped.
+
 ### belongs_to
 
 ```saga
-fun belongs_to : Table ccols -> pcols -> pk -> ccols -> ck -> RelationOne pcols ccols child k where {k: Core.PgType + Eq, pk: ToSql k, ck: ToSql k, ccols: Generic ccols_rep, ccols_rep: Selectable child_rep, child: Generic child_rep}
+fun belongs_to : Table ccols -> ccols -> Projection child -> pcols -> pk -> ccols -> ck -> RelationOne pcols ccols child k where {k: Core.PgType + Eq, pk: ToSql k, ck: ToSql k}
 ```
 
 Define a belongs-to relation: the parent holds the foreign key pointing at the
 child's key (e.g. a post's `author_id` → a user's `id`). Consume with `preload`
 → `Maybe child`.
 
-post_author = Db.belongs_to users (fun p -> p.author_id) (fun u -> u.id)
+post_author = Db.belongs_to users users_row (fun p -> p.author_id) (fun u -> u.id)
 
 ### has_one
 
 ```saga
-fun has_one : Table ccols -> pcols -> pk -> ccols -> ck -> RelationOne pcols ccols child k where {k: Core.PgType + Eq, pk: ToSql k, ck: ToSql k, ccols: Generic ccols_rep, ccols_rep: Selectable child_rep, child: Generic child_rep}
+fun has_one : Table ccols -> ccols -> Projection child -> pcols -> pk -> ccols -> ck -> RelationOne pcols ccols child k where {k: Core.PgType + Eq, pk: ToSql k, ck: ToSql k}
 ```
 
 Define a has-one relation: like `has_many` (the child holds the foreign key) but at
@@ -425,7 +444,7 @@ most one child per parent. Consume with `preload` → `Maybe child`.
 ### preload
 
 ```saga
-fun preload : rel -> pcols -> Preloaded out needs {QueryBuild} where {rel: Preloadable pcols ccols out}
+fun preload : Relation pcols ccols child k -> pcols -> Preloaded (List child) needs {QueryBuild} where {k: Eq}
 ```
 
 Pull a relation into the current query as a `select` field. The relation's declared
@@ -436,16 +455,30 @@ is added to the SELECT automatically, and the children are batch-loaded by
 
 let u = from! users
 let posts = preload authored_posts u      -- Preloaded (List Post)
-select ({ user: u, posts: posts })
+select (
+build Selection {
+user: users_row u,
+posts: Db.read_preloaded posts,
+})
 
-let p = from! posts
-let author = preload post_author p        -- Preloaded (Maybe User)
-select ({ post: p, author: author })
+### preload_through
+
+```saga
+fun preload_through : RelationThrough pcols jcols ccols child k link -> pcols -> Preloaded (List child) needs {QueryBuild} where {k: Eq}
+```
+
+### preload_one
+
+```saga
+fun preload_one : RelationOne pcols ccols child k -> pcols -> Preloaded (Maybe child) needs {QueryBuild} where {k: Eq}
+```
+
+Pull a to-one relation into the current query, yielding `Maybe child`.
 
 ### preload_where
 
 ```saga
-fun preload_where : rel -> pcols -> ccols -> Expr -> Preloaded out needs {QueryBuild} where {rel: Preloadable pcols ccols out}
+fun preload_where : Relation pcols ccols child k -> pcols -> ccols -> Expr -> Preloaded (List child) needs {QueryBuild} where {k: Eq}
 ```
 
 Like `preload`, but scopes the loaded children with a predicate over the child's
@@ -453,7 +486,23 @@ columns — `AND`-ed into the generated child query's `WHERE`. Only matching chi
 are loaded and stitched; parents with none get `[]` (or `Nothing` for a to-one).
 
 let posts = preload_where authored_posts u (fun p -> Db.eq p.published True)
-select ({ user: u, posts: posts })       -- each user's *published* posts
+select (
+build Selection {
+user: users_row u,
+posts: Db.read_preloaded posts,
+})
+
+### preload_through_where
+
+```saga
+fun preload_through_where : RelationThrough pcols jcols ccols child k link -> pcols -> ccols -> Expr -> Preloaded (List child) needs {QueryBuild} where {k: Eq}
+```
+
+### preload_one_where
+
+```saga
+fun preload_one_where : RelationOne pcols ccols child k -> pcols -> ccols -> Expr -> Preloaded (Maybe child) needs {QueryBuild} where {k: Eq}
+```
 
 ### transaction
 
@@ -462,14 +511,10 @@ fun transaction : Connection -> Unit -> Result a e needs {Repo, Rollback e} -> R
 ```
 
 Run `body` inside a database transaction. Every Kraken operation the body
-performs against `conn` (via `all`/`one`/`exec`/the DML helpers) automatically
-joins the transaction. The transaction commits if `body` returns `Ok` and rolls
-back if it returns `Err`.
+performs against `conn` automatically joins the transaction. The transaction
+commits if `body` returns `Ok` and rolls back if it returns `Err`.
 
 Body errors are returned as `RolledBack e`; failures before the body starts
 are returned as `TransactionFailed QueryError`. `rollback! e` is available
 inside the body for an early non-resuming rollback.
 
-Caveat (from saga_pgo): don't let a continuation captured inside `body` escape
-and run later — its re-invocation happens after commit/rollback, outside the
-transaction.

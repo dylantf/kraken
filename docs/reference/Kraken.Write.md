@@ -2,6 +2,22 @@
 title: Kraken.Write
 ---
 
+## Types
+
+### InsertCell
+
+```saga
+type InsertCell =
+  | Bind String InsertValue
+  | Skip
+```
+
+### Writer
+
+```saga
+opaque type Writer cols input
+```
+
 ## Effects
 
 ### Update
@@ -19,22 +35,43 @@ change, so it stays compact even on wide tables.
 
 ## Functions
 
+### writer
+
+```saga
+fun writer : cols -> input -> List InsertCell -> Writer cols input
+```
+
+### set
+
+```saga
+fun set : Col a -> a -> InsertCell where {a: PgType}
+```
+
+### set_default
+
+```saga
+fun set_default : Col a -> DefaultValue a -> InsertCell where {a: PgType}
+```
+
+### set_generated
+
+```saga
+fun set_generated : Generated a -> GeneratedValue a -> InsertCell where {a: PgType}
+```
+
 ### insert
 
 ```saga
-fun insert : Table cols -> ins -> Prepared Unit where {cols: Insertable ins + ColumnNameMap, ins: InsertRow}
+fun insert : Table cols -> Writer cols input -> input -> Prepared Unit
 ```
 
-Build an INSERT statement from a dedicated insert record. The input must be a
-named type deriving `Db.InsertRow` (anonymous records are rejected, so a typo'd
-or wrong-typed field fails to typecheck against that type). Column names come
-from the record's fields; declare the columns you want to set and omit the
-rest (e.g. DB-generated ones).
+Build an INSERT statement using a table-specific writer. Column names come
+from the writer's column handles; `Skip` cells are omitted.
 
 ### insert_returning
 
 ```saga
-fun insert_returning : Table cols -> ins -> cols -> selection -> Prepared row where {cols: Insertable ins + ColumnNameMap, ins: InsertRow, selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
+fun insert_returning : Table cols -> Writer cols input -> input -> cols -> Projection row -> Prepared row
 ```
 
 Like `insert`, but appends a `RETURNING` clause built from the projection
@@ -44,13 +81,13 @@ is a `Prepared row`; run it with `Db.one` (single insert) or `Db.all`.
 ### insert_all
 
 ```saga
-fun insert_all : Table cols -> List ins -> Prepared Unit where {cols: Insertable ins + ColumnNameMap, ins: InsertRow}
+fun insert_all : Table cols -> Writer cols input -> List input -> Prepared Unit
 ```
 
 Bulk insert: one `INSERT … VALUES (…), (…), …` statement for a list of rows.
 A single round trip instead of one per row — meaningful over a network, where
 a per-row loop (even inside a transaction) pays N round trips. Column names and
-value order come from the synthesized insert record, exactly like `insert`.
+value order come from the writer, exactly like `insert`.
 
 An empty list is a no-op: there is no valid zero-row VALUES SQL, so this returns
 a `noop` `Prepared` that `Db.exec` short-circuits to `Ok 0` (and `Db.all` to
@@ -62,7 +99,7 @@ limited to ~`floor(65535 / columns)` rows — chunk larger batches caller-side.
 ### insert_all_returning
 
 ```saga
-fun insert_all_returning : Table cols -> List ins -> cols -> selection -> Prepared row where {cols: Insertable ins + ColumnNameMap, ins: InsertRow, selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
+fun insert_all_returning : Table cols -> Writer cols input -> List input -> cols -> Projection row -> Prepared row
 ```
 
 Like `insert_all`, but appends a `RETURNING` clause built from the projection
@@ -73,7 +110,7 @@ that `Db.all` short-circuits to `Ok []` (no round trip).
 ### insert_on_conflict_do_nothing
 
 ```saga
-fun insert_on_conflict_do_nothing : Table cols -> ins -> cols -> List ColRef -> Prepared Unit where {cols: Insertable ins + ColumnNameMap, ins: InsertRow}
+fun insert_on_conflict_do_nothing : Table cols -> Writer cols input -> input -> cols -> List ColRef -> Prepared Unit
 ```
 
 `INSERT ... ON CONFLICT (<target>) DO NOTHING` — insert the row unless it would
@@ -83,7 +120,7 @@ callback names the conflict columns with `Db.ref` (e.g. `fun u -> [Db.ref u.emai
 ### upsert
 
 ```saga
-fun upsert : Table cols -> ins -> cols -> List ColRef -> Prepared Unit where {cols: Insertable ins + ColumnNameMap, ins: InsertRow}
+fun upsert : Table cols -> Writer cols input -> input -> cols -> List ColRef -> Prepared Unit
 ```
 
 Upsert: `INSERT ... ON CONFLICT (<target>) DO UPDATE SET <rest> = EXCLUDED.<rest>`.
@@ -95,7 +132,7 @@ with `Db.ref`. Panics at build time if the target covers every inserted column
 ### insert_on_conflict_do_nothing_returning
 
 ```saga
-fun insert_on_conflict_do_nothing_returning : Table cols -> ins -> cols -> List ColRef -> cols -> selection -> Prepared row where {cols: Insertable ins + ColumnNameMap, ins: InsertRow, selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
+fun insert_on_conflict_do_nothing_returning : Table cols -> Writer cols input -> input -> cols -> List ColRef -> cols -> Projection row -> Prepared row
 ```
 
 Like `insert_on_conflict_do_nothing`, but appends a `RETURNING` clause. Note a
@@ -105,7 +142,7 @@ skipped (conflicting) row produces *no* returned row, so `Db.one` yields
 ### upsert_returning
 
 ```saga
-fun upsert_returning : Table cols -> ins -> cols -> List ColRef -> cols -> selection -> Prepared row where {cols: Insertable ins + ColumnNameMap, ins: InsertRow, selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
+fun upsert_returning : Table cols -> Writer cols input -> input -> cols -> List ColRef -> cols -> Projection row -> Prepared row
 ```
 
 Like `upsert`, but appends a `RETURNING` clause built from the projection
@@ -115,7 +152,7 @@ always yields the resulting row.
 ### upsert_set
 
 ```saga
-fun upsert_set : Table cols -> ins -> cols -> ConflictTarget -> cols -> List SetExpr -> Prepared Unit where {cols: Insertable ins + ColumnNameMap, ins: InsertRow}
+fun upsert_set : Table cols -> Writer cols input -> input -> cols -> ConflictTarget -> cols -> List SetExpr -> Prepared Unit
 ```
 
 Upsert with an explicit `DO UPDATE SET`: update only the columns you list, to
@@ -129,7 +166,7 @@ default, use `upsert` instead.
 ### upsert_set_returning
 
 ```saga
-fun upsert_set_returning : Table cols -> ins -> cols -> ConflictTarget -> cols -> List SetExpr -> cols -> selection -> Prepared row where {cols: Insertable ins + ColumnNameMap, ins: InsertRow, selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
+fun upsert_set_returning : Table cols -> Writer cols input -> input -> cols -> ConflictTarget -> cols -> List SetExpr -> cols -> Projection row -> Prepared row
 ```
 
 Like `upsert_set`, but appends a `RETURNING` clause built from the projection
@@ -147,7 +184,7 @@ column record; `set!`/`where_!` describe the assignments and row filter.
 ### update_returning
 
 ```saga
-fun update_returning : Table cols -> cols -> Unit needs {Update} -> cols -> selection -> Prepared row where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
+fun update_returning : Table cols -> cols -> Unit needs {Update} -> cols -> Projection row -> Prepared row
 ```
 
 Like `update`, but appends a `RETURNING` clause built from the projection
@@ -156,15 +193,14 @@ callback. Returns a `Prepared row`; run it with `Db.all` / `Db.one`.
 ### update_all
 
 ```saga
-fun update_all : Table cols -> row -> Prepared Unit where {cols: ColumnSet + Selectable row, row: InsertRow}
+fun update_all : Table cols -> Writer cols row -> row -> Prepared Unit where {cols: ColumnSet}
 ```
 
 Save a whole entity: `UPDATE <table> SET <every non-key column> WHERE <pk>`.
 The entity is the domain record as-is (read → modify → save, no conversion);
 the key columns come from the table's `primary_key` and form the `WHERE`, the
-rest become the `SET`. The `Selectable cols row` constraint ties the accepted
-entity to the table's own domain type (the same `cols -> row` link the read
-path uses), so you cannot pass an unrelated record.
+rest become the `SET`. The supplied writer ties the accepted entity type to
+the table's columns.
 
 ### delete
 
@@ -177,7 +213,7 @@ Build a DELETE statement. The predicate callback receives the table's columns.
 ### delete_returning
 
 ```saga
-fun delete_returning : Table cols -> cols -> Expr -> cols -> selection -> Prepared row where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
+fun delete_returning : Table cols -> cols -> Expr -> cols -> Projection row -> Prepared row
 ```
 
 Like `delete`, but appends a `RETURNING` clause built from the projection
