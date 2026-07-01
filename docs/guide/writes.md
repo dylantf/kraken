@@ -14,7 +14,7 @@ with `RETURNING` produce `Db.Prepared row` and run with `Db.all`, `Db.one`, or
 Use a record-builder insert shape:
 
 ```saga
-pub fun user_insert : String -> Int -> Db.InsertFields Users
+pub fun user_insert : String -> Int -> Db.InsertOf Users
 user_insert name age =
   build Db.Insert Users {
     id: Db.insert_auto,
@@ -24,11 +24,11 @@ user_insert name age =
 
 pub fun insert_user_query : Unit -> Db.Prepared Unit
 insert_user_query () =
-  Db.insert_record users (user_insert "Carol" 31)
+  Db.insert users (user_insert "Carol" 31)
 ```
 
 `Db.insert_auto` / `Db.insert_default` render SQL `DEFAULT`.
-`Db.insert_value value` binds one explicitly. The `Db.InsertFields Users`
+`Db.insert_value value` binds one explicitly. The `Db.InsertOf Users`
 annotation is what makes the compiler check against the table's full column
 record.
 
@@ -46,7 +46,7 @@ Return the whole inserted row:
 pub fun insert_user_returning : Unit -> Db.Prepared User
 insert_user_returning () = {
   let row = user_insert "Carol" 31
-  Db.insert_record_returning users row users_row
+  Db.insert_returning users row users_row
 }
 ```
 
@@ -57,7 +57,7 @@ pub fun insert_user_returning_id : Unit -> Db.Prepared { id: Int }
 insert_user_returning_id () = {
   let row = user_insert "Carol" 31
   (
-    Db.insert_record_returning users row (fun u ->
+    Db.insert_returning users row (fun u ->
       build Selection { id: Db.read u.id })
   )
 }
@@ -72,13 +72,13 @@ Db.one conn (insert_user_returning ())
 ## Bulk insert
 
 ```saga
-Db.insert_all_records users [
+Db.insert_all users [
   user_insert "Carol" 31,
   user_insert "Dave" 40,
 ]
 ```
 
-`Db.insert_all_records []` is a no-op prepared statement. `Db.exec` returns `Ok 0` and
+`Db.insert_all []` is a no-op prepared statement. `Db.exec` returns `Ok 0` and
 `Db.all` returns `Ok []` without a database round trip.
 
 Bulk inserts need one shared column list. Use `Db.insert_default` /
@@ -89,7 +89,7 @@ Bulk returning:
 
 ```saga
 (
-  Db.insert_all_records_returning users rows (fun u ->
+  Db.insert_all_returning users rows (fun u ->
     build Selection { id: Db.read u.id })
 )
 ```
@@ -162,7 +162,7 @@ Use `Db.insert_on_conflict_do_nothing`:
 
 ```saga
 let row = user_insert "Carol" 31
-Db.insert_record_on_conflict_do_nothing users row (fun u -> [Db.ref u.name])
+Db.insert_on_conflict_do_nothing users row (fun u -> [Db.ref u.name])
 ```
 
 The target callback names conflict columns with `Db.ref`.
@@ -171,7 +171,7 @@ Returning version:
 
 ```saga
 (
-  Db.insert_record_on_conflict_do_nothing_returning users row
+  Db.insert_on_conflict_do_nothing_returning users row
     (fun u -> [Db.ref u.name])
     users_row
 )
@@ -191,14 +191,14 @@ let row =
     age: Db.insert_value 31,
   }
 
-Db.upsert_record users row (fun u -> [Db.ref u.id])
+Db.upsert users row (fun u -> [Db.ref u.id])
 ```
 
 Returning version:
 
 ```saga
 (
-  Db.upsert_record_returning users row
+  Db.upsert_returning users row
     (fun u -> [Db.ref u.id])
     users_row
 )
@@ -206,11 +206,11 @@ Returning version:
 
 ## Custom upsert
 
-Use `Db.upsert_record_set` when you want explicit assignments:
+Use `Db.upsert_set` when you want explicit assignments:
 
 ```saga
 (
-  Db.upsert_record_set users row
+  Db.upsert_set users row
     (fun u -> Db.on_columns [Db.ref u.id])
     (fun u -> [
       Db.assign u.age (Db.add u.age 1),
@@ -223,7 +223,7 @@ Use a named constraint:
 
 ```saga
 (
-  Db.upsert_record_set users row
+  Db.upsert_set users row
     (fun _ -> Db.on_constraint "users_pkey")
     (fun u -> [Db.assign u.age (Db.excluded u.age)])
 )
@@ -237,7 +237,7 @@ Wrap several operations in `Db.transaction`:
 pub fun atomic_writes : Connection -> Result Int (Db.TransactionError Db.DbError) needs {Transaction}
 atomic_writes conn = Db.transaction conn (fun () -> {
   let new_row = user_insert "Dave" 40
-  case Db.exec conn (Db.insert_record users new_row) {
+  case Db.exec conn (Db.insert users new_row) {
     Err err -> Err err
     Ok inserted -> case Db.exec conn (bump_age_query ()) {
       Err err -> Err err

@@ -18,10 +18,10 @@ type InsertCell =
 opaque type InsertInput slot
 ```
 
-### InsertFields
+### InsertOf
 
 ```saga
-opaque type InsertFields row
+opaque type InsertOf row
 ```
 
 ### Insert
@@ -81,13 +81,13 @@ fun insert_generated : GeneratedValue a -> InsertInput (Generated a) where {a: P
 ### insert_into
 
 ```saga
-fun insert_into : row -> InsertFields row
+fun insert_into : row -> InsertOf row
 ```
 
 ### insert_field
 
 ```saga
-fun insert_field : String -> InsertInput slot -> InsertFields (slot -> row) -> InsertFields row
+fun insert_field : String -> InsertInput slot -> InsertOf (slot -> row) -> InsertOf row
 ```
 
 ### writer
@@ -114,55 +114,55 @@ fun set_default : Col a -> DefaultValue a -> InsertCell where {a: PgType}
 fun set_generated : Generated a -> GeneratedValue a -> InsertCell where {a: PgType}
 ```
 
-### insert
+### insert_with_writer
 
 ```saga
-fun insert : Table cols -> Writer cols input -> input -> Prepared Unit
+fun insert_with_writer : Table cols -> Writer cols input -> input -> Prepared Unit
 ```
 
 Build an INSERT statement using a table-specific writer. Column names come
 from the writer's column handles; `Skip` cells are omitted.
 
-### insert_record
+### insert
 
 ```saga
-fun insert_record : Table cols -> InsertFields row -> Prepared Unit where {cols: ColumnSet}
+fun insert : Table cols -> InsertOf row -> Prepared Unit where {cols: ColumnSet}
 ```
 
 Build an INSERT from an anonymous record builder:
 
-Db.insert_record users build Db.Insert Users {
+Db.insert users build Db.Insert Users {
 id: Db.insert_auto,
 name: Db.insert_value "Carol",
 age: Db.insert_value 31,
 }
 
-Use the table's column record (`Users` here) as the `Db.InsertFields` shape to
+Use the table's column record (`Users` here) as the `Db.InsertOf` shape to
 make the compiler check that every field is present. Field labels map to SQL
 names via `ColumnSet.column_names` (identity by default).
+
+### insert_with_writer_returning
+
+```saga
+fun insert_with_writer_returning : Table cols -> Writer cols input -> input -> cols -> Projection row -> Prepared row
+```
+
+Like `insert_with_writer`, but appends a `RETURNING` clause built from the projection
+callback (the table's columns are passed in, exactly like `select`). The result
+is a `Prepared row`; run it with `Db.one` (single insert) or `Db.all`.
 
 ### insert_returning
 
 ```saga
-fun insert_returning : Table cols -> Writer cols input -> input -> cols -> Projection row -> Prepared row
+fun insert_returning : Table cols -> InsertOf insert_row -> cols -> Projection row -> Prepared row where {cols: ColumnSet}
 ```
 
-Like `insert`, but appends a `RETURNING` clause built from the projection
-callback (the table's columns are passed in, exactly like `select`). The result
-is a `Prepared row`; run it with `Db.one` (single insert) or `Db.all`.
+Like `insert`, but appends a `RETURNING` clause.
 
-### insert_record_returning
+### insert_all_with_writer
 
 ```saga
-fun insert_record_returning : Table cols -> InsertFields insert_row -> cols -> Projection row -> Prepared row where {cols: ColumnSet}
-```
-
-Like `insert_record`, but appends a `RETURNING` clause.
-
-### insert_all
-
-```saga
-fun insert_all : Table cols -> Writer cols input -> List input -> Prepared Unit
+fun insert_all_with_writer : Table cols -> Writer cols input -> List input -> Prepared Unit
 ```
 
 Bulk insert: one `INSERT … VALUES (…), (…), …` statement for a list of rows.
@@ -177,57 +177,57 @@ a `noop` `Prepared` that `Db.exec` short-circuits to `Ok 0` (and `Db.all` to
 Note Postgres caps a statement at 65535 bind parameters, so a single call is
 limited to ~`floor(65535 / columns)` rows — chunk larger batches caller-side.
 
-### insert_all_records
+### insert_all
 
 ```saga
-fun insert_all_records : Table cols -> List (InsertFields row) -> Prepared Unit where {cols: ColumnSet}
+fun insert_all : Table cols -> List (InsertOf row) -> Prepared Unit where {cols: ColumnSet}
 ```
 
 Bulk insert for the record-builder insert path. Each row must have the same
 field set; use `insert_default` / `insert_auto` when a row should ask Postgres
 for a default without changing the shared column list.
 
-### insert_all_returning
+### insert_all_with_writer_returning
 
 ```saga
-fun insert_all_returning : Table cols -> Writer cols input -> List input -> cols -> Projection row -> Prepared row
+fun insert_all_with_writer_returning : Table cols -> Writer cols input -> List input -> cols -> Projection row -> Prepared row
 ```
 
-Like `insert_all`, but appends a `RETURNING` clause built from the projection
+Like `insert_all_with_writer`, but appends a `RETURNING` clause built from the projection
 callback (the table's columns, exactly like `select`). Yields a `Prepared row`
 with one row per inserted row; run it with `Db.all`. An empty list is a no-op
 that `Db.all` short-circuits to `Ok []` (no round trip).
 
-### insert_all_records_returning
+### insert_all_returning
 
 ```saga
-fun insert_all_records_returning : Table cols -> List (InsertFields insert_row) -> cols -> Projection row -> Prepared row where {cols: ColumnSet}
+fun insert_all_returning : Table cols -> List (InsertOf insert_row) -> cols -> Projection row -> Prepared row where {cols: ColumnSet}
 ```
 
-Like `insert_all_records`, but appends a `RETURNING` clause.
+Like `insert_all`, but appends a `RETURNING` clause.
 
-### insert_on_conflict_do_nothing
+### insert_with_writer_on_conflict_do_nothing
 
 ```saga
-fun insert_on_conflict_do_nothing : Table cols -> Writer cols input -> input -> cols -> List ColRef -> Prepared Unit
+fun insert_with_writer_on_conflict_do_nothing : Table cols -> Writer cols input -> input -> cols -> List ColRef -> Prepared Unit
 ```
 
 `INSERT ... ON CONFLICT (<target>) DO NOTHING` — insert the row unless it would
 collide on the target columns, in which case skip it silently. The target
 callback names the conflict columns with `Db.ref` (e.g. `fun u -> [Db.ref u.email]`).
 
-### insert_record_on_conflict_do_nothing
+### insert_on_conflict_do_nothing
 
 ```saga
-fun insert_record_on_conflict_do_nothing : Table cols -> InsertFields row -> cols -> List ColRef -> Prepared Unit where {cols: ColumnSet}
+fun insert_on_conflict_do_nothing : Table cols -> InsertOf row -> cols -> List ColRef -> Prepared Unit where {cols: ColumnSet}
 ```
 
-Record-builder variant of `insert_on_conflict_do_nothing`.
+`INSERT ... ON CONFLICT (<target>) DO NOTHING` for `InsertOf`.
 
-### upsert
+### upsert_with_writer
 
 ```saga
-fun upsert : Table cols -> Writer cols input -> input -> cols -> List ColRef -> Prepared Unit
+fun upsert_with_writer : Table cols -> Writer cols input -> input -> cols -> List ColRef -> Prepared Unit
 ```
 
 Upsert: `INSERT ... ON CONFLICT (<target>) DO UPDATE SET <rest> = EXCLUDED.<rest>`.
@@ -236,54 +236,54 @@ with the value from this insert. The target callback names the conflict columns
 with `Db.ref`. Panics at build time if the target covers every inserted column
 (nothing left to update — use `insert_on_conflict_do_nothing`).
 
-### upsert_record
+### upsert
 
 ```saga
-fun upsert_record : Table cols -> InsertFields row -> cols -> List ColRef -> Prepared Unit where {cols: ColumnSet}
+fun upsert : Table cols -> InsertOf row -> cols -> List ColRef -> Prepared Unit where {cols: ColumnSet}
 ```
 
-Record-builder variant of `upsert`.
+Upsert for `InsertOf`.
 
-### insert_on_conflict_do_nothing_returning
+### insert_with_writer_on_conflict_do_nothing_returning
 
 ```saga
-fun insert_on_conflict_do_nothing_returning : Table cols -> Writer cols input -> input -> cols -> List ColRef -> cols -> Projection row -> Prepared row
+fun insert_with_writer_on_conflict_do_nothing_returning : Table cols -> Writer cols input -> input -> cols -> List ColRef -> cols -> Projection row -> Prepared row
 ```
 
 Like `insert_on_conflict_do_nothing`, but appends a `RETURNING` clause. Note a
 skipped (conflicting) row produces *no* returned row, so `Db.one` yields
 `Ok Nothing` on conflict.
 
-### insert_record_on_conflict_do_nothing_returning
+### insert_on_conflict_do_nothing_returning
 
 ```saga
-fun insert_record_on_conflict_do_nothing_returning : Table cols -> InsertFields insert_row -> cols -> List ColRef -> cols -> Projection row -> Prepared row where {cols: ColumnSet}
+fun insert_on_conflict_do_nothing_returning : Table cols -> InsertOf insert_row -> cols -> List ColRef -> cols -> Projection row -> Prepared row where {cols: ColumnSet}
 ```
 
-Record-builder returning variant of `insert_on_conflict_do_nothing`.
+Returning variant of `insert_on_conflict_do_nothing`.
 
-### upsert_returning
+### upsert_with_writer_returning
 
 ```saga
-fun upsert_returning : Table cols -> Writer cols input -> input -> cols -> List ColRef -> cols -> Projection row -> Prepared row
+fun upsert_with_writer_returning : Table cols -> Writer cols input -> input -> cols -> List ColRef -> cols -> Projection row -> Prepared row
 ```
 
 Like `upsert`, but appends a `RETURNING` clause built from the projection
 callback. Both the inserted and the updated row are returned, so `Db.one`
 always yields the resulting row.
 
-### upsert_record_returning
+### upsert_returning
 
 ```saga
-fun upsert_record_returning : Table cols -> InsertFields insert_row -> cols -> List ColRef -> cols -> Projection row -> Prepared row where {cols: ColumnSet}
+fun upsert_returning : Table cols -> InsertOf insert_row -> cols -> List ColRef -> cols -> Projection row -> Prepared row where {cols: ColumnSet}
 ```
 
-Record-builder returning variant of `upsert`.
+Returning variant of `upsert`.
 
-### upsert_set
+### upsert_set_with_writer
 
 ```saga
-fun upsert_set : Table cols -> Writer cols input -> input -> cols -> ConflictTarget -> cols -> List SetExpr -> Prepared Unit
+fun upsert_set_with_writer : Table cols -> Writer cols input -> input -> cols -> ConflictTarget -> cols -> List SetExpr -> Prepared Unit
 ```
 
 Upsert with an explicit `DO UPDATE SET`: update only the columns you list, to
@@ -294,30 +294,30 @@ target is a `Db.ConflictTarget` (`Db.on_columns [Db.ref u.id]` or
 `Db.on_constraint "…"`). For the "overwrite every other column with EXCLUDED"
 default, use `upsert` instead.
 
-### upsert_record_set
+### upsert_set
 
 ```saga
-fun upsert_record_set : Table cols -> InsertFields row -> cols -> ConflictTarget -> cols -> List SetExpr -> Prepared Unit where {cols: ColumnSet}
+fun upsert_set : Table cols -> InsertOf row -> cols -> ConflictTarget -> cols -> List SetExpr -> Prepared Unit where {cols: ColumnSet}
 ```
 
-Record-builder variant of `upsert_set`.
+`InsertOf` variant of `upsert_set`.
 
-### upsert_set_returning
+### upsert_set_with_writer_returning
 
 ```saga
-fun upsert_set_returning : Table cols -> Writer cols input -> input -> cols -> ConflictTarget -> cols -> List SetExpr -> cols -> Projection row -> Prepared row
+fun upsert_set_with_writer_returning : Table cols -> Writer cols input -> input -> cols -> ConflictTarget -> cols -> List SetExpr -> cols -> Projection row -> Prepared row
 ```
 
 Like `upsert_set`, but appends a `RETURNING` clause built from the projection
 callback. Yields the resulting row (inserted or updated) via `Db.one`.
 
-### upsert_record_set_returning
+### upsert_set_returning
 
 ```saga
-fun upsert_record_set_returning : Table cols -> InsertFields insert_row -> cols -> ConflictTarget -> cols -> List SetExpr -> cols -> Projection row -> Prepared row where {cols: ColumnSet}
+fun upsert_set_returning : Table cols -> InsertOf insert_row -> cols -> ConflictTarget -> cols -> List SetExpr -> cols -> Projection row -> Prepared row where {cols: ColumnSet}
 ```
 
-Record-builder returning variant of `upsert_set`.
+Returning variant of `upsert_set`.
 
 ### update
 

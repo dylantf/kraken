@@ -54,11 +54,11 @@ users_row u =
 ## Insert shapes
 
 For complete inserts, use the table's column record as the insert shape. The
-`Db.InsertFields Users` annotation is the exhaustiveness check: missing or extra
+`Db.InsertOf Users` annotation is the exhaustiveness check: missing or extra
 fields fail to typecheck against the same `Users` record you use for reads.
 
 ```saga
-pub fun new_user : String -> Int -> Db.InsertFields Users
+pub fun new_user : String -> Int -> Db.InsertOf Users
 new_user name age =
   build Db.Insert Users {
     id: Db.insert_auto,
