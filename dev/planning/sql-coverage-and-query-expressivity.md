@@ -867,18 +867,30 @@ ColRef)`; `key`/`ref`/`composite` build it, and `AsColRef` is implemented for bo
 `Col` and `Generated` so a serial PK (`u.id : Generated Int`) works. `update_all`
 on a `NoKey` table panics with a clear message.
 
-**Insert takes a dedicated, named insert type** (`record NewUser { name, age }
-deriving (Db.InsertRow)`), not the domain record and not an anonymous record:
+**Insert takes a table-specific writer** (`Writer Users NewUser`) plus whatever
+input shape that writer accepts. With anonymous records kept in the language, the
+common input can stay lightweight:
 
-- `insert : Table cols -> input -> Prepared Unit where {input: InsertRow}`.
-- Type safety comes from the named type itself — `NewUser { name: 31 }` fails
-  ("expected String, got Int"), and an anonymous record is rejected outright
-  ("no impl of InsertRow for anonymous record type"). So you can't fat-finger a
-  column type or pass an ad-hoc shape.
+```saga
+type alias NewUser = { name: String, age: Int }
+
+users_insert_writer = Db.writer (fun u r -> [
+  Db.set u.name r.name,
+  Db.set u.age r.age,
+])
+```
+
+- `insert : Table cols -> Writer cols input -> input -> Prepared Unit`.
+- Type safety comes from the writer's input type — `{ name: 31, age: 31 }` fails
+  because `name` must be `String`; `{ name: "Carol" }` fails because `age` is
+  missing.
 - You declare the columns you set and omit the rest (DB-generated columns, or
-  any with a default). To *force* a normally-generated column (e.g. a specific
-  `created_at`), just include it in your insert type — insert never consults the
-  schema, so it inserts whatever columns the type carries.
+  any with a default). To *force* a normally-generated column, use a writer that
+  calls `Db.set_generated` and either accepts a plain value for that use case or
+  a `Db.GeneratedValue a` when the same input shape needs both auto and override.
+  For ordinary columns with table defaults, use `Db.set_default` with
+  `Db.DefaultValue a`: `Db.default` renders SQL `DEFAULT`, while
+  `Db.provide Nothing` binds SQL `NULL`.
 
 **Kraken does not cross-validate the insert type against the schema** (that
 `{name: 31}` started this discussion was a red herring — it only typechecked
@@ -997,11 +1009,10 @@ three bulk inserts this now covers. Scope/known limits:
   `Prepared`) that breaks the clean build-vs-execute split. Empty batches are
   *common* (sesh-importer guards `[]` on 2 of 3 inserts), so the idiomatic pattern
   is to guard at the call site: `case rows { [] -> Ok 0; _ -> exec (insert_all …) }`.
-- **One shared column list**, enforced. Every row must set the same columns; the
-  only way to get a ragged batch is mixing `Db.auto` (omits a `Writable` column)
-  and `Db.provide` (binds it) across rows, which now panics with a clear message
-  rather than emitting broken SQL. (Nullable `Maybe` columns always bind — NULL or
-  value — so they're never ragged.)
+- **One shared column list**, enforced. Every row must set the same columns.
+  Per-row defaults render as SQL `DEFAULT`, so mixing `Db.default`/`Db.auto` and
+  `Db.provide` no longer creates a ragged batch. Nullable `Maybe` columns always
+  bind — NULL or value — unless you explicitly wrap them in `DefaultValue`.
 - **No auto-chunking** for Postgres' 65535 bind-param ceiling (~`floor(65535 /
   columns)` rows per statement) — document and chunk caller-side; add later if a
   caller hits it.

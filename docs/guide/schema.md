@@ -7,8 +7,8 @@ Kraken separates three ideas:
 3. A `ColumnSet` impl: the runtime mapping from Saga fields to SQL table and
    column names.
 
-This gives you typed query construction without asking users to write projection
-impls by hand.
+This gives you typed query construction while keeping the schema mapping as
+ordinary Saga code.
 
 ## Domain records
 
@@ -22,8 +22,7 @@ record User {
 }
 ```
 
-No derive is required just to name the data shape. Query decoding is connected
-by the column record's `Selectable User` derive.
+No derive is required just to name the data shape.
 
 ## Column records
 
@@ -34,68 +33,54 @@ record Users {
   id: Db.Generated Int,
   name: Db.Col String,
   age: Db.Col Int,
-} deriving (Selectable User)
+}
 ```
 
 Use `Db.Col a` for normal columns and `Db.Generated a` for columns the database
 normally fills in, such as serial ids.
 
-The read derive does one job:
-
-- `Selectable User`: selecting `u` decodes a `User`.
-
-That is enough for reads:
+Write a projection when you want to decode a whole row:
 
 ```saga
-select u  # User
+pub fun users_row : Users -> Db.Projection User
+users_row u =
+  build Selection User {
+    id: Db.read u.id,
+    name: Db.read u.name,
+    age: Db.read u.age,
+  }
 ```
 
-## Write derives
+## Insert shapes
 
-For inserts, add `Insertable <Name>` and `ColumnNameMap` to the column
-record:
+For complete inserts, use the table's column record as the insert shape. The
+`Db.InsertOf Users` annotation is the exhaustiveness check: missing or extra
+fields fail to typecheck against the same `Users` record you use for reads.
 
 ```saga
-record Users {
-  id: Db.Generated Int,
-  name: Db.Col String,
-  age: Db.Col Int,
-} deriving (
-  Selectable User,
-  Insertable UsersInsert,
-  ColumnNameMap,
-)
+pub fun new_user : String -> Int -> Db.InsertOf Users
+new_user name age =
+  build Db.Insert Users {
+    id: Db.insert_auto,
+    name: Db.insert_value name,
+    age: Db.insert_value age,
+  }
 ```
 
-These write derives do two jobs:
+Use `Db.insert_auto` / `Db.insert_default` for SQL `DEFAULT`, and
+`Db.insert_value value` to bind a concrete value.
 
-- `Insertable UsersInsert`: creates an insert input record from the column
-  record.
-- `ColumnNameMap`: lets writes translate Saga field labels to actual SQL
-  column names.
-
-The generated `UsersInsert` shape maps `Generated Int` to `Db.Writable Int` and
-plain `Col a` to `a`:
+For save-style `Db.update_all`, write a `Db.Writer` for the domain record. This
+is intentionally the partial/low-level write encoder; inserts should usually use
+the record-builder shape above.
 
 ```saga
-UsersInsert {
-  id: Db.auto,
-  name: "Alice",
-  age: 30,
-}
-```
-
-Use `Db.auto` to omit a generated column, or `Db.provide value` to force it.
-
-For save-style `Db.update_all`, also derive `InsertRow` on the domain
-record:
-
-```saga
-record User {
-  id: Int,
-  name: String,
-  age: Int,
-} deriving (InsertRow)
+pub fun users_save_writer : Db.Writer Users User
+users_save_writer = Db.writer (fun u user -> [
+  Db.set_generated u.id (Db.provide user.id),
+  Db.set u.name user.name,
+  Db.set u.age user.age,
+])
 ```
 
 ## ColumnSet
@@ -119,6 +104,10 @@ pass it to every `Db.col` / `Db.generated` so expressions render as `t0.name`,
 `t0.age`, and so on.
 
 `primary_key` is optional, but needed by `Db.update_all`.
+
+`column_names` is optional. The default uses insert-builder field labels as SQL
+column names. Override it when a Saga field label differs from the database
+column name.
 
 ## Table value
 
@@ -147,7 +136,7 @@ record Accounts {
   id: Db.Generated Int,
   email: Db.Col String,
   status: Db.Col AccountStatus,
-} deriving (Selectable Account)
+}
 
 impl ColumnSet for Accounts {
   columns source = Accounts {
@@ -155,10 +144,15 @@ impl ColumnSet for Accounts {
     email: Db.col "email_address" source,
     status: Db.col "status" source,
   }
+
+  column_names a = [
+    Db.column_name "email" a.email,
+  ]
 }
 ```
 
-Users write `a.email`; SQL renders `t0.email_address`.
+Users write `a.email`; SQL renders `t0.email_address`. Insert builders can use
+the field label `email`, and `column_names` remaps it to `email_address`.
 
 ## Custom PostgreSQL types
 
@@ -236,7 +230,7 @@ record Accounts {
   id: Db.Generated Int,
   email: Db.Col String,
   status: Db.Col AccountStatus,
-} deriving (Selectable Account)
+}
 ```
 
 The `ColumnSet` maps `status` to the actual SQL column:
@@ -255,11 +249,15 @@ After that, the custom type behaves like a built-in:
 
 ```saga
 where_! (Db.eq a.status Active)
-select a
+select build Selection Account {
+  id: Db.read a.id,
+  email: Db.read a.email,
+  status: Db.read a.status,
+}
 ```
 
-This comparison encodes `Active` with `encode_pg`. Selecting `a` decodes the
-`status` column with `decode_pg`.
+This comparison encodes `Active` with `encode_pg`. Reading `a.status` decodes
+the column with `decode_pg`.
 
 If you have a custom wrapper that encodes through an existing `PgType`, use
 `Db.encode_via` and `Db.decode_via`:
@@ -321,6 +319,5 @@ your Saga type.
 ## Module surface
 
 Use the import pattern from [Getting started](getting-started.md). Application
-code uses `Db.*` from `Kraken.Db`; the schema derives (`Selectable`,
-`Insertable`, `ColumnNameMap`, `InsertRow`) and `ColumnSet` resolve through the
-same `Kraken.Db` import and are written unqualified.
+code uses `Db.*` from `Kraken.Db`; `ColumnSet`, projections, insert shapes, and
+writers are ordinary Saga definitions in your schema modules.

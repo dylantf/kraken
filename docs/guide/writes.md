@@ -11,19 +11,26 @@ with `RETURNING` produce `Db.Prepared row` and run with `Db.all`, `Db.one`, or
 
 ## Insert
 
-Use the insert shape synthesized by `Insertable`:
+Use a record-builder insert shape:
 
 ```saga
+pub fun user_insert : String -> Int -> Db.InsertOf Users
+user_insert name age =
+  build Db.Insert Users {
+    id: Db.insert_auto,
+    name: Db.insert_value name,
+    age: Db.insert_value age,
+  }
+
 pub fun insert_user_query : Unit -> Db.Prepared Unit
 insert_user_query () =
-  Db.insert users (UsersInsert {
-    id: Db.auto,
-    name: "Carol",
-    age: 31,
-  })
+  Db.insert users (user_insert "Carol" 31)
 ```
 
-`Db.auto` omits a generated column. `Db.provide value` binds one explicitly.
+`Db.insert_auto` / `Db.insert_default` render SQL `DEFAULT`.
+`Db.insert_value value` binds one explicitly. The `Db.InsertOf Users`
+annotation is what makes the compiler check against the table's full column
+record.
 
 Run a non-returning insert with `Db.exec`:
 
@@ -38,8 +45,8 @@ Return the whole inserted row:
 ```saga
 pub fun insert_user_returning : Unit -> Db.Prepared User
 insert_user_returning () = {
-  let row = UsersInsert { id: Db.auto, name: "Carol", age: 31 }
-  Db.insert_returning users row (fun u -> u)
+  let row = user_insert "Carol" 31
+  Db.insert_returning users row users_row
 }
 ```
 
@@ -48,8 +55,11 @@ Return selected fields:
 ```saga
 pub fun insert_user_returning_id : Unit -> Db.Prepared { id: Int }
 insert_user_returning_id () = {
-  let row = UsersInsert { id: Db.auto, name: "Carol", age: 31 }
-  Db.insert_returning users row (fun u -> { id: u.id })
+  let row = user_insert "Carol" 31
+  (
+    Db.insert_returning users row (fun u ->
+      build Selection { id: Db.read u.id })
+  )
 }
 ```
 
@@ -63,21 +73,25 @@ Db.one conn (insert_user_returning ())
 
 ```saga
 Db.insert_all users [
-  UsersInsert { id: Db.auto, name: "Carol", age: 31 },
-  UsersInsert { id: Db.auto, name: "Dave", age: 40 },
+  user_insert "Carol" 31,
+  user_insert "Dave" 40,
 ]
 ```
 
 `Db.insert_all []` is a no-op prepared statement. `Db.exec` returns `Ok 0` and
 `Db.all` returns `Ok []` without a database round trip.
 
-Bulk inserts need one shared column list. Do not mix `Db.auto` and `Db.provide`
-for the same generated column across rows in a single call.
+Bulk inserts need one shared column list. Use `Db.insert_default` /
+`Db.insert_auto` when one row should use a default without changing that shared
+list.
 
 Bulk returning:
 
 ```saga
-Db.insert_all_returning users rows (fun u -> { id: u.id })
+(
+  Db.insert_all_returning users rows (fun u ->
+    build Selection { id: Db.read u.id })
+)
 ```
 
 ## Update
@@ -105,16 +119,24 @@ Db.update_returning users (fun u -> {
 
 ## Whole-row update
 
-If the table has a primary key and the domain record derives `InsertRow`, use
-`Db.update_all` for a save-style update:
+If the table has a primary key and a domain-record writer, use `Db.update_all`
+for a save-style update:
 
 ```saga
+pub fun users_save_writer : Db.Writer Users User
+users_save_writer = Db.writer (fun u user -> [
+  Db.set_generated u.id (Db.provide user.id),
+  Db.set u.name user.name,
+  Db.set u.age user.age,
+])
+
 pub fun save_user_query : User -> Db.Prepared Unit
-save_user_query user = Db.update_all users user
+save_user_query user = Db.update_all users users_save_writer user
 ```
 
 `update_all` updates every non-key field and builds the `WHERE` from the
-`primary_key` declared in `ColumnSet`.
+`primary_key` declared in `ColumnSet`. Use `Db.update` with `set!` for partial
+updates.
 
 ## Delete
 
@@ -139,7 +161,7 @@ Returning:
 Use `Db.insert_on_conflict_do_nothing`:
 
 ```saga
-let row = UsersInsert { id: Db.auto, name: "Carol", age: 31 }
+let row = user_insert "Carol" 31
 Db.insert_on_conflict_do_nothing users row (fun u -> [Db.ref u.name])
 ```
 
@@ -151,7 +173,7 @@ Returning version:
 (
   Db.insert_on_conflict_do_nothing_returning users row
     (fun u -> [Db.ref u.name])
-    (fun u -> u)
+    users_row
 )
 ```
 
@@ -162,14 +184,24 @@ If the row conflicts, Postgres returns no row, so `Db.one` yields `Ok Nothing`.
 Default upsert overwrites every inserted non-target column with `EXCLUDED`:
 
 ```saga
-let row = UsersInsert { id: Db.provide 1, name: "Carol", age: 31 }
+let row =
+  build Db.Insert Users {
+    id: Db.insert_generated (Db.provide 1),
+    name: Db.insert_value "Carol",
+    age: Db.insert_value 31,
+  }
+
 Db.upsert users row (fun u -> [Db.ref u.id])
 ```
 
 Returning version:
 
 ```saga
-Db.upsert_returning users row (fun u -> [Db.ref u.id]) (fun u -> u)
+(
+  Db.upsert_returning users row
+    (fun u -> [Db.ref u.id])
+    users_row
+)
 ```
 
 ## Custom upsert
@@ -177,8 +209,6 @@ Db.upsert_returning users row (fun u -> [Db.ref u.id]) (fun u -> u)
 Use `Db.upsert_set` when you want explicit assignments:
 
 ```saga
-let row = UsersInsert { id: Db.provide 1, name: "Carol", age: 31 }
-
 (
   Db.upsert_set users row
     (fun u -> Db.on_columns [Db.ref u.id])
@@ -206,7 +236,7 @@ Wrap several operations in `Db.transaction`:
 ```saga
 pub fun atomic_writes : Connection -> Result Int (Db.TransactionError Db.DbError) needs {Transaction}
 atomic_writes conn = Db.transaction conn (fun () -> {
-  let new_row = UsersInsert { id: Db.auto, name: "Dave", age: 40 }
+  let new_row = user_insert "Dave" 40
   case Db.exec conn (Db.insert users new_row) {
     Err err -> Err err
     Ok inserted -> case Db.exec conn (bump_age_query ()) {

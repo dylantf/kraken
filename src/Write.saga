@@ -1,41 +1,85 @@
 module Write
 
-import Kraken.Db (Update, Prepared, Repo, DbError, QueryFailed, TransactionError)
-import Read (users, User, UsersInsert)
+import Kraken.Db (
+  Update,
+  Prepared,
+  Repo,
+  DbError,
+  QueryFailed,
+  TransactionError,
+  Selection,
+)
+import Read (users, accounts, User, Users, Accounts, Active, users_insert_writer, users_save_writer, users_row)
 import SagaPgo (Connection, Postgres, Transaction, QueryError)
 
-# INSERT using the schema-generated insert type. Generated id via Db.auto.
+pub record InsertedId {
+  id: Int,
+}
+
+# INSERT with the generated id omitted.
 pub fun insert_user_query : Unit -> Prepared Unit
 insert_user_query () =
-  Db.insert users (UsersInsert { id: Db.auto, name: "Carol", age: 31 })
+  Db.insert_with_writer users users_insert_writer { name: "Carol", age: 31 }
+
+pub fun user_insert : Unit -> Db.InsertOf Users
+user_insert () =
+  build Db.Insert Users {
+    id: Db.insert_auto,
+    name: Db.insert_value "Carol",
+    age: Db.insert_value 31,
+  }
+
+pub fun insert_user_record_query : Unit -> Prepared Unit
+insert_user_record_query () =
+  Db.insert users (user_insert ())
+
+pub fun account_insert : Unit -> Db.InsertOf Accounts
+account_insert () =
+  build Db.Insert Accounts {
+    id: Db.insert_auto,
+    email: Db.insert_value "a@example.com",
+    status: Db.insert_value Active,
+  }
+
+pub fun insert_account_record_query : Unit -> Prepared Unit
+insert_account_record_query () =
+  Db.insert accounts (account_insert ())
 
 # Bulk INSERT: many rows in one statement (one round trip).
 pub fun insert_users_query : Unit -> Prepared Unit
 insert_users_query () =
-  Db.insert_all users [
-    UsersInsert { id: Db.auto, name: "Carol", age: 31 },
-    UsersInsert { id: Db.auto, name: "Dave", age: 40 },
-    UsersInsert { id: Db.auto, name: "Erin", age: 22 },
+  Db.insert_all_with_writer users users_insert_writer [
+    { name: "Carol", age: 31 },
+    { name: "Dave", age: 40 },
+    { name: "Erin", age: 22 },
   ]
 
 # Bulk INSERT ... RETURNING the generated ids of every inserted row.
-pub fun insert_users_returning_ids : Unit -> Prepared { id: Int }
-insert_users_returning_ids () = Db.insert_all_returning users [UsersInsert { id: Db.auto, name: "Carol", age: 31 }, UsersInsert { id: Db.auto, name: "Dave", age: 40 }] (fun u -> {
-  id: u.id,
-})
+pub fun insert_users_returning_ids : Unit -> Prepared InsertedId
+insert_users_returning_ids () =
+  Db.insert_all_with_writer_returning users users_insert_writer [
+    { name: "Carol", age: 31 },
+    { name: "Dave", age: 40 },
+  ] (fun u ->
+    build Selection InsertedId {
+      id: Db.read u.id,
+    })
 
 # INSERT ... RETURNING the whole inserted row, decoded back into the domain type.
 pub fun insert_user_returning : Unit -> Prepared User
 insert_user_returning () = {
-  let row = UsersInsert { id: Db.auto, name: "Carol", age: 31 }
-  Db.insert_returning users row (fun u -> u)
+  let row = { name: "Carol", age: 31 }
+  Db.insert_with_writer_returning users users_insert_writer row users_row
 }
 
 # INSERT ... RETURNING just the generated id (the common "get my new id" case).
-pub fun insert_user_returning_id : Unit -> Prepared { id: Int }
+pub fun insert_user_returning_id : Unit -> Prepared InsertedId
 insert_user_returning_id () = {
-  let row = UsersInsert { id: Db.auto, name: "Carol", age: 31 }
-  Db.insert_returning users row (fun u -> { id: u.id })
+  let row = { name: "Carol", age: 31 }
+  Db.insert_with_writer_returning users users_insert_writer row (fun u ->
+    build Selection InsertedId {
+      id: Db.read u.id,
+    })
 }
 
 # UPDATE ... RETURNING the updated row.
@@ -44,7 +88,7 @@ bump_age_returning () =
   Db.update_returning users (fun u -> {
     set! u.age 43
     where_! (Db.eq u.id 1)
-  }) (fun u -> u)
+  }) users_row
 
 # Run an INSERT ... RETURNING and decode the single row back.
 pub fun run_insert_returning : Connection -> Result (Maybe User) DbError
@@ -55,8 +99,8 @@ run_insert_returning conn = Db.one conn (insert_user_returning ())
 # values. Provides the id so the conflict can actually fire.
 pub fun upsert_user_query : Unit -> Prepared Unit
 upsert_user_query () = {
-  let row = UsersInsert { id: Db.provide 1, name: "Carol", age: 31 }
-  Db.upsert users row (fun u -> [Db.ref u.id])
+  let row = User { id: 1, name: "Carol", age: 31 }
+  Db.upsert_with_writer users users_save_writer row (fun u -> [Db.ref u.id])
 }
 
 # Upsert with a custom DO UPDATE SET: on id conflict, bump age by 1 (an expression
@@ -64,8 +108,8 @@ upsert_user_query () = {
 # these two columns are touched — a partial update, not the blanket overwrite.
 pub fun upsert_bump_query : Unit -> Prepared Unit
 upsert_bump_query () = {
-  let row = UsersInsert { id: Db.provide 1, name: "Carol", age: 31 }
-  Db.upsert_set users row (fun u -> Db.on_columns [Db.ref u.id]) (fun u -> [
+  let row = User { id: 1, name: "Carol", age: 31 }
+  Db.upsert_set_with_writer users users_save_writer row (fun u -> Db.on_columns [Db.ref u.id]) (fun u -> [
     Db.assign u.age (Db.add u.age 1),
     Db.assign u.name (Db.excluded u.name),
   ])
@@ -75,8 +119,8 @@ upsert_bump_query () = {
 # than a column list — for composite / named / exclusion constraints.
 pub fun upsert_on_constraint_query : Unit -> Prepared Unit
 upsert_on_constraint_query () = {
-  let row = UsersInsert { id: Db.provide 1, name: "Carol", age: 31 }
-  Db.upsert_set users row (fun _ -> Db.on_constraint "users_pkey") (fun u -> [
+  let row = User { id: 1, name: "Carol", age: 31 }
+  Db.upsert_set_with_writer users users_save_writer row (fun _ -> Db.on_constraint "users_pkey") (fun u -> [
     Db.assign u.age (Db.excluded u.age),
   ])
 }
@@ -84,25 +128,25 @@ upsert_on_constraint_query () = {
 # Insert-or-skip: do nothing if a row with this name already exists.
 pub fun insert_user_if_new_query : Unit -> Prepared Unit
 insert_user_if_new_query () = {
-  let row = UsersInsert { id: Db.auto, name: "Carol", age: 31 }
-  Db.insert_on_conflict_do_nothing users row (fun u -> [Db.ref u.name])
+  let row = { name: "Carol", age: 31 }
+  Db.insert_with_writer_on_conflict_do_nothing users users_insert_writer row (fun u -> [Db.ref u.name])
 }
 
 # Upsert and read back the resulting row (inserted or updated).
 pub fun upsert_user_returning : Unit -> Prepared User
 upsert_user_returning () = {
-  let row = UsersInsert { id: Db.provide 1, name: "Carol", age: 31 }
-  Db.upsert_returning users row (fun u -> [Db.ref u.id]) (fun u -> u)
+  let row = User { id: 1, name: "Carol", age: 31 }
+  Db.upsert_with_writer_returning users users_save_writer row (fun u -> [Db.ref u.id]) users_row
 }
 
 # Insert-if-new and read back the row (Nothing on conflict, since a skipped row
 # returns nothing).
 pub fun insert_user_if_new_returning : Unit -> Prepared User
 insert_user_if_new_returning () = {
-  let row = UsersInsert { id: Db.auto, name: "Carol", age: 31 }
-  Db.insert_on_conflict_do_nothing_returning users row (fun u -> [
+  let row = { name: "Carol", age: 31 }
+  Db.insert_with_writer_on_conflict_do_nothing_returning users users_insert_writer row (fun u -> [
     Db.ref u.name,
-  ]) (fun u -> u)
+  ]) users_row
 }
 
 # Run an upsert-returning and decode the resulting row.
@@ -118,8 +162,8 @@ run_upsert_returning conn = Db.one conn (upsert_user_returning ())
 # {Postgres}` (wire `with {pg_transaction, pg, …}`).
 pub fun atomic_writes : Connection -> Result Int (TransactionError DbError) needs {Transaction}
 atomic_writes conn = Db.transaction conn (fun () -> {
-  let new_row = UsersInsert { id: Db.auto, name: "Dave", age: 40 }
-  case Db.exec conn (Db.insert users new_row) {
+  let new_row = { name: "Dave", age: 40 }
+  case Db.exec conn (Db.insert_with_writer users users_insert_writer new_row) {
     Err err -> Err err
     Ok inserted -> case Db.exec conn (bump_age_query ()) {
       Err err -> Err err
@@ -133,8 +177,8 @@ atomic_writes conn = Db.transaction conn (fun () -> {
 pub fun rolled_back_write : Connection -> QueryError -> Result Unit (TransactionError DbError)
   needs {Transaction}
 rolled_back_write conn abort = Db.transaction conn (fun () -> {
-  let new_row = UsersInsert { id: Db.auto, name: "Ghost", age: 99 }
-  case Db.exec conn (Db.insert users new_row) {
+  let new_row = { name: "Ghost", age: 99 }
+  case Db.exec conn (Db.insert_with_writer users users_insert_writer new_row) {
     Err err -> Err err
     Ok _ -> Err (QueryFailed abort)
   }
@@ -149,7 +193,7 @@ bump_age_query () = Db.update users (fun u -> {
 
 # Whole-entity save: read -> modify -> save, keyed by primary_key
 pub fun save_user_query : User -> Prepared Unit
-save_user_query user = Db.update_all users user
+save_user_query user = Db.update_all users users_save_writer user
 
 # DELETE with a predicate.
 pub fun delete_user_query : Unit -> Prepared Unit

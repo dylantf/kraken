@@ -56,12 +56,10 @@ record Users {
   id: Db.Generated Int,
   name: Db.Col String,
   age: Db.Col Int,
-} deriving (Selectable User)
+}
 ```
 
 `Db.Generated a` is a readable column that the database usually fills in.
-`Selectable User` says that selecting the whole `Users` scope decodes a
-`User`.
 
 Map the column record to the SQL table:
 
@@ -81,9 +79,20 @@ users = Db.table "users"
 The first string in `Db.col "name" source` is the real SQL column name. The
 record field name is the Saga field (`u.name`) and the default select alias.
 
-That is enough for read queries. For inserts and save-style updates, add the
-write derives described in the [schema](schema.md) and [writes](writes.md)
-guides.
+For whole-row reads, write a projection:
+
+```saga
+pub fun users_row : Users -> Db.Projection User
+users_row u =
+  build Selection User {
+    id: Db.read u.id,
+    name: Db.read u.name,
+    age: Db.read u.age,
+  }
+```
+
+For inserts and save-style updates, add the manual insert shape / writer
+described in the [schema](schema.md) and [writes](writes.md) guides.
 
 ## Query
 
@@ -97,7 +106,11 @@ users_query () = Db.query (fun () -> {
   where_! (Db.gt u.age 18)
   order_by! [Db.asc u.id]
   limit! 20
-  select ({ id: u.id, name: u.name, age: u.age })
+  select build Selection {
+    id: Db.read u.id,
+    name: Db.read u.name,
+    age: Db.read u.age,
+  }
 })
 ```
 
@@ -120,7 +133,10 @@ Kraken uses anonymous records as the normal way to shape query results. In a
 `select`, the labels you write become fields on the decoded row:
 
 ```saga
-select ({ id: u.id, display_name: u.name })
+select build Selection {
+  id: Db.read u.id,
+  display_name: Db.read u.name,
+}
 ```
 
 That query returns rows shaped like:
@@ -133,11 +149,11 @@ You can select expressions, columns, whole rows, and preloaded relations in the
 same anonymous record:
 
 ```saga
-select ({
-  user: u,
-  title: p.title,
-  age_text: Db.as_text u.age,
-})
+select build Selection {
+  user: users_row u,
+  title: Db.read p.title,
+  age_text: Db.read (Db.as_text u.age),
+}
 ```
 
 The decoded row type is:
@@ -146,7 +162,7 @@ The decoded row type is:
 { user: User, title: String, age_text: String }
 ```
 
-Whole-row selections use the table's `Selectable` derive. Scalar fields use
+Whole-row selections use a projection such as `users_row`. Scalar fields use
 their column or SQL expression type. This gives query-local result shapes without
 defining a new named record for every query.
 
@@ -163,11 +179,10 @@ pub fun user_summaries : Unit -> Db.Prepared UserSummary
 user_summaries () =
   Db.query (fun () -> {
     let u = from! users
-    select ({ id: u.id, name: u.name })
-  })
-  |> Db.into (fun row -> UserSummary {
-    id: row.id,
-    name: row.name,
+    select build Selection UserSummary {
+      id: Db.read u.id,
+      name: Db.read u.name,
+    }
   })
 ```
 
@@ -181,7 +196,7 @@ pub fun active_users : Unit -> Db.Prepared User
 active_users () = Db.query (fun () -> {
   let u = from! users
   where_! (Db.gt u.age 18)
-  select u
+  select (users_row u)
 })
 ```
 
@@ -218,7 +233,7 @@ numbers parameters at render time, so nested subqueries and CTEs still produce
 
 ## Next
 
-- [Schema](schema.md) explains the table setup and insert-shape derives.
+- [Schema](schema.md) explains the table setup and insert shapes.
 - [Queries](queries.md) covers joins, grouping, subqueries, CTEs, and execution.
 - [Expressions](expressions.md) covers predicates, raw SQL, JSONB, arrays, and
   window functions.

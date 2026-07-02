@@ -23,8 +23,8 @@ type TypeTag a =
   | TypeTag
 ```
 
-A phantom carrier for a (`Star`-kinded) type, so a cast can name its target type
-without having a value of it. (`Std.Base.Proxy` is `Symbol`-kinded only.)
+A phantom carrier for a type, so a cast can name its target type without having
+a value of it.
 
 ### Nullable
 
@@ -81,18 +81,24 @@ predicates exactly like a normal column, but the type prevents it from being
 supplied in an `insert` input — id-omission becomes a type guarantee, not a
 convention.
 
-### Writable
+### DefaultValue
 
 ```saga
-type Writable a =
-  | Auto
+type DefaultValue a =
+  | UseDefault
   | Provide a
 ```
 
-The value of a DB-generated column in an insert input. `Auto` lets the database
-assign it (the column is omitted from the INSERT); `Provide v` forces a value.
-A `deriving (Db.Insertable …)` insert type maps each `Generated a` schema column
-to a `Writable a` field.
+The insert value for a column that may use its table default. `UseDefault`
+renders SQL `DEFAULT`; `Provide v` binds an explicit value. This is different
+from `Maybe`: `Nothing` binds SQL NULL, while `UseDefault` asks the database to
+compute the column default.
+
+### GeneratedValue
+
+```saga
+type alias GeneratedValue a = DefaultValue a
+```
 
 ### SetExpr
 
@@ -220,7 +226,14 @@ key) but decodes to `out` — the children loaded by a separate query, shaped by
 how the relation is consumed (`List child` for a to-many `preload`, `Maybe child`
 for a to-one `preload_one`). Built by the query layer; selecting it contributes
 the parent-key column to the SELECT and a deferred decode that resolves children
-from the executor-supplied `RelData`. See `make_preloaded` and `Selectable out`.
+from the executor-supplied `RelData`.
+
+### Selection
+
+```saga
+type Selection =
+  | Selection
+```
 
 ### Window
 
@@ -259,6 +272,7 @@ The Postgres type name a Saga type casts to (`x::<name>`). Only types you cast
 ```saga
 trait ColumnSet cols {
   fun columns : String -> cols
+  fun column_names : cols -> List (String, String)
   fun primary_key : cols -> PrimaryKey
 }
 ```
@@ -273,44 +287,10 @@ trait AsColRef c {
 
 Columns (`Col` / `Generated`) that can be erased to a `ColRef`.
 
-### InsertField
-
-```saga
-trait InsertField col ins | col -> ins {
-}
-```
-
-The per-field type map that drives insert-type synthesis: it rewrites each
-schema column type to its insert-input field type. The method-less impls below
-ARE the rewrite table — a plain `Col a` field binds its value directly, a
-`Generated a` field becomes `Writable a` (so it can be omitted with `Db.auto`).
-
-### Insertable
-
-```saga
-trait Insertable cols ins | cols -> ins {
-}
-```
-
-Links a table's column record to its generated insert-shape type. Emitted by
-`deriving (Db.Insertable <Name>)` on the column record; consumed by `Db.insert`
-to fix the accepted input type from the table (`cols` determines `ins`). The
-`synthesizes` clause tells the compiler to create the insert record by mapping
-each column field through `InsertField` and to attach `deriving (InsertRow)` so
-Kraken can encode it.
-
-### Selectable
-
-```saga
-trait Selectable selection row | selection -> row {
-  fun to_projection : selection -> Projection row
-}
-```
-
 ### ToSql
 
 ```saga
-trait ToSql input a | input -> a {
+trait ToSql input a {
   fun to_sql : input -> Sql a
 }
 ```
@@ -318,7 +298,7 @@ trait ToSql input a | input -> a {
 ### ToArraySql
 
 ```saga
-trait ToArraySql input a | input -> a {
+trait ToArraySql input a {
   fun to_array_sql : input -> Sql (Array a)
 }
 ```
@@ -326,77 +306,8 @@ trait ToArraySql input a | input -> a {
 ### ToJsonbSql
 
 ```saga
-trait ToJsonbSql input a | input -> a {
+trait ToJsonbSql input a {
   fun to_jsonb_sql : input -> Sql (Jsonb a)
-}
-```
-
-### DerivedField
-
-```saga
-trait DerivedField value out | value -> out {
-}
-```
-
-### DerivedLeaf
-
-```saga
-trait DerivedLeaf rep_in rep_out | rep_in -> rep_out {
-  fun derived_leaf : rep_in -> String -> String -> rep_out
-}
-```
-
-### DerivedScope
-
-```saga
-trait DerivedScope rep_in rep_out | rep_in -> rep_out {
-  fun build_scope : rep_in -> String -> rep_out
-}
-```
-
-### InsertCol
-
-```saga
-trait InsertCol a {
-  fun insert_col : a -> Maybe Value
-}
-```
-
-Encode one insert column value: `Just param` to bind it, `Nothing` to omit the
-column (let the database supply it). Plain column types always bind; `Writable`
-(a generated column) omits on `Auto` and binds on `Provide`.
-
-Instances are keyed per column-type head (no blanket over `PgType`, since Saga
-requires impl targets to be named or tuple types). A column type not listed here
-is not insertable unless the user adds its own `InsertCol` impl.
-
-### EncodeLeaf
-
-```saga
-trait EncodeLeaf rep {
-  fun encode_leaf : rep -> Maybe Value
-}
-```
-
-### InsertRow
-
-```saga
-trait InsertRow a {
-  fun insert_row : a -> List (String, Value)
-}
-```
-
-Encode a whole record to an ordered list of `(column_name, parameter)` pairs.
-Column names are taken from the record's field labels, in declaration order.
-This is the write-direction counterpart of `Selectable`: derive it on a domain
-record (`deriving (Db.InsertRow)`) and `Db.insert` uses it to build the column
-list and bound values.
-
-### ColumnNameMap
-
-```saga
-trait ColumnNameMap a {
-  fun column_name_map_rep : a -> List (String, String)
 }
 ```
 
@@ -545,10 +456,28 @@ fun ref_name : ColRef -> String
 
 The column name a `ColRef` points to (e.g. for an `ON CONFLICT` target).
 
+### column_name
+
+```saga
+fun column_name : String -> c -> (String, String) where {c: AsColRef}
+```
+
+Pair a Saga field label with the SQL column name from a typed column handle.
+Use this in `ColumnSet.column_names` when the Saga field and SQL column differ:
+`column_names a = [column_name "email" a.email]`.
+
+### default
+
+```saga
+fun default : DefaultValue a
+```
+
+Use the table's default for this column.
+
 ### auto
 
 ```saga
-fun auto : Writable a
+fun auto : DefaultValue a
 ```
 
 Let the database assign a generated column (the common case).
@@ -556,10 +485,10 @@ Let the database assign a generated column (the common case).
 ### provide
 
 ```saga
-fun provide : a -> Writable a
+fun provide : a -> DefaultValue a
 ```
 
-Force a specific value into a normally-generated column.
+Force a specific value into a defaulted or normally-generated column.
 
 ### table
 
@@ -631,6 +560,12 @@ fun col_name : Col a -> String
 ```
 
 The bare column name (no table qualifier), e.g. for an `UPDATE ... SET` target.
+
+### generated_name
+
+```saga
+fun generated_name : Generated a -> String
+```
 
 ### excluded
 
@@ -723,26 +658,45 @@ Build a `Preloaded` field from its injected parent-key column and a resolver. Th
 query layer supplies both; the resolver closes over the child types and the
 to-many/to-one shaping, so `Preloaded` is parameterized only by the output `out`.
 
-### project
-
-```saga
-fun project : selection -> Projection row where {selection: Generic selection_rep, selection_rep: Selectable row_rep, row: Generic row_rep}
-```
-
-### selection_items
-
-```saga
-fun selection_items : selection -> List SelectItem where {selection: Generic selection_rep, selection_rep: Selectable row_rep}
-```
-
-The `SelectItem`s a selection renders to, without committing to the decoded row
-type. Used to render a subquery's `SELECT` list (a derived table decodes through
-the *outer* query, so the subquery's own row type is never needed).
-
 ### map
 
 ```saga
 fun map : a -> b -> Projection a -> Projection b
+```
+
+### selection
+
+```saga
+fun selection : Selection
+```
+
+### projection_into
+
+```saga
+fun projection_into : a -> b -> Projection (a -> b)
+```
+
+Start building a projection for a constructor. This is the explicit primitive
+used by `build Selection Record { ... }`.
+
+### projection_with
+
+```saga
+fun projection_with : Projection a -> Projection (a -> b) -> Projection b
+```
+
+Feed one projected value into a projected constructor. The constructor projection
+is the piped value:
+
+build Selection User {
+id: Db.read u.id,
+name: Db.read u.name,
+}
+
+### projection_field
+
+```saga
+fun projection_field : String -> Projection a -> Projection (a -> b) -> Projection b
 ```
 
 ### sql_text
@@ -1277,6 +1231,16 @@ to `Nothing`; otherwise the row is decoded and wrapped in `Just`. The all-NULL
 rule remains correct even when a domain field is itself nullable, since a
 matched row still carries at least one non-null required column.
 
+### projection_relabel
+
+```saga
+fun projection_relabel : String -> Projection a -> Projection a
+```
+
+Relabel a projection for a record field. This is the explicit primitive used by
+`build Selection Record { field: projection }`: single-column fields take the field
+label directly, while multi-column fields get prefixed labels like `user_id`.
+
 ### projection_selections
 
 ```saga
@@ -1303,6 +1267,43 @@ Coerce any column-like value (`Col` / `Generated` / `Sql`) to a `Sql a`. Exposed
 so the query layer can accept a relation key as a column accessor regardless of
 whether the schema field is a plain or generated column.
 
+### read
+
+```saga
+fun read : input -> Projection a where {input: ToSql a}
+```
+
+Project any SQL-like value (`Col`, `Generated`, or `Sql`) as a single decoded
+column. This is the explicit leaf used by `projection_into` / `projection_with`.
+
+### read_sql
+
+```saga
+fun read_sql : Sql a -> Projection a
+```
+
+Project an already-built SQL expression. Alias is supplied by the surrounding
+projection construction or by the generated select item.
+
+### read_nullable
+
+```saga
+fun read_nullable : Nullable cols -> cols -> Projection a -> Projection (Maybe a)
+```
+
+Project a nullable scope through a whole-row projection. This keeps the left
+join all-NULL sentinel in one named operation instead of making callers unwrap
+a scope directly at a `select` site.
+
+### read_preloaded
+
+```saga
+fun read_preloaded : Preloaded out -> Projection out
+```
+
+Project a preloaded relation field. It contributes the hidden parent-key column
+and decodes through the relation data stitched in by the query executor.
+
 ### col_select_item
 
 ```saga
@@ -1328,9 +1329,7 @@ fun col_projection : Sql a -> Projection a
 ```
 
 A single-column `Projection` for a `Sql` value. Exposed so the query layer can
-pair a relation's foreign-key column alongside the child row without a generic
-select over an anonymous pair (whose `Generic` constraint can't be surfaced on a
-`fun`).
+pair a relation's foreign-key column alongside the child row.
 
 ### project_pair
 
@@ -1350,28 +1349,6 @@ fun decode_projection : Projection a -> RelData -> Dynamic -> Result (a, List Re
 Decode a result row through a projection, threading relation data and collecting
 any relation keys the row's `Preloaded` slots emit. Callers with no relations
 pass `empty_rel_data` and ignore the (empty) key list.
-
-### derived_columns
-
-```saga
-fun derived_columns : selection -> String -> scope where {selection: Generic sel_rep, sel_rep: DerivedScope scope_rep, scope: Generic scope_rep}
-```
-
-Build a derived-table column scope from the subquery's selection value and the
-alias assigned to the derived table. Each labeled selection becomes a `Col`
-named by its label and qualified by `alias`.
-
-### column_name_map
-
-```saga
-fun column_name_map : cols -> List (String, String) where {cols: ColumnNameMap}
-```
-
-Recover `(field_label, sql_column_name)` pairs from a table's column record,
-honoring `ColumnSet` renames. The DML layer uses this to translate the
-field-labelled output of `insert_row` to real SQL column names. Attach
-`deriving (Db.ColumnNameMap)` to the column record (like `Db.InsertRow` on the
-domain record) to make the bridge available.
 
 ### asc
 
